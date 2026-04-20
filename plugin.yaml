@@ -1,0 +1,18 @@
+# Root-level Hermes plugin manifest.
+#
+# Why two plugin.yaml files? Per the Phase 1 install-path spike (A2=FLAT-REQUIRED, see
+# .planning/phases/01-scaffolding-discovery-packaging/01-01-SPIKE-REPORT.md):
+#   - `hermes plugins install` clones our repo root to $HERMES_HOME/plugins/cashew/ and
+#     reads plugin.yaml FROM THE CLONE ROOT via _read_manifest(tmp_target). It requires
+#     manifest_version <= 1.
+#   - The bundled memory-loader convention keeps a copy at plugins/memory/cashew/plugin.yaml.
+# Both must stay in sync. Consider adding a CI check in a future phase.
+manifest_version: 1
+name: cashew
+version: 0.1.0
+description: "Cashew — persistent thought-graph memory with local embeddings, organic decay, and autonomous think cycles."
+pip_dependencies:
+  - "cashew-brain"
+requires_env: []
+hooks:
+  - on_session_end

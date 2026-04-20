@@ -28,6 +28,17 @@ except ImportError:
     # initialize() will silent-degrade if ContextRetriever is unavailable at runtime.
     ContextRetriever = None  # type: ignore[assignment,misc]
 
+# Phase 3 Plan 02 — tool-surface helpers live in a dedicated module (PHASE_DESIGN_NOTES
+# Decision Point 2). `import json` is redundant with tools.py's own use of json.dumps
+# but is kept at module level for forward compatibility with future defensive parsing
+# of `args` if Hermes ever passes a JSON string instead of a dict.
+import json  # noqa: E402 — intentional: documented Phase 3 forward-compat hook
+from plugins.memory.cashew.tools import (  # noqa: E402
+    CASHEW_QUERY_SCHEMA,
+    build_error_envelope,
+    build_success_envelope,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -186,8 +197,16 @@ class CashewMemoryProvider(MemoryProvider):
             return ""
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        # Phase 3 adds cashew_query, Phase 4 adds cashew_extract
-        return []
+        """Return the list of LLM tool schemas this provider exposes (RECALL-02).
+
+        Phase 3 exposes one: `cashew_query`. Phase 4 will append `cashew_extract`.
+        Schema structure follows Anthropic's input_schema convention — see
+        03-RESEARCH.md §3 and plugins.memory.cashew.tools.CASHEW_QUERY_SCHEMA.
+
+        The returned list is a fresh list literal each call, but the schema dict
+        itself is a module constant (not a copy) — callers must not mutate it.
+        """
+        return [CASHEW_QUERY_SCHEMA]
 
     # All other ABC methods are inherited as no-ops from the ABC defaults (when Hermes is present).
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import pathlib
 import queue
+import threading  # Phase 4: non-daemon worker for sync_turn drain
+import time       # Phase 4: monotonic-clock polling in on_session_end
 from typing import Any, Dict, List
 
 try:
@@ -42,6 +44,15 @@ from plugins.memory.cashew.tools import (  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+_SHUTDOWN = object()
+"""Unique sentinel for graceful sync worker exit.
+
+Compared with `is` (identity), never `==`. Never None — None collides with
+legitimate test-code payloads and with Python 3.13's queue.Queue.shutdown()
+signal path. See 04-RESEARCH.md §6.4 for rationale.
+"""
+
+
 class CashewMemoryProvider(MemoryProvider):
     """Cashew thought-graph memory provider for Hermes Agent."""
 
@@ -56,7 +67,17 @@ class CashewMemoryProvider(MemoryProvider):
         self._db_path: pathlib.Path | None = None
         self._sync_queue: queue.Queue | None = None
         self._session_id: str = ""
-        # threading state lives in Phase 4 — the worker that drains _sync_queue lives there
+        self._sync_worker: "threading.Thread | None" = None
+        # Phase 4: non-daemon worker that drains _sync_queue. Started in
+        # initialize() only on happy path (Pitfall 4). Joined in shutdown()
+        # with bounded timeout. See 04-RESEARCH.md §§6.5, 6.6.
+        self._dropped_turn_count: int = 0
+        # Phase 4: monotonic counter of drop-oldest events on the sync queue.
+        # Incremented inside sync_turn's overflow branch each time a queued
+        # turn is evicted to make room for a new one. Exposed for Plan 04-04's
+        # test_burst_default_queue_drops_oldest_cleanly to assert counter
+        # matches the WARNING-log count. See B-02 revision in
+        # PHASE_DESIGN_NOTES (2026-04-20).
 
     @property
     def name(self) -> str:
@@ -124,6 +145,9 @@ class CashewMemoryProvider(MemoryProvider):
                     "cashew-brain dependency missing"
                 )
             self._retriever = ContextRetriever(db_path=str(self._db_path))
+            # Phase 4: start the sync worker AFTER all worker-read state
+            # is populated (db_path, session_id, sync_queue). Pitfall 4.
+            self._start_sync_worker()
         except Exception:
             logger.warning(
                 "cashew initialize failed at %s; provider will report unavailable until fixed",
@@ -133,28 +157,145 @@ class CashewMemoryProvider(MemoryProvider):
             self._config = None
             self._db_path = None
             self._retriever = None
+            self._sync_worker = None
 
-    def shutdown(self) -> None:
-        """Tear down the provider (ABC contract; safe no-op pre-initialize).
+    def _start_sync_worker(self) -> None:
+        """Launch the non-daemon worker. Called from initialize() only on happy path.
 
-        Phase 2: no worker exists yet, so this just clears references. Phase 4
-        will (a) signal the worker via a queue sentinel and (b) bounded-join the
-        worker using self._config.sync_queue_timeout. Both additions slot in
-        without restructuring this method.
+        MUST run AFTER self._db_path / self._session_id / self._sync_queue are set
+        (Pitfall 4). daemon=False is load-bearing (PROJECT.md Key Decision).
+        """
+        self._sync_worker = threading.Thread(
+            target=self._worker_loop,
+            name=f"cashew-sync-{self._session_id}",
+            daemon=False,
+        )
+        self._sync_worker.start()
 
-        _hermes_home is intentionally NOT reset — is_available() should continue
-        to reflect on-disk reality (the cashew.json file persists across init/shutdown
-        cycles in the same process; only the in-memory queue/config state is torn down).
+    def sync_turn(self, user_content: str, assistant_content: str) -> None:
+        """Hot-path enqueue of a completed turn (SYNC-01).
+
+        Contract: returns in <10ms. Never raises. If the queue is full, drops the
+        OLDEST queued turn, logs a WARNING, and enqueues the new one (drop-oldest
+        policy, 04-RESEARCH.md §6.3). If somehow still full after the drop (rare
+        worker-draining race), drops the NEW turn with a second WARNING.
+
+        Half-state (_sync_queue is None) is a silent no-op.
         """
         if self._sync_queue is None:
-            # initialize() was never called; nothing to tear down.
-            return
-        # Phase 4 will: self._sync_queue.put(_SHUTDOWN_SENTINEL); self._worker.join(timeout=...)
+            return  # not initialized or silent-degraded; no worker to feed
+        turn = (user_content, assistant_content)
+        try:
+            self._sync_queue.put_nowait(turn)
+        except queue.Full:
+            # Drop-oldest (04-RESEARCH.md §6.3 + Pitfall 3).
+            try:
+                self._sync_queue.get_nowait()
+                self._sync_queue.task_done()  # balance the drop (EXACTLY ONCE)
+            except queue.Empty:
+                pass  # worker drained between Full and get_nowait — rare race; no-op
+            self._dropped_turn_count += 1  # per-drop counter — asserted by Plan 04-04 burst test
+            logger.warning(
+                "cashew sync queue overflow (maxsize=%d); dropped oldest turn",
+                self._sync_queue.maxsize,
+            )
+            try:
+                self._sync_queue.put_nowait(turn)
+            except queue.Full:
+                logger.warning("cashew sync queue still full after drop-oldest; dropping new turn")
+
+    def _worker_loop(self) -> None:
+        """Background drain loop. Entry point for self._sync_worker.
+
+        Sentinel check BEFORE try (Pitfall 1 — must not be reachable from the
+        exception path). task_done() ALWAYS in finally (Pitfall 2). Per-iteration
+        except catches all Cashew failures (SYNC-06) without poisoning the queue.
+        """
+        assert self._sync_queue is not None  # invariant: worker only starts when queue exists
+        while True:
+            item = self._sync_queue.get()
+            if item is _SHUTDOWN:
+                self._sync_queue.task_done()
+                return
+            try:
+                self._drain_once(item)
+            except Exception:
+                logger.warning("cashew sync worker: turn failed", exc_info=True)
+            finally:
+                self._sync_queue.task_done()
+
+    def _drain_once(self, turn: tuple[str, str]) -> None:
+        """Persist one turn via Cashew's heuristic extractor.
+
+        Lazy-imports core.session so the plugin module loads even when cashew-brain
+        is not installed (matches Phase 1 Pattern 3 for agent.memory_provider).
+        model_fn=None uses Cashew's built-in heuristic extractor (04-RESEARCH.md
+        §§1, 6.2 — no LLM round-trip).
+        """
+        from core.session import end_session  # lazy import (see 04-RESEARCH.md §9 + test strategy §11)
+        user, assistant = turn
+        end_session(
+            db_path=str(self._db_path),
+            session_id=self._session_id,
+            conversation_text=f"User: {user}\nAssistant: {assistant}",
+            model_fn=None,
+        )
+
+    def on_session_end(self, messages: list) -> None:
+        """Best-effort bounded drain; does NOT stop the worker (ABC-06).
+
+        Polls unfinished_tasks with the same sync_queue_timeout that shutdown()
+        uses. Worker stays alive for subsequent sessions. No WARNING on timeout —
+        this method is advisory; shutdown() is authoritative. See 04-RESEARCH.md
+        §6.10 + PHASE_DESIGN_NOTES Decision Point 4.
+        """
+        if self._sync_queue is None:
+            return  # not initialized or silent-degraded
+        timeout = self._config.sync_queue_timeout if self._config is not None else 30.0
+        deadline = time.monotonic() + timeout
+        while self._sync_queue.unfinished_tasks > 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        # Intentional: no WARNING on incomplete drain — shutdown() will log if it also times out.
+
+    def shutdown(self) -> None:
+        """Post sentinel, bounded-join worker, clear references (ABC-05 + SYNC-05).
+
+        Order is load-bearing:
+          1. If not initialized, return (Phase 2 safe-no-op carryover).
+          2. Post _SHUTDOWN sentinel to the queue. put_nowait first; fallback to
+             a 1s blocking put if the queue is full (worker is draining fast).
+          3. Bounded-join the worker using sync_queue_timeout. WARNING on timeout.
+          4. Clear _sync_queue, _sync_worker, _config, _db_path, _retriever.
+
+        _hermes_home is intentionally NOT reset — is_available() must keep
+        reflecting on-disk reality (Phase 2 Success #3).
+        """
+        if self._sync_queue is None:
+            return  # safe no-op: initialize() was never called
+        timeout = self._config.sync_queue_timeout if self._config is not None else 30.0
+        # Post sentinel. put_nowait first; if somehow full, try a brief blocking put.
+        try:
+            self._sync_queue.put_nowait(_SHUTDOWN)
+        except queue.Full:
+            try:
+                self._sync_queue.put(_SHUTDOWN, block=True, timeout=1.0)
+            except queue.Full:
+                logger.warning("cashew shutdown: could not post sentinel; worker may leak")
+        # Bounded join. NEVER raise (silent-degrade Key Decision).
+        if self._sync_worker is not None:
+            self._sync_worker.join(timeout=timeout)
+            if self._sync_worker.is_alive():
+                logger.warning(
+                    "cashew sync worker did not exit within %ss; abandoning",
+                    timeout,
+                )
+        # Clear state. _hermes_home persists (see Phase 2 Plan 02-02 rationale).
         self._sync_queue = None
+        self._sync_worker = None
         self._config = None
         self._db_path = None
         self._retriever = None
-        logger.debug("cashew provider shutdown complete (Phase 3 — no worker yet, retriever cleared)")
+        logger.debug("cashew provider shutdown complete (Phase 4 — worker drained)")
 
     def prefetch(self, query: str) -> str:
         """Return recalled-context string from Cashew, respecting `recall_k` (RECALL-01).

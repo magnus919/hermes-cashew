@@ -39,10 +39,12 @@ def test_initialize_without_hermes_home_raises_keyerror():
 
 
 def test_initialize_creates_bounded_queue(tmp_path):
-    """Phase 2 deferred Phase 4: queue is created here so the worker addition is purely additive.
+    """Queue is created with maxsize=16 in initialize(); Phase 4 now also starts the worker.
 
     PHASE_DESIGN_NOTES Decision Point 4: queue.Queue(maxsize=16) per CLAUDE.md ### Threading Rule.
-    No worker thread should be started — verified by threading.active_count.
+    Phase 4 (Plan 04-01) landed the non-daemon worker thread, so initialize() now
+    adds exactly one thread to active_count(); shutdown() returns it to baseline
+    (covered by test_initialize_then_shutdown_returns_to_baseline_threads).
     """
     p = CashewMemoryProvider()
     baseline = threading.active_count()
@@ -50,8 +52,8 @@ def test_initialize_creates_bounded_queue(tmp_path):
     try:
         assert isinstance(p._sync_queue, queue.Queue)
         assert p._sync_queue.maxsize == 16
-        assert threading.active_count() == baseline, (
-            "no worker thread expected in Phase 2; initialize started one"
+        assert threading.active_count() == baseline + 1, (
+            "Phase 4 expects exactly one worker thread started by initialize()"
         )
     finally:
         p.shutdown()

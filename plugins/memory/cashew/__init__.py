@@ -213,19 +213,27 @@ class CashewMemoryProvider(MemoryProvider):
         Sentinel check BEFORE try (Pitfall 1 — must not be reachable from the
         exception path). task_done() ALWAYS in finally (Pitfall 2). Per-iteration
         except catches all Cashew failures (SYNC-06) without poisoning the queue.
+
+        Plan 04-04 race fix: binds the queue reference to a local `q` at loop
+        entry. If shutdown() times out waiting for this worker, it clears
+        `self._sync_queue = None` and abandons the worker. Without this local
+        bind, the abandoned worker's `finally: self._sync_queue.task_done()`
+        would raise AttributeError on NoneType. Using `q` keeps task_done()
+        bound to the queue the worker was actually draining, race-free.
         """
-        assert self._sync_queue is not None  # invariant: worker only starts when queue exists
+        q = self._sync_queue  # bind once; shutdown may clear self._sync_queue before we exit
+        assert q is not None  # invariant: worker only starts when queue exists
         while True:
-            item = self._sync_queue.get()
+            item = q.get()
             if item is _SHUTDOWN:
-                self._sync_queue.task_done()
+                q.task_done()
                 return
             try:
                 self._drain_once(item)
             except Exception:
                 logger.warning("cashew sync worker: turn failed", exc_info=True)
             finally:
-                self._sync_queue.task_done()
+                q.task_done()
 
     def _drain_once(self, turn: tuple[str, str]) -> None:
         """Persist one turn via Cashew's heuristic extractor.

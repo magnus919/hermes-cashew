@@ -32,6 +32,12 @@ Homepage   = "https://github.com/magnus919/hermes-cashew"
 Repository = "https://github.com/magnus919/hermes-cashew"
 Issues     = "https://github.com/magnus919/hermes-cashew/issues"
 
+[tool.hatch.metadata]
+# Required because `cashew-brain` is pinned via a git+SHA direct reference in [project.dependencies].
+# PyPI forbids VCS deps on uploaded distributions (Phase 5 will migrate to a PyPI specifier once
+# cashew-brain is published), but for Phase 1 dev/CI installs this flag is mandatory.
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 # Intentional PEP 420 namespace package — do NOT add __init__.py at plugins/ or plugins/memory/.
 # Doing so would shadow Hermes's bundled memory providers when both are on sys.path.

@@ -1,8 +1,14 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # hermes-cashew
 
 A [Hermes Agent](https://hermes-agent.nousresearch.com) memory provider plugin that uses [Cashew](https://github.com/rajkripal/cashew) as the backing store — persistent thought-graph memory with local embeddings, organic decay, and autonomous think cycles.
 
 **Repo:** https://github.com/magnus919/hermes-cashew
+
+**Status:** scaffolding stage — only `CLAUDE.md`, `LICENSE`, and `README.md` exist on disk. The layout, `pyproject.toml`, `plugin.yaml`, and test files described below are the *target* state; create them as work progresses.
 
 ---
 
@@ -19,24 +25,16 @@ When active, this provider feeds Cashew-retrieved context into Hermes' system pr
 
 ## Repository Layout
 
+Hermes imposes a specific plugin path — the non-obvious part:
+
 ```
-hermes-cashew/
-├── plugins/
-│   └── memory/
-│       └── cashew/
-│           ├── __init__.py      # CashewMemoryProvider + register()
-│           ├── plugin.yaml      # Hermes plugin metadata
-│           └── README.md        # End-user setup guide
-├── tests/
-│   ├── conftest.py              # Shared fixtures
-│   └── test_cashew_provider.py  # Acceptance tests (E2E lifecycle)
-├── .github/
-│   └── workflows/
-│       └── tests.yml            # CI — runs acceptance tests
-├── .gitignore
-├── pyproject.toml               # Package metadata + dev deps
-└── CLAUDE.md                    # This file
+plugins/memory/cashew/
+├── __init__.py      # CashewMemoryProvider + register()
+├── plugin.yaml      # Hermes plugin metadata
+└── README.md        # End-user setup guide
 ```
+
+Tests live in `tests/`; CI in `.github/workflows/tests.yml`.
 
 ---
 
@@ -131,8 +129,11 @@ Cashew requires ~2 GB RAM and downloads the `all-MiniLM-L6-v2` embedding model (
 Tests live in `tests/` and use `pytest`. They follow the pattern from Hermes Agent's `tests/agent/test_memory_plugin_e2e.py`.
 
 ```bash
-# Run all tests
+# All tests
 pytest
+
+# Single test
+pytest tests/test_cashew_provider.py::test_full_lifecycle -xvs
 
 # macOS
 python3 -m pytest
@@ -172,29 +173,11 @@ Tests must:
 
 ---
 
-## plugin.yaml
+## Non-obvious ignores
 
-```yaml
-name: cashew
-version: 1.0.0
-description: "Persistent thought-graph memory via Cashew (sqlite-vec + local embeddings)."
-hooks:
-  - prefetch
-  - sync_turn
-  - on_session_end
-  - shutdown
-```
+Beyond standard Python ignores, `.gitignore` must also cover `cashew-config.json` — it is written at runtime by `save_config()`, not authored by hand.
 
----
-
-## .gitignore Highlights
-
-Standard Python ignores plus:
-
-- `*.db` — Cashew brain databases (contain personal data)
-- `.env` — API keys written by `hermes memory setup`
-- `cashew-config.json` — local config written by `save_config()`
-- `.hermes/` — if accidentally created locally
+See `plugins/memory/cashew/plugin.yaml` for the hook registration list.
 
 ---
 

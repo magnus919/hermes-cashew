@@ -53,6 +53,12 @@ if "agent.memory_provider" not in sys.modules:
     sys.modules["agent"] = _agent_pkg
     sys.modules["agent.memory_provider"] = _mp_mod
 
+# Phase 3: MemoryManager stub injection — must happen after agent.memory_provider
+# is already in sys.modules because the stub imports nothing from there directly
+# but Hermes ABC ordering conventions keep memory_provider ahead of memory_manager.
+from tests._memory_manager_stub import inject_into_sys_modules  # noqa: E402
+inject_into_sys_modules()
+
 import pytest  # noqa: E402
 
 

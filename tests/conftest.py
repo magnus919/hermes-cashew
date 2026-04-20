@@ -81,3 +81,53 @@ def fake_embedder(monkeypatch):
     except ImportError:
         pass
     yield
+
+
+@pytest.fixture
+def home_snapshot():
+    """Snapshot ~/.hermes mtime + recursive file listing before/after a test.
+
+    Used by tests/test_no_home_leak.py to satisfy TEST-03: any plugin code path
+    that writes under the user's real $HOME during a tmp_path-scoped lifecycle
+    is a profile-isolation violation. Yields a dict with the pre-test snapshot;
+    the test calls `assert_unchanged()` (also yielded) to verify post-test state.
+
+    If ~/.hermes does not exist pre-test, asserts it does not exist post-test.
+    Never creates files under ~ — purely observational.
+    """
+    import pathlib
+    home_hermes = pathlib.Path.home() / ".hermes"
+
+    def _snapshot():
+        if not home_hermes.exists():
+            return {"exists": False, "mtime": None, "files": frozenset()}
+        files = frozenset(
+            (p.relative_to(home_hermes).as_posix(), p.stat().st_mtime_ns)
+            for p in home_hermes.rglob("*")
+            if p.is_file()
+        )
+        return {
+            "exists": True,
+            "mtime": home_hermes.stat().st_mtime_ns,
+            "files": files,
+        }
+
+    pre = _snapshot()
+
+    def assert_unchanged():
+        post = _snapshot()
+        assert pre["exists"] == post["exists"], (
+            f"~/.hermes existence changed: pre={pre['exists']} post={post['exists']}"
+        )
+        if pre["exists"]:
+            assert pre["mtime"] == post["mtime"], (
+                f"~/.hermes mtime changed: pre={pre['mtime']} post={post['mtime']}"
+            )
+            new_files = post["files"] - pre["files"]
+            removed_files = pre["files"] - post["files"]
+            assert not new_files, f"~/.hermes gained files during test: {sorted(new_files)}"
+            assert not removed_files, f"~/.hermes lost files during test: {sorted(removed_files)}"
+
+    yield {"pre": pre, "assert_unchanged": assert_unchanged}
+    # Belt-and-suspenders: if the test forgot to call assert_unchanged, do it here.
+    assert_unchanged()

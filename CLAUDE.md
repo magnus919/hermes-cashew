@@ -83,7 +83,7 @@ The plugin lives at `plugins/memory/cashew/__init__.py` and implements `MemoryPr
 | `get_tool_schemas()` | Exposes `cashew_query` and `cashew_extract` tools |
 | `handle_tool_call(name, args)` | Routes tool calls to Cashew's Python API |
 | `prefetch(query)` | Returns recalled context string before each LLM call |
-| `sync_turn(user, assistant)` | **Must be non-blocking** — run in a daemon thread |
+| `sync_turn(user, assistant)` | **Must be non-blocking** — enqueues onto the bounded sync queue; see Threading Rule |
 | `on_session_end(messages)` | Flush remaining sync work |
 | `shutdown()` | Join any outstanding threads |
 

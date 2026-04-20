@@ -79,22 +79,17 @@ The plugin lives at `plugins/memory/cashew/__init__.py` and implements `MemoryPr
 
 ### Threading Rule
 
-`sync_turn()` is called on the hot path. Any Cashew I/O (extraction, think cycles) **must** happen in a daemon thread. Join with a short timeout before spawning the next:
+`sync_turn()` is called on Hermes's hot path. It must return in under 10 ms. The plugin uses:
 
-```python
-def sync_turn(self, user_content, assistant_content):
-    def _sync():
-        try:
-            # cashew extraction call here
-            ...
-        except Exception as e:
-            logger.warning("cashew sync failed: %s", e)
+- A bounded `queue.Queue(maxsize=16)` for pending turns.
+- A single **non-daemon** worker thread that drains the queue and calls Cashew's extraction API per turn.
+- A sentinel value (not `None` — conflicts with `queue.Queue`'s own close semantics) pushed by `shutdown()` to signal the worker to exit.
+- `shutdown()` joins the worker with a bounded timeout (default 30s, configurable via `sync_queue_timeout`); if the timeout expires, a WARNING is logged and the method returns — it never raises into Hermes.
+- When Cashew raises during extraction, the worker logs `WARNING` with `exc_info=True` and continues draining. One bad turn does not poison the queue.
 
-    if self._sync_thread and self._sync_thread.is_alive():
-        self._sync_thread.join(timeout=5.0)
-    self._sync_thread = threading.Thread(target=_sync, daemon=True)
-    self._sync_thread.start()
-```
+Queue overflow policy and exact sentinel pattern are resolved by `/gsd-research-phase 4` before Phase 4 implementation.
+
+This supersedes the rolling-daemon-thread sketch previously documented here. Daemon threads drop work on shutdown and cannot apply backpressure; the queue-worker pattern ships on day one rather than being a breaking-change retrofit.
 
 ### Profile Isolation
 

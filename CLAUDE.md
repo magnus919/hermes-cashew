@@ -118,14 +118,22 @@ db_path = Path("~/.hermes/cashew/brain.db").expanduser()
 
 ## Cashew Integration
 
-The plugin uses Cashew's Python API directly:
+The plugin uses Cashew's `ContextRetriever` two-step retrieval API (verified 2026-04-20 — see `.planning/phases/03-recall-path-read-only/03-RESEARCH.md` §1 for source references):
 
 ```python
-from core.context import ContextRetriever
-from core.embeddings import load_embeddings
+from core.context import ContextRetriever, RelevantNode
+
+retriever = ContextRetriever(db_path=str(hermes_home / "cashew" / "brain.db"))
+nodes: list[RelevantNode] = retriever.retrieve(query, max_nodes=5)
+context_string: str = retriever.format_context(nodes)
 ```
 
-Cashew requires ~2 GB RAM and downloads the `all-MiniLM-L6-v2` embedding model (~500 MB) on first use. Tests must not trigger the embedding model download — use mocking or a pre-seeded test fixture.
+- `ContextRetriever.__init__` is lazy — no SQLite connection opened, no embeddings loaded, until the first `retrieve()` call.
+- Both `retrieve()` and `format_context()` are synchronous; there is no async variant.
+- `db_path` must be passed explicitly (string, not `pathlib.Path`) — relying on the `CASHEW_DB_PATH` env-var fallback would violate profile isolation (CONF-04).
+- Cashew has no custom exception taxonomy; failures are stdlib exceptions (`sqlite3.OperationalError`, `FileNotFoundError`, `KeyError`, etc.). The silent-degrade path is a bare `except Exception` with `logger.warning(..., exc_info=True)`.
+
+Cashew requires ~2 GB RAM and downloads the `all-MiniLM-L6-v2` embedding model (~500 MB) on first embedding use. Tests must not trigger the embedding model download — `tests/conftest.py` provides a `fake_embedder` autouse fixture that raises `RuntimeError` from every embedding entry point, and Phase 3 tests mock `ContextRetriever.retrieve` / `format_context` at the instance level to bypass the embedding path entirely.
 
 ---
 

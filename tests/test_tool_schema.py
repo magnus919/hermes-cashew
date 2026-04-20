@@ -114,7 +114,14 @@ def test_max_nodes_above_cap_fails_jsonschema_validation():
 
 
 def test_provider_get_tool_schemas_returns_single_cashew_query_schema():
-    """RECALL-02: get_tool_schemas exposes exactly the cashew_query schema."""
+    """RECALL-02 + SYNC-03: get_tool_schemas exposes both tool schemas.
+
+    Phase 3 shipped one schema (cashew_query); Phase 4 Plan 04-02 appended
+    cashew_extract. The first-slot identity invariant (cashew_query is
+    schemas[0]) is preserved so any downstream iteration order assumption
+    remains stable. Both schemas must be module constants, not copies —
+    callers must not mutate them.
+    """
     schemas = CashewMemoryProvider().get_tool_schemas()
-    assert len(schemas) == 1
+    assert len(schemas) == 2, "Phase 4 expects two schemas: cashew_query + cashew_extract"
     assert schemas[0] is CASHEW_QUERY_SCHEMA, "get_tool_schemas must return the module constant, not a copy"

@@ -14,7 +14,13 @@ Contract per PHASE_DESIGN_NOTES Decision Point 3:
     Exception types/messages never leak through these builders — the caller is
     expected to logger.warning(..., exc_info=True) for the audit trail.
 
-Phase 4 will add CASHEW_EXTRACT_SCHEMA and a matching envelope pair here.
+Phase 4 additions (shipped in Plan 04-02):
+  - EXTRACT_TOOL_NAME + CASHEW_EXTRACT_SCHEMA for the cashew_extract
+    tool (synchronous, bypasses the sync queue).
+  - build_extract_success_envelope / build_extract_error_envelope
+    return JSON strings in shape {ok/tool/new_nodes/new_edges} (success)
+    or {ok/tool/error} (error). Extract envelopes do NOT echo
+    user/assistant content — PHASE_DESIGN_NOTES Decision Point 7.
 """
 from __future__ import annotations
 
@@ -23,8 +29,11 @@ from typing import Any
 
 __all__ = [
     "CASHEW_QUERY_SCHEMA",
+    "CASHEW_EXTRACT_SCHEMA",
     "build_success_envelope",
     "build_error_envelope",
+    "build_extract_success_envelope",
+    "build_extract_error_envelope",
 ]
 
 TOOL_NAME: str = "cashew_query"
@@ -119,4 +128,95 @@ def build_error_envelope(
         "tool": TOOL_NAME,
         "error": error_message,
         "query": query,
+    })
+
+
+EXTRACT_TOOL_NAME: str = "cashew_extract"
+"""Stable extract-tool identifier. Separate from TOOL_NAME ('cashew_query')
+so both schemas can live in the same module without string duplication."""
+
+
+CASHEW_EXTRACT_SCHEMA: dict[str, Any] = {
+    "name": EXTRACT_TOOL_NAME,
+    "description": (
+        "Explicitly persist a conversation turn into the Cashew thought graph. "
+        "Use when the LLM judges that this turn contains important knowledge, "
+        "decisions, or beliefs worth extracting immediately rather than waiting "
+        "for the background sync to process it. Returns an ack with counts of "
+        "new nodes and edges created."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "user_content": {
+                "type": "string",
+                "description": "The user's message text in this turn.",
+            },
+            "assistant_content": {
+                "type": "string",
+                "description": "The assistant's reply text in this turn.",
+            },
+        },
+        "required": ["user_content", "assistant_content"],
+        "additionalProperties": False,
+    },
+}
+"""Anthropic-format tool schema for cashew_extract.
+
+Description length: 325 characters (>= 50-char SYNC-03 floor with ~6x
+headroom). Do NOT paraphrase — Plan 04-03 asserts the exact wording.
+Mirrors CASHEW_QUERY_SCHEMA shape (Phase 3 Plan 03-02): input_schema key
+(Anthropic, not OpenAI parameters), explicit required, additionalProperties
+False.
+"""
+
+
+def build_extract_success_envelope(new_nodes: int, new_edges: int) -> str:
+    """Return a json.dumps(...) string for a successful cashew_extract call.
+
+    Args:
+        new_nodes: Count of new ThoughtNodes created — from
+            `len(ExtractionResult.new_nodes)`.
+        new_edges: Count of new DerivationEdges created — from
+            `len(ExtractionResult.new_edges)`.
+
+    Returns:
+        A JSON string. Never None, never raises for int inputs.
+
+    Shape:
+        {"ok": true, "tool": "cashew_extract", "new_nodes": N, "new_edges": M}
+    """
+    return json.dumps({
+        "ok": True,
+        "tool": EXTRACT_TOOL_NAME,
+        "new_nodes": new_nodes,
+        "new_edges": new_edges,
+    })
+
+
+def build_extract_error_envelope(error_message: str = "cashew extract failed") -> str:
+    """Return a json.dumps(...) string for a failed cashew_extract call.
+
+    Args:
+        error_message: GENERIC error label. Must NOT contain exception types,
+            file paths, line numbers, or traceback fragments. The full
+            traceback is the caller's responsibility to route to
+            logger.warning with exc_info=True. Intentionally does NOT accept
+            an exception argument — structural stack-trace-leak prevention,
+            matching Phase 3's build_error_envelope.
+
+    Returns:
+        A JSON string. Never None, never raises.
+
+    Shape:
+        {"ok": false, "tool": "cashew_extract", "error": <message>}
+
+    Note: unlike build_error_envelope (query tool) this envelope does NOT
+    echo user/assistant content. See PHASE_DESIGN_NOTES Decision Point 7 —
+    the LLM already has both strings in its context.
+    """
+    return json.dumps({
+        "ok": False,
+        "tool": EXTRACT_TOOL_NAME,
+        "error": error_message,
     })

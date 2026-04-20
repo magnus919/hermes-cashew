@@ -1,0 +1,12 @@
+# Schema verified from NousResearch/hermes-agent/plugins/memory/{honcho,hindsight}/plugin.yaml@main
+# Hooks list is minimal for Phase 1 — add on_turn_start / on_pre_compress / on_memory_write / on_delegation in later phases
+# as their methods are implemented. Declaring a hook here whose method doesn't yet exist may trip loader probes.
+manifest_version: 1
+name: cashew
+version: 0.1.0
+description: "Cashew — persistent thought-graph memory with local embeddings, organic decay, and autonomous think cycles."
+pip_dependencies:
+  - "cashew-brain"
+requires_env: []
+hooks:
+  - on_session_end

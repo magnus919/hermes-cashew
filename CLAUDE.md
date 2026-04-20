@@ -27,11 +27,21 @@ When active, this provider feeds Cashew-retrieved context into Hermes' system pr
 
 Hermes imposes a specific plugin path — the non-obvious part:
 
+> **Layout note (verified 2026-04-19 via Phase 1 Plan 01 spike — see `.planning/phases/01-scaffolding-discovery-packaging/01-01-SPIKE-REPORT.md`):** Two load paths need to be satisfied. The pip-installed wheel exposes `plugins.memory.cashew` for `import plugins.memory.cashew`. The `hermes plugins install` flow git-clones our repo root to `$HERMES_HOME/plugins/cashew/` and the memory loader scans that directory for `__init__.py` **directly** (no recursion into `plugins/memory/cashew/`). This requires a **dual layout**: a thin root `__init__.py` that re-exports from the nested module, plus the real implementation under `plugins/memory/cashew/__init__.py`. `plugins/` and `plugins/memory/` stay as PEP 420 namespace packages (no `__init__.py`) so they merge cleanly with Hermes's bundled plugins namespace.
+
 ```
-plugins/memory/cashew/
-├── __init__.py      # CashewMemoryProvider + register()
-├── plugin.yaml      # Hermes plugin metadata
-└── README.md        # End-user setup guide
+hermes-cashew/                   # repo root (= $HERMES_HOME/plugins/cashew/ after `hermes plugins install`)
+├── __init__.py                  # FLAT entry — re-exports CashewMemoryProvider + register from plugins.memory.cashew
+├── plugin.yaml                  # Manifest — name: cashew, manifest_version: 1 (read by `hermes plugins install`)
+├── pyproject.toml
+├── plugins/                     # PEP 420 namespace — NO __init__.py
+│   └── memory/                  # PEP 420 namespace — NO __init__.py
+│       └── cashew/
+│           ├── __init__.py      # Real CashewMemoryProvider + register() implementation
+│           └── plugin.yaml      # Hermes plugin metadata (bundled-loader convention)
+├── tests/
+├── .github/workflows/tests.yml
+└── ...
 ```
 
 Tests live in `tests/`; CI in `.github/workflows/tests.yml`.

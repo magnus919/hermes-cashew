@@ -7,6 +7,7 @@ cashew.json
 
 # Python
 __pycache__/
+*.pyc
 *.py[cod]
 *$py.class
 *.so
@@ -49,4 +50,7 @@ htmlcov/
 
 # Cashew runtime artifacts
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
 .hermes/

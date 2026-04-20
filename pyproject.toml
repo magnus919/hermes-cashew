@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling>=1.29"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-cashew"
+version = "0.1.0"
+description = "Hermes Agent memory provider plugin backed by Cashew thought-graph memory."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "Magnus Hedemark", email = "magnus919@pm.me" }]
+dependencies = [
+    # Phase 1 pin: cashew-brain not yet on PyPI. Migrate to PyPI specifier in Phase 5 before production release.
+    "cashew-brain @ git+https://github.com/rajkripal/cashew.git@90d1c73b700d567a3518551dc115021eb5296bac",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2,<10",
+    "pytest-asyncio>=1.3",
+    "pytest-mock>=3.15",
+    "PyYAML>=6.0",
+    "build>=1.0",
+]
+
+[project.entry-points."hermes_agent.plugins"]
+cashew = "plugins.memory.cashew:register"
+
+[project.urls]
+Homepage   = "https://github.com/magnus919/hermes-cashew"
+Repository = "https://github.com/magnus919/hermes-cashew"
+Issues     = "https://github.com/magnus919/hermes-cashew/issues"
+
+[tool.hatch.build.targets.wheel]
+# Intentional PEP 420 namespace package — do NOT add __init__.py at plugins/ or plugins/memory/.
+# Doing so would shadow Hermes's bundled memory providers when both are on sys.path.
+packages = ["plugins"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

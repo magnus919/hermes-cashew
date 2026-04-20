@@ -15,10 +15,13 @@ from typing import Any
 class MemoryManager:
     """Minimal stand-in for Hermes's agent.memory_manager.MemoryManager.
 
-    Implements only the five methods Phase 3's E2E test exercises:
-      add_provider, initialize_all, handle_tool_call, on_session_end, shutdown_all.
+    Implements six methods for Phase 3 + Phase 4 E2E tests:
+      add_provider, initialize_all, handle_tool_call, sync_all, on_session_end,
+      shutdown_all.
 
-    Phase 4 will extend with sync_all when the write path ships.
+    `sync_all` was added in Phase 4 Plan 04-04 to exercise the write path
+    through the same per-provider iteration pattern as initialize_all /
+    on_session_end / shutdown_all.
     """
 
     def __init__(self) -> None:
@@ -43,6 +46,15 @@ class MemoryManager:
             if any(s.get("name") == name for s in schemas):
                 return p.handle_tool_call(name, args)
         return None
+
+    def sync_all(self, user_content: str, assistant_content: str) -> None:
+        """Route a completed turn through each registered provider's sync_turn.
+
+        Phase 4 addition. Mirrors the per-provider iteration pattern of
+        initialize_all / on_session_end / shutdown_all.
+        """
+        for p in self._providers:
+            p.sync_turn(user_content, assistant_content)
 
     def on_session_end(self, messages: list) -> None:
         for p in self._providers:

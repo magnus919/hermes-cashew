@@ -78,3 +78,79 @@ def test_memory_manager_routes_unknown_tool_to_none(tmp_path):
         )
     finally:
         mgr.shutdown_all()
+
+
+def test_full_lifecycle_with_sync_path(tmp_path, monkeypatch):
+    """TEST-01 extended: MemoryManager.sync_all exercises the Phase 4 write path.
+
+    add_provider -> initialize_all -> handle_tool_call (Phase 3 cashew_query) ->
+    sync_all x3 (Phase 4 write path) -> handle_tool_call (Phase 4 cashew_extract)
+    -> on_session_end -> shutdown_all.
+
+    Mocks both:
+      - ContextRetriever instance (Phase 3 pattern) for cashew_query.
+      - core.session.end_session (Phase 4 pattern) for the worker drain
+        AND the cashew_extract synchronous path.
+    """
+    import threading
+    import time
+    import types
+    from unittest.mock import MagicMock
+
+    calls: list = []
+    def _fake(**kwargs):
+        calls.append(kwargs)
+        return types.SimpleNamespace(new_nodes=["n1"], new_edges=[], updated_nodes=[])
+    monkeypatch.setattr("core.session.end_session", _fake, raising=False)
+
+    baseline = threading.active_count()
+    mgr = MemoryManager()
+    provider = CashewMemoryProvider()
+    provider.save_config({}, str(tmp_path))
+    mgr.add_provider(provider)
+
+    start = time.monotonic()
+    mgr.initialize_all("session-e2e-04", hermes_home=str(tmp_path))
+
+    # Swap in a mocked retriever so Phase 3 tools.py happy path works.
+    provider._retriever = MagicMock()
+    provider._retriever.retrieve.return_value = [MagicMock()]
+    provider._retriever.format_context.return_value = "recalled context"
+
+    # Phase 3 tool — recall path
+    q_result = mgr.handle_tool_call("cashew_query", {"query": "what did we decide"})
+    assert isinstance(q_result, str)
+    assert json.loads(q_result)["ok"] is True
+
+    # Phase 4 write path — sync_all
+    for i in range(3):
+        mgr.sync_all(f"user-{i}", f"assistant-{i}")
+
+    # Phase 4 tool — synchronous extract path
+    x_result = mgr.handle_tool_call("cashew_extract", {
+        "user_content": "important turn",
+        "assistant_content": "noted",
+    })
+    assert isinstance(x_result, str)
+    assert json.loads(x_result) == {
+        "ok": True, "tool": "cashew_extract", "new_nodes": 1, "new_edges": 0,
+    }
+
+    # Session end bounded-drains the sync_all queue
+    mgr.on_session_end([])
+    mgr.shutdown_all()
+    elapsed = time.monotonic() - start
+    assert elapsed < 5.0, f"E2E over budget: {elapsed*1000:.0f}ms (cap 5s per TEST-01)"
+
+    # Thread-leak guard (Phase 4 contract)
+    deadline = time.monotonic() + 2.0
+    while threading.active_count() > baseline and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert threading.active_count() == baseline, (
+        f"post-E2E thread leak: {threading.active_count()} vs {baseline}"
+    )
+
+    # Sanity: end_session was called at least once via the sync_all path
+    # (may be more via cashew_extract). Drop-oldest may have eliminated some
+    # of the 3 sync_all turns, but extract is synchronous so count >= 1.
+    assert len(calls) >= 1

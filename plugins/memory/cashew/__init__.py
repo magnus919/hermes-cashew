@@ -145,6 +145,46 @@ class CashewMemoryProvider(MemoryProvider):
         self._retriever = None
         logger.debug("cashew provider shutdown complete (Phase 3 — no worker yet, retriever cleared)")
 
+    def prefetch(self, query: str) -> str:
+        """Return recalled-context string from Cashew, respecting `recall_k` (RECALL-01).
+
+        Contract (PHASE_DESIGN_NOTES Decision Point 1 + 03-RESEARCH.md §§1, 2, 8):
+        - Half-state guard: if `_retriever is None` (initialize was never called OR
+          corrupt config / resolve failure left the provider in the silent-degrade
+          state), return `""` without logging. `initialize()` already emitted the
+          WARNING when it set `_retriever = None`; we do not double-log.
+        - Happy path: `retrieve(query, max_nodes=recall_k)` + `format_context(nodes)`.
+          Both methods are synchronous per 03-RESEARCH.md §1. Empty result is valid
+          (returns `""` without logging — empty graph is not a failure).
+        - Failure path: `except Exception` (no Cashew exception taxonomy per
+          03-RESEARCH.md §2). Log exactly ONE `WARNING` with `exc_info=True` and
+          return `""`. Never raise into Hermes (silent-degrade is a PROJECT.md Key
+          Decision).
+
+        Args:
+            query: The search query string. Passed through to Cashew's retrieve
+                call as a typed parameter — NO string concatenation into SQL (threat
+                T-03-01-01 mitigated by Cashew's parameterized queries).
+
+        Returns:
+            Formatted context string on success (may be the empty string if Cashew
+            has nothing relevant or errored). Never None, never raises.
+        """
+        if self._retriever is None or self._config is None:
+            # Half-state: initialize() never ran OR ran and silent-degraded.
+            # The relevant WARNING was already emitted by initialize(); stay quiet.
+            return ""
+        try:
+            nodes = self._retriever.retrieve(query, max_nodes=self._config.recall_k)
+            return self._retriever.format_context(nodes)
+        except Exception:
+            logger.warning(
+                "cashew recall failed for query=%r",
+                query,
+                exc_info=True,
+            )
+            return ""
+
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         # Phase 3 adds cashew_query, Phase 4 adds cashew_extract
         return []

@@ -208,6 +208,66 @@ class CashewMemoryProvider(MemoryProvider):
         """
         return [CASHEW_QUERY_SCHEMA]
 
+    def handle_tool_call(self, name: str, args: Dict[str, Any]) -> str:
+        """Route an LLM tool call to the Cashew backend (RECALL-03).
+
+        Returns a `json.dumps(...)` string in all cases — success envelope on happy
+        path, error envelope on any failure. NEVER raises into Hermes. NEVER leaks
+        a stack trace in the returned payload (success criterion #3 via envelope
+        builders in plugins.memory.cashew.tools).
+
+        Silent-degrade paths:
+          - Unknown tool name -> error envelope + WARNING (no exc_info).
+          - Half-state (_retriever is None or _config is None) -> error envelope,
+            no log (initialize already warned).
+          - Retrieval failure (including KeyError on missing "query") -> error
+            envelope + WARNING with exc_info=True.
+
+        Args:
+            name: Tool identifier. Phase 3 accepts only "cashew_query"; anything
+                else routes to the unknown-tool error path. Phase 4 adds
+                "cashew_extract".
+            args: Parameter dict from the LLM. Expected shape depends on tool;
+                for cashew_query: {"query": <str>, "max_nodes"?: <int>}.
+
+        Returns:
+            JSON string (see plugins.memory.cashew.tools.build_success_envelope /
+            build_error_envelope for exact shapes).
+        """
+        if name != "cashew_query":
+            logger.warning("cashew unknown tool call: %r", name)
+            return build_error_envelope(query=None, error_message="unknown tool")
+
+        # Half-state guard (PHASE_DESIGN_NOTES Decision Point 1 + 03-RESEARCH.md §8):
+        # match Plan 03-01's prefetch contract. No log here — initialize already
+        # emitted the WARNING that set _retriever = None.
+        if self._retriever is None or self._config is None:
+            return build_error_envelope(
+                query=args.get("query"),
+                error_message="cashew recall failed",
+            )
+
+        try:
+            query = args["query"]  # KeyError caught below — counts as tool-call failure
+            max_nodes = args.get("max_nodes", self._config.recall_k)
+            nodes = self._retriever.retrieve(query, max_nodes=max_nodes)
+            context = self._retriever.format_context(nodes)
+            return build_success_envelope(
+                query=query,
+                context=context,
+                node_count=len(nodes),
+            )
+        except Exception:
+            logger.warning(
+                "cashew tool call %r failed",
+                name,
+                exc_info=True,
+            )
+            return build_error_envelope(
+                query=args.get("query"),
+                error_message="cashew recall failed",
+            )
+
     # All other ABC methods are inherited as no-ops from the ABC defaults (when Hermes is present).
 
 

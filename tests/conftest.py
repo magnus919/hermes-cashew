@@ -61,8 +61,14 @@ def fake_embedder(monkeypatch):
     """Block any attempt to load a real sentence-transformers model.
 
     Phase 1 tests don't touch Cashew, so this fixture is defensive scaffolding that Phase 3+ inherits.
-    If Cashew's core.embeddings module is importable in this environment, patch load_embeddings to a
-    RuntimeError-raising stub; if not (Phase 1 typical), the fixture is a no-op.
+    If Cashew's core.embeddings module is importable in this environment, patch every public
+    model-loading/inference entry point to a RuntimeError-raising stub; if not (unusual in Phase 1,
+    since cashew-brain IS a declared runtime dep), the fixture is a no-op.
+
+    Candidate function names cover both the plan's historical spec (`load_embeddings`) and the
+    actual Cashew API surface observed at pin 90d1c73 (`embed_text`, `embed_nodes`, `load_all_embeddings`).
+    `raising=False` makes each patch a no-op if that attribute is absent on the current Cashew version —
+    the fixture is belt-and-suspenders, not a pinned-version contract.
     """
     def _stub(*args, **kwargs):
         raise RuntimeError(
@@ -70,7 +76,8 @@ def fake_embedder(monkeypatch):
         )
     try:
         import core.embeddings  # noqa: F401
-        monkeypatch.setattr("core.embeddings.load_embeddings", _stub)
+        for attr in ("load_embeddings", "load_all_embeddings", "embed_text", "embed_nodes"):
+            monkeypatch.setattr(f"core.embeddings.{attr}", _stub, raising=False)
     except ImportError:
         pass
     yield

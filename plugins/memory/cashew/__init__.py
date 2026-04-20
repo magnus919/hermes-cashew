@@ -21,6 +21,13 @@ from plugins.memory.cashew.config import (
     save_config as _config_save_config,
 )
 
+try:
+    from core.context import ContextRetriever
+except ImportError:
+    # Cashew not installed — plugin still loads (for wheel-smoke + discovery paths).
+    # initialize() will silent-degrade if ContextRetriever is unavailable at runtime.
+    ContextRetriever = None  # type: ignore[assignment,misc]
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,8 +35,10 @@ class CashewMemoryProvider(MemoryProvider):
     """Cashew thought-graph memory provider for Hermes Agent."""
 
     def __init__(self) -> None:
-        # Phase 1 placeholders preserved
-        self._retriever = None          # Phase 3
+        # Phase 3 — eager lifecycle: constructed in initialize() once _db_path is
+        # known, cleared in shutdown(). None during Phase 2 half-state (corrupt
+        # config) so prefetch() + handle_tool_call() can short-circuit uniformly.
+        self._retriever: "ContextRetriever | None" = None
         # Phase 2 lifecycle state (None until initialize() runs)
         self._hermes_home: pathlib.Path | None = None
         self._config: CashewConfig | None = None
@@ -95,14 +104,24 @@ class CashewMemoryProvider(MemoryProvider):
         try:
             self._config = load_config(self._hermes_home)
             self._db_path = resolve_db_path(self._hermes_home, self._config.cashew_db_path)
+            # Phase 3 eager construction (PHASE_DESIGN_NOTES Decision Point 1).
+            # ContextRetriever.__init__ is lazy — no SQLite open, no embedding load yet.
+            # Guard against the defensive-import fallback (ContextRetriever = None).
+            if ContextRetriever is None:
+                raise RuntimeError(
+                    "core.context.ContextRetriever unavailable at import time; "
+                    "cashew-brain dependency missing"
+                )
+            self._retriever = ContextRetriever(db_path=str(self._db_path))
         except Exception:
             logger.warning(
-                "cashew config load failed at %s; provider will report unavailable until config is fixed",
+                "cashew initialize failed at %s; provider will report unavailable until fixed",
                 resolve_config_path(self._hermes_home),
                 exc_info=True,
             )
             self._config = None
             self._db_path = None
+            self._retriever = None
 
     def shutdown(self) -> None:
         """Tear down the provider (ABC contract; safe no-op pre-initialize).
@@ -123,7 +142,8 @@ class CashewMemoryProvider(MemoryProvider):
         self._sync_queue = None
         self._config = None
         self._db_path = None
-        logger.debug("cashew provider shutdown complete (Phase 2 — no worker yet)")
+        self._retriever = None
+        logger.debug("cashew provider shutdown complete (Phase 3 — no worker yet, retriever cleared)")
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         # Phase 3 adds cashew_query, Phase 4 adds cashew_extract

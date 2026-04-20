@@ -164,7 +164,7 @@ def test_initialize_does_not_import_cashew_runtime(tmp_path):
     try:
         post = set(sys.modules.keys())
         new = post - pre
-        forbidden = {"core.context", "core.embeddings"}
+        forbidden = {"core.embeddings"}  # Phase 3: core.context is now legitimately loaded at initialize; embedding still lazy.
         assert not (new & forbidden), (
             f"initialize() loaded forbidden Cashew runtime modules: {new & forbidden}"
         )
@@ -183,7 +183,7 @@ def test_initialize_silent_degrades_on_corrupt_config(tmp_path, caplog):
         assert p._db_path is None
         # WARNING was logged with exc_info
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert any("cashew config load failed" in r.getMessage() for r in warnings), (
+        assert any("cashew initialize failed" in r.getMessage() for r in warnings), (
             f"expected silent-degrade WARNING; got {[r.getMessage() for r in warnings]}"
         )
         # is_available probes the file directly — the file still exists, just is corrupt.

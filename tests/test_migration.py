@@ -160,3 +160,76 @@ def test_metadata_backfill(tmp_path):
         conn.close()
     finally:
         p.shutdown()
+
+
+def test_vec_embeddings_guarded_when_unavailable(tmp_path, caplog):
+    """SCHEMA-04: When sqlite-vec is unavailable, initialize() succeeds and logs INFO."""
+    p = CashewMemoryProvider()
+    with caplog.at_level("INFO", logger="plugins.memory.cashew"):
+        p.initialize("s", hermes_home=str(tmp_path))
+    try:
+        # Must succeed even though sqlite-vec is not installed in test environment
+        assert p._config is not None, "initialize() must succeed when sqlite-vec is unavailable"
+        assert p._db_path is not None
+        infos = [r for r in caplog.records if r.levelname == "INFO"]
+        assert any(
+            "sqlite-vec not available" in r.getMessage() for r in infos
+        ), (
+            f"Expected INFO about sqlite-vec unavailability; got: "
+            f"{[r.getMessage() for r in infos]}"
+        )
+    finally:
+        p.shutdown()
+
+
+def test_existing_data_preserved(tmp_path):
+    """SCHEMA-06: All existing row data is preserved after migration."""
+    db_path = tmp_path / "cashew" / "brain.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    _make_v0_1_0_db(db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "INSERT INTO thought_nodes (id, content, node_type, domain, timestamp, confidence) "
+        "VALUES ('n1', 'hello world', 'fact', 'test-domain', '2024-01-01T00:00:00', 0.95)"
+    )
+    conn.commit()
+    conn.close()
+
+    p = CashewMemoryProvider()
+    p.initialize("s", hermes_home=str(tmp_path))
+    try:
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT id, content, node_type, domain, timestamp, confidence "
+            "FROM thought_nodes WHERE id = 'n1'"
+        ).fetchone()
+        assert row == ("n1", "hello world", "fact", "test-domain", "2024-01-01T00:00:00", 0.95), (
+            f"Existing data was corrupted during migration: {row}"
+        )
+        conn.close()
+    finally:
+        p.shutdown()
+
+
+def test_fresh_db_has_all_columns(tmp_path):
+    """Fresh DB (no prior schema) gets the complete v0.2.0 schema on first initialize()."""
+    p = CashewMemoryProvider()
+    p.initialize("s", hermes_home=str(tmp_path))
+    try:
+        import pathlib
+        db_path = pathlib.Path(str(tmp_path)) / "cashew" / "brain.db"
+        conn = sqlite3.connect(str(db_path))
+        cols = _get_columns(conn, "thought_nodes")
+        assert "reasoning" in cols
+        assert "mood_state" in cols
+        assert "metadata" in cols
+        assert "permanent" in cols
+        assert "last_updated" in cols
+        assert "last_accessed" in cols
+        assert "access_count" in cols
+        assert "tags" in cols
+        assert "referent_time" in cols
+        conn.close()
+    finally:
+        p.shutdown()

@@ -86,6 +86,7 @@ The plugin lives at `plugins/memory/cashew/__init__.py` and implements `MemoryPr
 | `sync_turn(user, assistant)` | **Must be non-blocking** — enqueues onto the bounded sync queue; see Threading Rule |
 | `on_session_end(messages)` | Flush remaining sync work |
 | `shutdown()` | Join any outstanding threads |
+| `system_prompt_block()` | Returns a ~10-line LLM-visible status string for the system prompt |
 
 ### Threading Rule
 

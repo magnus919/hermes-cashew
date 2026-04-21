@@ -455,6 +455,58 @@ class CashewMemoryProvider(MemoryProvider):
             logger.warning("cashew unknown tool call: %r", name)
             return build_error_envelope(query=None, error_message="unknown tool")
 
+    def system_prompt_block(self) -> str:
+        """Return a ~10-line LLM-visible status string for the system prompt (UX-01).
+
+        The returned string is included verbatim in Hermes's assembled system prompt
+        so the LLM can reason about what memory is available.
+
+        Format (~10 lines):
+            [cashew] memory provider: available
+            graph: <N> nodes, <M> edges
+            recall depth: <recall_k>
+
+        When unavailable or empty: clearly signals the LLM should not expect recall.
+        Never raises. Returns a plain str, not a dict or JSON.
+        """
+        if self._config is None or self._hermes_home is None:
+            return "[cashew] memory provider: not configured\n"
+
+        try:
+            recall_k = self._config.recall_k
+        except AttributeError:
+            recall_k = 5
+
+        if self._db_path is None:
+            return (
+                f"[cashew] memory provider: available (db not initialized)\n"
+                f"graph: uninitialized\n"
+                f"recall depth: {recall_k}\n"
+            )
+
+        try:
+            import sqlite3
+            conn = sqlite3.connect(str(self._db_path))
+            cursor = conn.execute(
+                "SELECT COUNT(*), (SELECT COUNT(*) FROM derivation_edges) FROM thought_nodes"
+            )
+            row = cursor.fetchone()
+            conn.close()
+            node_count = row[0] if row else 0
+            edge_count = row[1] if row else 0
+            if node_count == 0:
+                graph_state = "empty"
+            else:
+                graph_state = f"{node_count} nodes, {edge_count} edges"
+        except Exception:
+            graph_state = "unknown"
+
+        return (
+            f"[cashew] memory provider: available\n"
+            f"graph: {graph_state}\n"
+            f"recall depth: {recall_k}\n"
+        )
+
     # All other ABC methods are inherited as no-ops from the ABC defaults (when Hermes is present).
 
 

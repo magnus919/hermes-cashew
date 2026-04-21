@@ -182,7 +182,7 @@ class CashewMemoryProvider(MemoryProvider):
         )
         self._sync_worker.start()
 
-    def sync_turn(self, user_content: str, assistant_content: str) -> None:
+    def sync_turn(self, user_content: str, assistant_content: str, session_id: str = "") -> None:
         """Hot-path enqueue of a completed turn (SYNC-01).
 
         Contract: returns in <10ms. Never raises. If the queue is full, drops the
@@ -194,7 +194,7 @@ class CashewMemoryProvider(MemoryProvider):
         """
         if self._sync_queue is None:
             return  # not initialized or silent-degraded; no worker to feed
-        turn = (user_content, assistant_content)
+        turn = (user_content, assistant_content, session_id)
         try:
             self._sync_queue.put_nowait(turn)
         except queue.Full:
@@ -378,10 +378,10 @@ class CashewMemoryProvider(MemoryProvider):
         §§1, 6.2 — no LLM round-trip).
         """
         from core.session import end_session  # lazy import (see 04-RESEARCH.md §9 + test strategy §11)
-        user, assistant = turn
+        user, assistant, session_id = turn
         end_session(
             db_path=str(self._db_path),
-            session_id=self._session_id,
+            session_id=session_id or self._session_id,
             conversation_text=f"User: {user}\nAssistant: {assistant}",
             model_fn=None,
         )

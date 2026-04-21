@@ -258,6 +258,7 @@ class CashewMemoryProvider(MemoryProvider):
         import sqlite3
         conn = sqlite3.connect(str(db_path))
         try:
+            # Step 1: thought_nodes — base table + column migration (per D-07)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS thought_nodes (
                     id TEXT PRIMARY KEY,
@@ -279,6 +280,15 @@ class CashewMemoryProvider(MemoryProvider):
                     reasoning TEXT
                 )
             """)
+            try:
+                conn.execute("BEGIN")
+                self._add_missing_columns(conn)
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                logger.warning("thought_nodes schema migration failed", exc_info=True)
+
+            # Step 2: derivation_edges — base table + timestamp constraint migration (per D-07)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS derivation_edges (
                     parent_id TEXT,
@@ -292,6 +302,15 @@ class CashewMemoryProvider(MemoryProvider):
                     FOREIGN KEY (child_id) REFERENCES thought_nodes(id)
                 )
             """)
+            try:
+                conn.execute("BEGIN")
+                self._migrate_edges_timestamp_not_null(conn)
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                logger.warning("derivation_edges schema migration failed", exc_info=True)
+
+            # Step 3: embeddings table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS embeddings (
                     node_id TEXT PRIMARY KEY,
@@ -301,10 +320,16 @@ class CashewMemoryProvider(MemoryProvider):
                     FOREIGN KEY (node_id) REFERENCES thought_nodes(id)
                 )
             """)
+            try:
+                conn.execute("BEGIN")
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                logger.warning("embeddings schema migration failed", exc_info=True)
 
-            self._migrate_edges_timestamp_not_null(conn)
+            # Step 4: vec_embeddings virtual table (guarded, no explicit transaction needed — DDL auto-commits)
+            self._create_vec_embeddings(conn)
 
-            conn.commit()
         finally:
             conn.close()
 

@@ -153,6 +153,7 @@ class CashewMemoryProvider(MemoryProvider):
                     "cashew-brain dependency missing"
                 )
             self._db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._ensure_db_schema(self._db_path)
             self._retriever = ContextRetriever(db_path=str(self._db_path))
             # Phase 4: start the sync worker AFTER all worker-read state
             # is populated (db_path, session_id, sync_queue). Pitfall 4.
@@ -240,6 +241,65 @@ class CashewMemoryProvider(MemoryProvider):
                 logger.warning("cashew sync worker: turn failed", exc_info=True)
             finally:
                 q.task_done()
+
+    def _ensure_db_schema(self, db_path: pathlib.Path) -> None:
+        """Create Cashew schema tables if they do not exist.
+
+        Cashew's _ensure_schema() only runs ALTER TABLE migrations (adds missing
+        columns) — it does NOT create tables from scratch. On a fresh DB, this
+        method creates the three required tables so that end_session() can run
+        without 'no such table' errors.
+
+        This matches the schema defined in verify.py (which is the canonical
+        reference) and in the cashew-brain CLI's init-db command.
+        """
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS thought_nodes (
+                    id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    node_type TEXT NOT NULL,
+                    domain TEXT,
+                    timestamp TEXT,
+                    access_count INTEGER DEFAULT 0,
+                    last_accessed TEXT,
+                    confidence REAL,
+                    source_file TEXT,
+                    decayed INTEGER DEFAULT 0,
+                    metadata TEXT DEFAULT '{}',
+                    last_updated TEXT,
+                    mood_state TEXT,
+                    permanent INTEGER DEFAULT 0,
+                    tags TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS derivation_edges (
+                    parent_id TEXT,
+                    child_id TEXT,
+                    weight REAL,
+                    reasoning TEXT,
+                    confidence REAL,
+                    timestamp TEXT,
+                    PRIMARY KEY (parent_id, child_id),
+                    FOREIGN KEY (parent_id) REFERENCES thought_nodes(id),
+                    FOREIGN KEY (child_id) REFERENCES thought_nodes(id)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS embeddings (
+                    node_id TEXT PRIMARY KEY,
+                    vector BLOB NOT NULL,
+                    model TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (node_id) REFERENCES thought_nodes(id)
+                )
+            """)
+            conn.commit()
+        finally:
+            conn.close()
 
     def _drain_once(self, turn: tuple[str, str]) -> None:
         """Persist one turn via Cashew's heuristic extractor.

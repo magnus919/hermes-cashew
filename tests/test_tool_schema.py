@@ -16,8 +16,8 @@ CANONICAL_DESCRIPTION_PREFIX = (
 
 
 def test_schema_has_required_top_level_keys():
-    """Schema structural contract — Anthropic tool-schema shape."""
-    assert set(CASHEW_QUERY_SCHEMA.keys()) == {"name", "description", "input_schema"}
+    """Schema structural contract — OpenAI tool-schema shape."""
+    assert set(CASHEW_QUERY_SCHEMA.keys()) == {"name", "description", "parameters"}
     assert CASHEW_QUERY_SCHEMA["name"] == "cashew_query"
 
 
@@ -36,53 +36,52 @@ def test_schema_description_matches_canonical_wording():
     )
 
 
-def test_schema_input_schema_required_is_query_only():
-    """RECALL-02: `required` is explicitly the one-element list [\"query\"]."""
-    input_schema = CASHEW_QUERY_SCHEMA["input_schema"]
-    assert input_schema["required"] == ["query"]
+def test_schema_parameters_required_is_query_only():
+    """RECALL-02: `required` is explicitly the one-element list ["query"]."""
+    params = CASHEW_QUERY_SCHEMA["parameters"]
+    assert params["required"] == ["query"]
 
 
-def test_schema_input_schema_additional_properties_false():
+def test_schema_parameters_additional_properties_false():
     """Defensive: unknown parameters are rejected at schema-validation layer (T-03-02-04)."""
-    assert CASHEW_QUERY_SCHEMA["input_schema"]["additionalProperties"] is False
+    assert CASHEW_QUERY_SCHEMA["parameters"]["additionalProperties"] is False
 
 
 def test_schema_query_property_is_string():
-    props = CASHEW_QUERY_SCHEMA["input_schema"]["properties"]
+    props = CASHEW_QUERY_SCHEMA["parameters"]["properties"]
     assert props["query"]["type"] == "string"
     assert props["query"].get("description"), "query property needs a description"
 
 
 def test_schema_max_nodes_property_is_bounded_integer():
-    props = CASHEW_QUERY_SCHEMA["input_schema"]["properties"]
+    props = CASHEW_QUERY_SCHEMA["parameters"]["properties"]
     mn = props["max_nodes"]
     assert mn["type"] == "integer"
     assert mn["minimum"] == 1
     assert mn["maximum"] == 20
 
 
-def test_schema_uses_anthropic_input_schema_key_naming():
-    """RECALL-02 + 03-RESEARCH.md §3: input_schema, NOT OpenAI's parameters-under-function key."""
-    assert "input_schema" in CASHEW_QUERY_SCHEMA
-    assert "parameters" not in CASHEW_QUERY_SCHEMA
+def test_schema_uses_openai_parameters_key_naming():
+    """OpenAI-format: parameters key, NOT Anthropic's input_schema."""
+    assert "parameters" in CASHEW_QUERY_SCHEMA
+    assert "input_schema" not in CASHEW_QUERY_SCHEMA
     assert "function" not in CASHEW_QUERY_SCHEMA
 
 
 def test_schema_passes_draft7_meta_validation():
     """JSON-Schema structural validity — catches typos / invalid keywords."""
     jsonschema = pytest.importorskip("jsonschema")
-    # Validate the input_schema portion (it's the actual JSON-Schema document; the
-    # outer dict is Anthropic's tool-wrapper, not a JSON-Schema itself).
-    jsonschema.Draft7Validator.check_schema(CASHEW_QUERY_SCHEMA["input_schema"])
+    # Validate the parameters portion (it's the actual JSON-Schema document).
+    jsonschema.Draft7Validator.check_schema(CASHEW_QUERY_SCHEMA["parameters"])
 
 
 def test_valid_args_pass_jsonschema_validation():
     """Positive: a well-formed LLM call validates."""
     jsonschema = pytest.importorskip("jsonschema")
-    jsonschema.validate({"query": "hello"}, CASHEW_QUERY_SCHEMA["input_schema"])
+    jsonschema.validate({"query": "hello"}, CASHEW_QUERY_SCHEMA["parameters"])
     jsonschema.validate(
         {"query": "hello", "max_nodes": 5},
-        CASHEW_QUERY_SCHEMA["input_schema"],
+        CASHEW_QUERY_SCHEMA["parameters"],
     )
 
 
@@ -90,7 +89,7 @@ def test_missing_query_fails_jsonschema_validation():
     """Negative: required field enforcement."""
     jsonschema = pytest.importorskip("jsonschema")
     with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate({}, CASHEW_QUERY_SCHEMA["input_schema"])
+        jsonschema.validate({}, CASHEW_QUERY_SCHEMA["parameters"])
 
 
 def test_unknown_parameter_fails_jsonschema_validation():
@@ -99,7 +98,7 @@ def test_unknown_parameter_fails_jsonschema_validation():
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(
             {"query": "x", "bogus": 1},
-            CASHEW_QUERY_SCHEMA["input_schema"],
+            CASHEW_QUERY_SCHEMA["parameters"],
         )
 
 
@@ -109,7 +108,7 @@ def test_max_nodes_above_cap_fails_jsonschema_validation():
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(
             {"query": "x", "max_nodes": 100},
-            CASHEW_QUERY_SCHEMA["input_schema"],
+            CASHEW_QUERY_SCHEMA["parameters"],
         )
 
 

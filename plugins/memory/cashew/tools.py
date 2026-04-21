@@ -1,7 +1,7 @@
 """Tool-surface helpers for the Cashew memory provider.
 
 This module owns:
-  - CASHEW_QUERY_SCHEMA (dict): Anthropic-style tool schema for the cashew_query tool.
+  - CASHEW_QUERY_SCHEMA (dict): OpenAI-style tool schema for the cashew_query tool.
     Structure matches 03-RESEARCH.md §3; description wording matches PHASE_DESIGN_NOTES
     Decision Point 6.
   - build_success_envelope / build_error_envelope: pure functions that return
@@ -50,7 +50,7 @@ CASHEW_QUERY_SCHEMA: dict[str, Any] = {
         "or knowledge the agent may have stored in a previous session. "
         "Returns a formatted context string that cites source nodes."
     ),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "query": {
@@ -68,11 +68,7 @@ CASHEW_QUERY_SCHEMA: dict[str, Any] = {
         "additionalProperties": False,
     },
 }
-"""Anthropic-format tool schema (input_schema, not OpenAI's parameters).
-
-Per 03-RESEARCH.md §3: Hermes's ABC is schema-format-agnostic at the plugin layer —
-it returns whatever the provider emits and adapts per downstream LLM. We target
-Nous Research's Hermes (Anthropic-first), so input_schema is the correct key.
+"""OpenAI-format tool schema (parameters, not Anthropic's input_schema).
 
 Description length: 284 characters (>= 50-char RECALL-02 floor with ~5x headroom).
 Do NOT rewrap or paraphrase; Plan 03-03 Task 2 asserts the exact wording.
@@ -145,7 +141,7 @@ CASHEW_EXTRACT_SCHEMA: dict[str, Any] = {
         "for the background sync to process it. Returns an ack with counts of "
         "new nodes and edges created."
     ),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "user_content": {
@@ -161,13 +157,10 @@ CASHEW_EXTRACT_SCHEMA: dict[str, Any] = {
         "additionalProperties": False,
     },
 }
-"""Anthropic-format tool schema for cashew_extract.
+"""OpenAI-format tool schema for cashew_extract.
 
-Description length: 325 characters (>= 50-char SYNC-03 floor with ~6x
-headroom). Do NOT paraphrase — Plan 04-03 asserts the exact wording.
-Mirrors CASHEW_QUERY_SCHEMA shape (Phase 3 Plan 03-02): input_schema key
-(Anthropic, not OpenAI parameters), explicit required, additionalProperties
-False.
+Mirrors CASHEW_QUERY_SCHEMA shape (Phase 3 Plan 03-02): parameters key
+(OpenAI format), explicit required, additionalProperties False.
 """
 
 

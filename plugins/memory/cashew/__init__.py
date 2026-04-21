@@ -357,10 +357,7 @@ class CashewMemoryProvider(MemoryProvider):
         """Return the list of LLM tool schemas this provider exposes (RECALL-02 + SYNC-03).
 
         Phase 3 + Phase 4: two tools — cashew_query (recall) and cashew_extract
-        (explicit sync). Schema structure follows Anthropic's input_schema
-        convention — see 03-RESEARCH.md §3 / 04-RESEARCH.md §6.9 and
-        plugins.memory.cashew.tools.CASHEW_QUERY_SCHEMA /
-        plugins.memory.cashew.tools.CASHEW_EXTRACT_SCHEMA.
+        (explicit sync). Schema structure follows OpenAI's parameters convention.
 
         The returned list is a fresh list literal each call, but the schema dicts
         themselves are module constants (not copies) — callers must not mutate.

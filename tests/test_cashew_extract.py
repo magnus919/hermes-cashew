@@ -50,7 +50,7 @@ def make_initialized_provider(tmp_path) -> CashewMemoryProvider:
 
 
 def test_extract_schema_shape():
-    assert set(CASHEW_EXTRACT_SCHEMA.keys()) >= {"name", "description", "input_schema"}
+    assert set(CASHEW_EXTRACT_SCHEMA.keys()) >= {"name", "description", "parameters"}
     assert CASHEW_EXTRACT_SCHEMA["name"] == "cashew_extract"
     assert CASHEW_EXTRACT_SCHEMA["name"] == EXTRACT_TOOL_NAME
 
@@ -60,37 +60,37 @@ def test_extract_schema_description_length():
 
 
 def test_extract_schema_required_fields():
-    ischema = CASHEW_EXTRACT_SCHEMA["input_schema"]
-    assert ischema["required"] == ["user_content", "assistant_content"]
-    assert ischema["additionalProperties"] is False
-    assert ischema["type"] == "object"
-    assert "user_content" in ischema["properties"]
-    assert "assistant_content" in ischema["properties"]
+    params = CASHEW_EXTRACT_SCHEMA["parameters"]
+    assert params["required"] == ["user_content", "assistant_content"]
+    assert params["additionalProperties"] is False
+    assert params["type"] == "object"
+    assert "user_content" in params["properties"]
+    assert "assistant_content" in params["properties"]
 
 
 def test_extract_schema_passes_jsonschema_draft7():
-    ischema = CASHEW_EXTRACT_SCHEMA["input_schema"]
+    params = CASHEW_EXTRACT_SCHEMA["parameters"]
     # Meta-validation: the schema itself is a valid JSON Schema.
-    jsonschema.Draft7Validator.check_schema(ischema)
+    jsonschema.Draft7Validator.check_schema(params)
     # Positive instance validation.
     jsonschema.validate(
         instance={"user_content": "u", "assistant_content": "a"},
-        schema=ischema,
+        schema=params,
     )
     # Negative: missing field.
     with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate(instance={"user_content": "u"}, schema=ischema)
+        jsonschema.validate(instance={"user_content": "u"}, schema=params)
     # Negative: extra field.
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(
             instance={"user_content": "u", "assistant_content": "a", "extra": 1},
-            schema=ischema,
+            schema=params,
         )
     # Negative: wrong type.
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(
             instance={"user_content": 123, "assistant_content": "a"},
-            schema=ischema,
+            schema=params,
         )
 
 

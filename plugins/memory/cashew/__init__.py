@@ -152,6 +152,7 @@ class CashewMemoryProvider(MemoryProvider):
                     "core.context.ContextRetriever unavailable at import time; "
                     "cashew-brain dependency missing"
                 )
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
             self._retriever = ContextRetriever(db_path=str(self._db_path))
             # Phase 4: start the sync worker AFTER all worker-read state
             # is populated (db_path, session_id, sync_queue). Pitfall 4.

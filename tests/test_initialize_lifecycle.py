@@ -91,6 +91,29 @@ def test_initialize_resolves_db_path_under_hermes_home(tmp_path):
         p.shutdown()
 
 
+def test_initialize_succeeds_on_fresh_hermes_home(tmp_path):
+    """GitHub issue #3: initialize() must create the cashew/ parent directory.
+
+    On a fresh hermes_home (no cashew/ directory), initialize() must succeed
+    without raising. SQLite cannot create a database file when its parent
+    directory does not exist, so we must create it before ContextRetriever.
+    """
+    import pathlib
+    assert not (tmp_path / "cashew").exists(), "precondition: cashew/ dir must not exist"
+
+    p = CashewMemoryProvider()
+    p.initialize("s", hermes_home=str(tmp_path))
+    try:
+        assert p._retriever is not None, (
+            "initialize() must succeed on fresh hermes_home — "
+            "ContextRetriever must be created even when cashew/ is absent"
+        )
+        assert p._db_path == pathlib.Path(str(tmp_path)) / "cashew" / "brain.db"
+        assert (tmp_path / "cashew").is_dir(), "initialize() must create the cashew/ parent directory"
+    finally:
+        p.shutdown()
+
+
 def test_full_roundtrip_save_then_initialize(tmp_path):
     """Goal-level: save_config + initialize round-trips a non-default value through the file."""
     p = CashewMemoryProvider()

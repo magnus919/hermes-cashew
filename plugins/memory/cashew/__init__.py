@@ -87,17 +87,22 @@ class CashewMemoryProvider(MemoryProvider):
         return "cashew"
 
     def is_available(self) -> bool:
-        """Return True iff a Cashew config file exists under the initialized hermes_home.
+        """Return True iff a Cashew config file exists under hermes_home.
 
         Contract (per ROADMAP Phase 2 Success #3 + Phase 1 RESEARCH.md Pitfall 5):
         zero I/O beyond ONE Path.exists() probe. No file content is read here.
-        Returns False if initialize() has not yet been called (no _hermes_home set) —
-        Hermes calls is_available() before initialize() to decide whether to even
-        bother initializing.
+        Hermes calls is_available() before initialize using a temporary provider
+        instance — we probe the default config location if _hermes_home has not
+        been set yet.
         """
-        if self._hermes_home is None:
+        if self._hermes_home is not None:
+            return resolve_config_path(self._hermes_home).exists()
+        # Fallback for pre-initialize check
+        try:
+            from hermes_constants import get_hermes_home
+            return resolve_config_path(get_hermes_home()).exists()
+        except Exception:
             return False
-        return resolve_config_path(self._hermes_home).exists()
 
     def get_config_schema(self) -> Dict[str, Any]:
         """Return the JSON-Schema-shaped dict Hermes uses to drive `hermes memory setup` (CONF-01)."""

@@ -317,10 +317,15 @@ class CashewMemoryProvider(MemoryProvider):
         SQLite does not support ALTER TABLE to change NOT NULL / DEFAULT on an
         existing column, so we recreate the table and copy data.
 
+        Handles multiple historical schemas including:
+        - Missing confidence column (old init-db: had edge_type instead)
+        - id INTEGER auto-inc column (old init-db artifact)
+        - timestamp nullable with no default
+
         Steps:
-          1. Create _derivation_edges_new with the correct schema (timestamp NOT NULL DEFAULT '').
-          2. Copy existing rows (NULL timestamp becomes '').
-          3. Drop old derivation_edges, rename new table in its place.
+          1. Inspect existing schema; check if migration is needed.
+          2. If table is empty and has wrong schema: DROP and recreate.
+          3. If table has rows: copy data, mapping columns correctly.
         """
         import sqlite3 as _sq
 
@@ -333,11 +338,18 @@ class CashewMemoryProvider(MemoryProvider):
         if "timestamp" not in cols:
             return
 
-        cursor.execute(
-            "SELECT 1 FROM derivation_edges WHERE timestamp IS NOT NULL LIMIT 1"
-        )
-        has_non_null = cursor.fetchone() is not None
-        if has_non_null:
+        row_count = conn.execute("SELECT COUNT(*) FROM derivation_edges").fetchone()[0]
+
+        has_timestamp_default = False
+        try:
+            info = conn.execute("PRAGMA table_info(derivation_edges)").fetchall()
+            for col in info:
+                if col[1] == "timestamp" and col[4] is not None:
+                    has_timestamp_default = True
+        except Exception:
+            pass
+
+        if has_timestamp_default:
             return
 
         try:
@@ -354,13 +366,28 @@ class CashewMemoryProvider(MemoryProvider):
                     FOREIGN KEY (child_id) REFERENCES thought_nodes(id)
                 )
             """)
-            cursor.execute("""
-                INSERT INTO _derivation_edges_new
-                    (parent_id, child_id, weight, reasoning, confidence, timestamp)
-                SELECT parent_id, child_id, weight, reasoning, confidence,
-                       COALESCE(timestamp, '')
-                FROM derivation_edges
-            """)
+
+            if row_count == 0:
+                pass
+            else:
+                has_confidence = "confidence" in cols
+                has_edge_type = "edge_type" in cols
+                has_id = "id" in cols
+
+                if has_confidence:
+                    src = "parent_id, child_id, weight, reasoning, confidence"
+                elif has_edge_type:
+                    src = "parent_id, child_id, weight, reasoning, NULL AS confidence"
+                else:
+                    src = "parent_id, child_id, weight, reasoning, NULL AS confidence"
+
+                cursor.execute(f"""
+                    INSERT INTO _derivation_edges_new
+                        (parent_id, child_id, weight, reasoning, confidence, timestamp)
+                    SELECT {src}, COALESCE(timestamp, '')
+                    FROM derivation_edges
+                """)
+
             cursor.execute("DROP TABLE derivation_edges")
             cursor.execute("ALTER TABLE _derivation_edges_new RENAME TO derivation_edges")
         except _sq.OperationalError:

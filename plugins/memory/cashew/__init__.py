@@ -275,7 +275,8 @@ class CashewMemoryProvider(MemoryProvider):
                     mood_state TEXT,
                     permanent INTEGER DEFAULT 0,
                     tags TEXT,
-                    referent_time TEXT
+                    referent_time TEXT,
+                    reasoning TEXT
                 )
             """)
             conn.execute("""
@@ -306,6 +307,35 @@ class CashewMemoryProvider(MemoryProvider):
             conn.commit()
         finally:
             conn.close()
+
+    def _add_missing_columns(self, conn: sqlite3.Connection) -> None:
+        _TARGET_COLUMNS = {
+            "reasoning": "TEXT",
+            "mood_state": "TEXT",
+            "metadata": "TEXT DEFAULT '{}'",
+            "permanent": "INTEGER DEFAULT 0",
+            "last_updated": "TEXT",
+            "last_accessed": "TEXT",
+            "access_count": "INTEGER DEFAULT 0",
+            "tags": "TEXT",
+            "referent_time": "TEXT",
+        }
+        _BACKFILL_DEFAULTS = {
+            "metadata": "{}",
+            "permanent": 0,
+            "access_count": 0,
+        }
+        cursor = conn.execute("PRAGMA table_info(thought_nodes)")
+        existing = {row[1] for row in cursor.fetchall()}
+        for col_name, col_def in _TARGET_COLUMNS.items():
+            if col_name not in existing:
+                conn.execute(f"ALTER TABLE thought_nodes ADD COLUMN {col_name} {col_def}")
+            if col_name in _BACKFILL_DEFAULTS:
+                default_val = _BACKFILL_DEFAULTS[col_name]
+                conn.execute(
+                    f"UPDATE thought_nodes SET {col_name} = ? WHERE {col_name} IS NULL",
+                    (default_val,),
+                )
 
     def _migrate_edges_timestamp_not_null(self, conn: sqlite3.Connection) -> None:
         """Migrate derivation_edges.timestamp to NOT NULL DEFAULT ''.

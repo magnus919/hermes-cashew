@@ -6,14 +6,26 @@ thought graph. Get from zero to a working install in under five minutes.
 
 ## Prerequisites
 
-- Python 3.10 or later
+- Python 3.10 or later (`python3` on Linux)
 - [Hermes Agent](https://github.com/nousresearch/hermes-agent) installed
-- pip
+- pip (`pip3` on Linux)
 
 ## Install
 
+> **Note:** This package is not yet published to PyPI. Install it directly from
+> the git repository.
+
 ```bash
-pip install hermes-cashew
+# macOS
+pip install git+https://github.com/magnus919/hermes-cashew
+
+# Debian/Ubuntu (PEP 668 externally-managed-environment error)
+# Recommended: use pipx to install as an application
+sudo apt install pipx && pipx install git+https://github.com/magnus919/hermes-cashew
+
+# Alternative: create a virtual environment first
+python3 -m venv ~/.venv/hermes-cashew
+~/.venv/hermes-cashew/bin/pip install git+https://github.com/magnus919/hermes-cashew
 ```
 
 ## Register with Hermes
@@ -33,7 +45,8 @@ When prompted to choose a memory provider, select **cashew**. This writes a
 Run the built-in smoke test to confirm everything is wired correctly:
 
 ```bash
-python -m plugins.memory.cashew.verify
+python -m plugins.memory.cashew.verify   # macOS
+python3 -m plugins.memory.cashew.verify # Linux
 ```
 
 Expected output: a short report ending with `OK`. Exit code 0 means success.
@@ -75,12 +88,30 @@ After first run, edit `~/.hermes/cashew.json` (or your configured `hermes_home`)
 ## Uninstall
 
 ```bash
-pip uninstall hermes-cashew
+pip uninstall hermes-cashew   # macOS
+python3 -m pip uninstall hermes-cashew   # Linux
 hermes memory setup   # re-run to unregister, or just forget the cashew choice
 rm -rf ~/.hermes/cashew   # optional: remove the local graph data
 ```
 
+If installed via pipx, use `pipx uninstall hermes-cashew` instead.
+
 ## Troubleshooting
+
+### `error: externally-managed-environment` (PEP 668)
+
+On Debian/Ubuntu and other modern Linux distros, pip is blocked from installing
+packages system-wide. Use `pipx` (recommended for applications) or a virtual
+environment:
+
+```bash
+# Recommended: pipx handles isolation for CLI applications
+sudo apt install pipx && pipx install hermes-cashew
+
+# Alternative: manual virtual environment
+python3 -m venv ~/.venv/hermes-cashew
+~/.venv/hermes-cashew/bin/pip install hermes-cashew
+```
 
 ### `python: module plugins.memory.cashew.verify not found`
 
@@ -97,7 +128,7 @@ fixture in tests (see `tests/conftest.py`).
 
 ### Hermes does not discover the plugin
 
-Ensure `hermes memory setup` is run **after** `pip install hermes-cashew`.
+Ensure `hermes memory setup` is run **after** installing hermes-cashew.
 The entry point is registered during `pip install`; Hermes scans it on setup.
 
 For more on how Hermes discovers memory providers, see the
@@ -106,7 +137,12 @@ For more on how Hermes discovers memory providers, see the
 ## Development
 
 ```bash
-pip install -e ".[dev]"   # install with test dependencies
+# Clone the repo first
+git clone https://github.com/magnus919/hermes-cashew
+cd hermes-cashew
+
+pip install -e ".[dev]"   # macOS
+python3 -m pip install -e ".[dev]"   # Linux
 pytest                      # run the test suite
 ```
 

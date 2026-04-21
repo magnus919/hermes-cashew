@@ -50,33 +50,28 @@ def test_cashew_config_dataclass_field_set_matches_defaults():
     assert fields == set(DEFAULTS.keys())
 
 
-def test_get_config_schema_shape_is_json_schema_compatible():
+def test_get_config_schema_shape_is_list_of_field_descriptors():
     """CONF-01 + Decision Point 3: the schema is the source of truth for hermes memory setup.
 
-    Validates against a representative `values` dict (defaults). If `jsonschema` is
-    importable, do a real validate() call; otherwise fall back to structural checks
-    (Phase 2 doesn't make jsonschema a hard dep; the structural checks are sufficient).
+    Hermes' memory_setup.py iterates `for f in schema` expecting dicts with keys
+    like `key`, `description`, `default`, `secret`, `env_var`. We emit a list of
+    field descriptors matching that contract (see
+    https://hermes-agent.nousresearch.com/docs/developer-guide/memory-provider-plugin#config-schema).
     """
     schema = get_config_schema()
-    assert schema["type"] == "object"
-    assert set(schema["properties"].keys()) == set(DEFAULTS.keys())
-    assert schema["required"] == []
-    assert schema["additionalProperties"] is False
-    for key, spec in schema["properties"].items():
-        assert "type" in spec, f"property {key!r} missing 'type'"
-        assert "description" in spec and len(spec["description"]) >= 20, (
-            f"property {key!r} description too short for hermes memory setup UX"
+    assert isinstance(schema, list)
+    keys = {f["key"] for f in schema}
+    assert keys == set(DEFAULTS.keys())
+    for field in schema:
+        assert "key" in field
+        assert "description" in field and len(field["description"]) >= 20, (
+            f"field {field['key']!r} description too short for hermes memory setup UX"
         )
-        assert "default" in spec and spec["default"] == DEFAULTS[key], (
-            f"property {key!r} default {spec['default']!r} != DEFAULTS {DEFAULTS[key]!r}"
+        assert "default" in field and field["default"] == DEFAULTS[field["key"]], (
+            f"field {field['key']!r} default {field['default']!r} != DEFAULTS {DEFAULTS[field['key']]!r}"
         )
-
-    try:
-        import jsonschema
-    except ImportError:
-        pytest.skip("jsonschema not installed; structural checks above are sufficient")
-    jsonschema.validate(DEFAULTS, schema)
-    jsonschema.validate({"recall_k": 7}, schema)
+        # Phase 2 has no secret fields (no API keys / credentials).
+        assert not field.get("secret", False), f"field {field['key']!r} unexpectedly marked secret"
 
 
 def test_resolve_config_path_under_hermes_home(tmp_path):

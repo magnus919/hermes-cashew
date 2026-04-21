@@ -43,50 +43,42 @@ class CashewConfig:
     sync_queue_timeout: float = DEFAULTS["sync_queue_timeout"]
 
 
-def get_config_schema() -> dict[str, Any]:
-    """Return the JSON-Schema-shaped dict Hermes uses to drive `hermes memory setup`.
+def get_config_schema() -> list[dict[str, Any]]:
+    """Return the list-of-field-descriptors Hermes uses to drive `hermes memory setup`.
 
-    Shape mirrors what bundled providers (Honcho, Hindsight) emit. Phase 2 has
-    NO required-from-user fields — every key has a default — so `required: []`.
+    Each element is a dict with keys: `key`, `description`, `default` (optional),
+    `secret` (optional, default False). Phase 2 has NO required-from-user fields —
+    every key has a default — so `hermes memory setup` can accept all defaults.
     """
-    return {
-        "type": "object",
-        "properties": {
-            "cashew_db_path": {
-                "type": "string",
-                "description": (
-                    "Path to the Cashew SQLite brain DB, relative to hermes_home. "
-                    "Absolute paths are rejected to preserve profile isolation."
-                ),
-                "default": DEFAULTS["cashew_db_path"],
-            },
-            "embedding_model": {
-                "type": "string",
-                "description": (
-                    "Sentence-transformers model identifier Cashew loads on first use. "
-                    "The default matches Cashew's documented default."
-                ),
-                "default": DEFAULTS["embedding_model"],
-            },
-            "recall_k": {
-                "type": "integer",
-                "minimum": 1,
-                "description": "How many context fragments prefetch() requests from Cashew per turn.",
-                "default": DEFAULTS["recall_k"],
-            },
-            "sync_queue_timeout": {
-                "type": "number",
-                "minimum": 0,
-                "description": (
-                    "Bounded join timeout (seconds) shutdown() applies when draining the sync queue. "
-                    "Worker thread is added in Phase 4; the value is wired through now."
-                ),
-                "default": DEFAULTS["sync_queue_timeout"],
-            },
+    return [
+        {
+            "key": "cashew_db_path",
+            "description": (
+                "Path to the Cashew SQLite brain DB, relative to hermes_home. "
+                "Absolute paths are rejected to preserve profile isolation."
+            ),
+            "default": DEFAULTS["cashew_db_path"],
         },
-        "required": [],
-        "additionalProperties": False,
-    }
+        {
+            "key": "embedding_model",
+            "description": (
+                "Sentence-transformers model identifier Cashew loads on first use."
+            ),
+            "default": DEFAULTS["embedding_model"],
+        },
+        {
+            "key": "recall_k",
+            "description": "How many context fragments prefetch() requests from Cashew per turn.",
+            "default": DEFAULTS["recall_k"],
+        },
+        {
+            "key": "sync_queue_timeout",
+            "description": (
+                "Bounded join timeout (seconds) shutdown() applies when draining the sync queue."
+            ),
+            "default": DEFAULTS["sync_queue_timeout"],
+        },
+    ]
 
 
 def resolve_config_path(hermes_home: str | os.PathLike[str]) -> pathlib.Path:

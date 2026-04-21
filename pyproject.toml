@@ -11,8 +11,8 @@ license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [{ name = "Magnus Hedemark", email = "magnus919@pm.me" }]
 dependencies = [
-    # Phase 1 pin: cashew-brain not yet on PyPI. Migrate to PyPI specifier in Phase 5 before production release.
-    "cashew-brain @ git+https://github.com/rajkripal/cashew.git@90d1c73b700d567a3518551dc115021eb5296bac",
+    # cashew-brain 1.0.0 published to PyPI 2026-04-21 — hermes-cashew pins to a compat range.
+    "cashew-brain>=1.0.0,<2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -34,9 +34,7 @@ Repository = "https://github.com/magnus919/hermes-cashew"
 Issues     = "https://github.com/magnus919/hermes-cashew/issues"
 
 [tool.hatch.metadata]
-# Required because `cashew-brain` is pinned via a git+SHA direct reference in [project.dependencies].
-# PyPI forbids VCS deps on uploaded distributions (Phase 5 will migrate to a PyPI specifier once
-# cashew-brain is published), but for Phase 1 dev/CI installs this flag is mandatory.
+# Required for `pip install -e .` dev installs when the package itself is cloned from git.
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]

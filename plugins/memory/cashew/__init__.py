@@ -243,15 +243,17 @@ class CashewMemoryProvider(MemoryProvider):
                 q.task_done()
 
     def _ensure_db_schema(self, db_path: pathlib.Path) -> None:
-        """Create Cashew schema tables if they do not exist.
+        """Create or migrate Cashew schema tables.
 
         Cashew's _ensure_schema() only runs ALTER TABLE migrations (adds missing
-        columns) — it does NOT create tables from scratch. On a fresh DB, this
-        method creates the three required tables so that end_session() can run
-        without 'no such table' errors.
+        columns) — it does NOT create tables from scratch, and does NOT alter
+        column constraints. On a fresh DB this method creates all three tables.
+        On an existing DB it migrates schemas that are missing constraints that
+        _create_edge / _create_node depend on (e.g. derivation_edges.timestamp
+        NOT NULL DEFAULT '').
 
-        This matches the schema defined in verify.py (which is the canonical
-        reference) and in the cashew-brain CLI's init-db command.
+        This matches the schema expected by _create_node and _create_edge in
+        cashew-brain's core.session module.
         """
         import sqlite3
         conn = sqlite3.connect(str(db_path))
@@ -272,7 +274,8 @@ class CashewMemoryProvider(MemoryProvider):
                     last_updated TEXT,
                     mood_state TEXT,
                     permanent INTEGER DEFAULT 0,
-                    tags TEXT
+                    tags TEXT,
+                    referent_time TEXT
                 )
             """)
             conn.execute("""
@@ -282,7 +285,7 @@ class CashewMemoryProvider(MemoryProvider):
                     weight REAL,
                     reasoning TEXT,
                     confidence REAL,
-                    timestamp TEXT,
+                    timestamp TEXT DEFAULT '',
                     PRIMARY KEY (parent_id, child_id),
                     FOREIGN KEY (parent_id) REFERENCES thought_nodes(id),
                     FOREIGN KEY (child_id) REFERENCES thought_nodes(id)
@@ -297,9 +300,74 @@ class CashewMemoryProvider(MemoryProvider):
                     FOREIGN KEY (node_id) REFERENCES thought_nodes(id)
                 )
             """)
+
+            self._migrate_edges_timestamp_not_null(conn)
+
             conn.commit()
         finally:
             conn.close()
+
+    def _migrate_edges_timestamp_not_null(self, conn: sqlite3.Connection) -> None:
+        """Migrate derivation_edges.timestamp to NOT NULL DEFAULT ''.
+
+        _create_edge in cashew-brain does NOT provide a timestamp value on
+        INSERT. If timestamp is nullable (the original verify.py schema had no
+        default), every insert raises IntegrityError: NOT NULL constraint failed.
+
+        SQLite does not support ALTER TABLE to change NOT NULL / DEFAULT on an
+        existing column, so we recreate the table and copy data.
+
+        Steps:
+          1. Create _derivation_edges_new with the correct schema (timestamp NOT NULL DEFAULT '').
+          2. Copy existing rows (NULL timestamp becomes '').
+          3. Drop old derivation_edges, rename new table in its place.
+        """
+        import sqlite3 as _sq
+
+        try:
+            cursor = conn.execute("PRAGMA table_info(derivation_edges)")
+            cols = {row[1] for row in cursor.fetchall()}
+        except _sq.OperationalError:
+            return
+
+        if "timestamp" not in cols:
+            return
+
+        cursor.execute(
+            "SELECT 1 FROM derivation_edges WHERE timestamp IS NOT NULL LIMIT 1"
+        )
+        has_non_null = cursor.fetchone() is not None
+        if has_non_null:
+            return
+
+        try:
+            cursor.execute("""
+                CREATE TABLE _derivation_edges_new (
+                    parent_id TEXT,
+                    child_id TEXT,
+                    weight REAL,
+                    reasoning TEXT,
+                    confidence REAL,
+                    timestamp TEXT DEFAULT '' NOT NULL,
+                    PRIMARY KEY (parent_id, child_id),
+                    FOREIGN KEY (parent_id) REFERENCES thought_nodes(id),
+                    FOREIGN KEY (child_id) REFERENCES thought_nodes(id)
+                )
+            """)
+            cursor.execute("""
+                INSERT INTO _derivation_edges_new
+                    (parent_id, child_id, weight, reasoning, confidence, timestamp)
+                SELECT parent_id, child_id, weight, reasoning, confidence,
+                       COALESCE(timestamp, '')
+                FROM derivation_edges
+            """)
+            cursor.execute("DROP TABLE derivation_edges")
+            cursor.execute("ALTER TABLE _derivation_edges_new RENAME TO derivation_edges")
+        except _sq.OperationalError:
+            try:
+                conn.execute("DROP TABLE IF EXISTS _derivation_edges_new")
+            except Exception:
+                pass
 
     def _drain_once(self, turn: tuple[str, str]) -> None:
         """Persist one turn via Cashew's heuristic extractor.

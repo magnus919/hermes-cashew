@@ -1,0 +1,132 @@
+# Trusted publishing workflow for hermes-cashew.
+# File name is locked by PyPI trusted-publisher configuration.
+# DO NOT RENAME TO release.yml or ci.yml (would break OIDC environment binding).
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"   # all version tags: v0.1.0, v0.1.0-rc1, v0.1.0-rc2, etc.
+
+permissions:
+  id-token: write   # required for OIDC trusted publishing
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        run: pip install build
+
+      - name: Build wheel and sdist
+        run: python -m build
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  # ---------------------------------------------------------------------------
+  # TestPyPI publish — triggered for ALL v* tags (including rc tags)
+  # pypa/gh-action-pypi-publish infers the target index from the environment.
+  # ---------------------------------------------------------------------------
+  publish-testpypi:
+    name: Publish to TestPyPI
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/hermes-cashew/
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to TestPyPI via trusted publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip_existing: true
+
+  # ---------------------------------------------------------------------------
+  # Smoke test from TestPyPI — runs for ALL tags (rc and release)
+  # ---------------------------------------------------------------------------
+  smoke-test:
+    name: Smoke test (CI-06)
+    runs-on: ubuntu-latest
+    needs: publish-testpypi
+    environment:
+      name: testpypi
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install from TestPyPI
+        run: |
+          pip install hermes-cashew \
+            --index-url https://test.pypi.org/simple/ \
+            --extra-index-url https://pypi.org/simple/
+
+      - name: CI-06 — run verify smoke test
+        run: |
+          set -o pipefail
+          python -m plugins.memory.cashew.verify 2>&1 | tee verify.log
+          if grep -v "^\[cashew\]" verify.log | grep -i "error\|exception\|traceback" > /dev/null 2>&1; then
+            echo "::error::Non-cashew error detected in verify output"
+            exit 1
+          fi
+          if ! grep -q "all checks passed" verify.log; then
+            echo "::error::verify script did not report success"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Production PyPI publish — ONLY for non-rc version tags (v1.0.0, v1.0.1, etc.)
+  # Depends on smoke-test passing so release tags always get a green smoke test
+  # before going to production.
+  # ---------------------------------------------------------------------------
+  publish-pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: [build, smoke-test]
+    if: contains(github.ref_name, '-') == false
+    environment:
+      name: pypi
+      url: https://pypi.org/project/hermes-cashew/
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI via trusted publishing
+        uses: pypa/gh-action-pypi-publish@release/v1

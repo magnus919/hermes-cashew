@@ -14,7 +14,7 @@ try:
 except ImportError:
     MemoryProvider = object  # Hermes not installed — allows module to load for discovery/wheel-smoke; is_available() gates real usage
 
-from plugins.memory.cashew.config import (
+from .config import (
     CashewConfig,
     get_config_schema as _config_get_config_schema,
     load_config,
@@ -35,7 +35,7 @@ except ImportError:
 # but is kept at module level for forward compatibility with future defensive parsing
 # of `args` if Hermes ever passes a JSON string instead of a dict.
 import json  # noqa: E402 — intentional: documented Phase 3 forward-compat hook
-from plugins.memory.cashew.tools import (  # noqa: E402
+from .tools import (  # noqa: E402
     CASHEW_EXTRACT_SCHEMA,
     CASHEW_QUERY_SCHEMA,
     build_error_envelope,

@@ -136,14 +136,21 @@ def test_macos_fallback_simulated(provider, db_path, monkeypatch):
     if not hasattr(sqlite3.Connection, "enable_load_extension"):
         pytest.skip("enable_load_extension not available on this Python build")
 
-    def _blocked_enable_load(self, *args, **kwargs):
-        raise AttributeError("simulated macOS: extension loading blocked")
-
+    # On some Python 3.11+ builds sqlite3.Connection is an immutable type.
+    # monkeypatch.setattr may appear to succeed but its teardown undo() will
+    # raise TypeError when it tries to restore the attribute.  Proactively
+    # detect immutability with a harmless dummy attribute test.
     try:
-        monkeypatch.setattr(sqlite3.Connection, "enable_load_extension", _blocked_enable_load)
+        sqlite3.Connection._test_mutability = lambda: None
+        del sqlite3.Connection._test_mutability
     except TypeError:
-        # sqlite3.Connection is immutable on this build (e.g. some Python 3.11+ Linux builds)
         monkeypatch.setattr(provider, '_retrieve_with_vec', lambda *a, **k: [])
+    else:
+
+        def _blocked_enable_load(self, *args, **kwargs):
+            raise AttributeError("simulated macOS: extension loading blocked")
+
+        monkeypatch.setattr(sqlite3.Connection, "enable_load_extension", _blocked_enable_load)
     _seed_node(db_path, id="n1", content="test content")
     result = provider.prefetch("test")
     assert "test content" in result

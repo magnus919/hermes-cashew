@@ -163,20 +163,20 @@ def test_metadata_backfill(tmp_path):
 
 
 def test_vec_embeddings_guarded_when_unavailable(tmp_path, caplog):
-    """SCHEMA-04: When sqlite-vec is unavailable, initialize() succeeds and logs INFO."""
+    """SCHEMA-04: When sqlite-vec is unavailable, initialize() succeeds and logs DEBUG."""
     p = CashewMemoryProvider()
-    with caplog.at_level("INFO", logger="plugins.memory.cashew"):
+    with caplog.at_level("DEBUG", logger="plugins.memory.cashew"):
         p.initialize("s", hermes_home=str(tmp_path))
     try:
         # Must succeed even though sqlite-vec is not installed in test environment
         assert p._config is not None, "initialize() must succeed when sqlite-vec is unavailable"
         assert p._db_path is not None
-        infos = [r for r in caplog.records if r.levelname == "INFO"]
+        debugs = [r for r in caplog.records if r.levelname == "DEBUG"]
         assert any(
-            "sqlite-vec not available" in r.getMessage() for r in infos
+            "sqlite-vec not available" in r.getMessage() for r in debugs
         ), (
-            f"Expected INFO about sqlite-vec unavailability; got: "
-            f"{[r.getMessage() for r in infos]}"
+            f"Expected DEBUG about sqlite-vec unavailability; got: "
+            f"{[r.getMessage() for r in debugs]}"
         )
     finally:
         p.shutdown()

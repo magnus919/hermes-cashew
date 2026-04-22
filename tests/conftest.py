@@ -53,6 +53,24 @@ if "agent.memory_provider" not in sys.modules:
     sys.modules["agent"] = _agent_pkg
     sys.modules["agent.memory_provider"] = _mp_mod
 
+# Synthesize core.session if cashew-brain is not installed.
+# Provides a minimal end_session stub so tests can monkeypatch core.session.end_session.
+# Use find_spec to detect cashew-brain without importing it — importing core.context
+# would populate sys.modules['core.session'] with the real module, blocking later patches.
+import importlib.util as _igu
+_cashew_spec = _igu.find_spec("core.context")
+if "core.session" not in sys.modules and _cashew_spec is None:
+    _core_pkg = types.ModuleType("core")
+    _session_mod = types.ModuleType("core.session")
+
+    def _stub_end_session(**kwargs):
+        return types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[])
+
+    _session_mod.end_session = _stub_end_session
+    _core_pkg.session = _session_mod
+    sys.modules["core"] = _core_pkg
+    sys.modules["core.session"] = _session_mod
+
 # Phase 3: MemoryManager stub injection — must happen after agent.memory_provider
 # is already in sys.modules because the stub imports nothing from there directly
 # but Hermes ABC ordering conventions keep memory_provider ahead of memory_manager.

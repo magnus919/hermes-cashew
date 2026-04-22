@@ -2,17 +2,16 @@
 
 A [Hermes Agent](https://hermes-agent.nousresearch.com) memory provider plugin
 that stores conversation context in a local [Cashew](https://github.com/rajkripal/cashew)
-thought graph. Get from zero to a working install in under five minutes.
+thought graph with semantic search and automatic context recall. Get from zero to
+a working install in under five minutes.
+
+**v0.2.0** brings semantic search via sqlite-vec, recursive graph traversal,
+expanded configuration (31 keys with sane defaults), and zero-config startup.
 
 ## Prerequisites
 
 - [Hermes Agent](https://github.com/nousresearch/hermes-agent) installed
-- `cashew-brain` — installed automatically by `hermes plugins install` or manually:
-  ```bash
-  ~/.hermes/hermes-agent/venv/bin/python3 -m ensurepip  # bootstrap pip if missing
-  ~/.hermes/hermes-agent/venv/bin/python3 -m pip install \
-    "cashew-brain @ git+https://github.com/rajkripal/cashew.git@90d1c73"
-  ```
+- `cashew-brain>=1.0.0` — installed automatically by `hermes plugins install`
 
 ## Install
 
@@ -36,13 +35,16 @@ hermes config set memory.provider cashew
 hermes gateway restart
 ```
 
-> **Note:** `hermes memory setup` shows a hardcoded list of providers and does
-> not yet include cashew in the interactive picker. Use `hermes config set`
-> to activate it directly.
+Or use the interactive setup (v0.2.0 now includes cashew in the provider picker):
 
-## Configure
+```bash
+hermes memory setup
+```
 
-Create `~/.hermes/cashew.json` with your settings:
+## Zero-Config Startup
+
+hermes-cashew works out of the box — all 31 configuration keys have sane
+defaults. Create `~/.hermes/cashew.json` only if you want to override them:
 
 ```bash
 cat > ~/.hermes/cashew.json << 'EOF'
@@ -50,17 +52,48 @@ cat > ~/.hermes/cashew.json << 'EOF'
   "cashew_db_path": "cashew/brain.db",
   "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
   "recall_k": 5,
-  "sync_queue_timeout": 30
+  "user_domain": "cli/user",
+  "ai_domain": "cli/ai",
+  "sync_queue_timeout": 30,
+  "vec_dimension": 384,
+  "gc_interval_turns": 100,
+  "gc_delete_probability": 0.01,
+  "enable_query_decomposition": true,
+  "max_tokens_per_node": 512,
+  "feature_bfs_retrieval": true,
+  "feature_semantic_search": true,
+  "feature_context_summarization": false,
+  "max_depth": 3,
+  "similarity_threshold": 0.7,
+  "max_nodes_per_query": 20
 }
 EOF
 ```
 
+### Full Config Reference
+
 | Key | Default | Description |
 |-----|---------|-------------|
-| `cashew_db_path` | `cashew/brain.db` | Path to the SQLite DB, relative to `hermes_home` |
+| `cashew_db_path` | `cashew/brain.db` | Path to SQLite DB, relative to `hermes_home` |
 | `embedding_model` | `sentence-transformers/all-MiniLM-L6-v2` | Embedding model for retrieval |
-| `recall_k` | `5` | Maximum nodes returned per recall query |
-| `sync_queue_timeout` | `30` | Seconds to wait for the sync worker to drain on shutdown |
+| `recall_k` | `5` | Max nodes returned per recall query |
+| `sync_queue_timeout` | `30` | Seconds to wait for sync worker drain on shutdown |
+| `user_domain` | `cli/user` | Domain label for user messages |
+| `ai_domain` | `cli/ai` | Domain label for AI messages |
+| `vec_dimension` | `384` | Embedding dimension (fixed for v0.2.0) |
+| `gc_interval_turns` | `100` | GC run frequency |
+| `gc_delete_probability` | `0.01` | Node deletion probability per GC |
+| `enable_query_decomposition` | `true` | Enable query decomposition |
+| `max_tokens_per_node` | `512` | Token limit per context node |
+| `feature_bfs_retrieval` | `true` | Enable BFS graph traversal |
+| `feature_semantic_search` | `true` | Enable sqlite-vec semantic search |
+| `feature_context_summarization` | `false` | Enable context summarization |
+| `max_depth` | `3` | Max BFS traversal depth |
+| `similarity_threshold` | `0.7` | Minimum similarity score |
+| `max_nodes_per_query` | `20` | Maximum nodes per query |
+
+Environment variables override config values: prefix any key with `CASHEW_`
+(e.g. `CASHEW_RECALL_K=10`).
 
 ## Verify the Install
 
@@ -76,11 +109,14 @@ Expected output shows `Provider: cashew` with `Plugin: installed` and `Status: a
 `hermes-cashew` provides two LLM-accessible tools:
 
 - **`cashew_query`** — searches the local thought graph for context relevant to
-  the current conversation. The agent calls this automatically during `prefetch()`.
+  the current conversation. Uses sqlite-vec for semantic search when available,
+  with keyword fallback on macOS or when the extension is unavailable.
 - **`cashew_extract`** — explicitly persists a conversation turn into the graph.
   The agent can call this when it judges a turn contains worth-remembering knowledge.
 
 Both tools are registered automatically when Hermes loads the plugin.
+On each session start, `prefetch()` retrieves relevant context from the graph
+and injects it into the system prompt.
 
 ## Uninstall
 
@@ -94,28 +130,28 @@ rm -rf ~/.hermes/cashew   # optional: remove the local graph data
 
 ### `Plugin: NOT installed` in `hermes memory status`
 
-This has two common causes:
-
-1. **`cashew-brain` not installed in Hermes venv** — `hermes plugins install` does not
+1. **cashew-brain not installed in Hermes venv** — `hermes plugins install` does not
    automatically install Python package dependencies into Hermes's venv. Install it manually:
    ```bash
    ~/.hermes/hermes-agent/venv/bin/python3 -m ensurepip
-   ~/.hermes/hermes-agent/venv/bin/python3 -m pip install \
-     "cashew-brain @ git+https://github.com/rajkripal/cashew.git@90d1c73"
+   ~/.hermes/hermes-agent/venv/bin/python3 -m pip install cashew-brain
    ```
 
-2. **Stale pycache or entry point not registered** — If `cashew-brain` is installed
-   but the plugin still shows NOT installed, the entry point may not be registered:
+2. **Stale pycache or entry point not registered** — If cashew-brain is installed
+   but the plugin still shows NOT installed:
    ```bash
    cd ~/.hermes/plugins/cashew && \
      ~/.hermes/hermes-agent/venv/bin/python3 -m pip install -e .
    hermes gateway restart
    ```
 
-### `Plugin: installed` but `Status: not available`
+### `Status: not available`
 
-Ensure `~/.hermes/cashew.json` exists. The plugin's `is_available()` checks for this
-file's presence. Create it with the default config shown above.
+The plugin is available when cashew-brain is importable. Check:
+```bash
+~/.hermes/hermes-agent/venv/bin/python3 -c "from core.context import ContextRetriever; print('ok')"
+```
+If this fails, cashew-brain is not installed in the Hermes venv (see above).
 
 ### Hermes-agent venv has no `pip`
 
@@ -141,10 +177,8 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 hermes ...
 ## Development
 
 ```bash
-# Clone the repo first
 git clone https://github.com/magnus919/hermes-cashew
 cd hermes-cashew
-
 pip install -e ".[dev]"   # macOS
 python3 -m pip install -e ".[dev]"   # Linux
 pytest                      # run the test suite

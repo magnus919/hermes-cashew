@@ -130,13 +130,25 @@ def test_format_context_without_domain_or_type(provider, db_path):
 
 
 def test_macos_fallback_simulated(provider, db_path, monkeypatch):
+    """Simulate macOS where sqlite-vec extension loading is unavailable — provider falls back to keyword search."""
     import sqlite3
 
-    def _blocked(self, flag):
-        raise AttributeError("blocked")
+    if not hasattr(sqlite3.Connection, "enable_load_extension"):
+        pytest.skip("enable_load_extension not available on this Python build")
 
-    if hasattr(sqlite3.Connection, "enable_load_extension"):
-        monkeypatch.setattr(sqlite3.Connection, "enable_load_extension", _blocked)
+    try:
+        type(sqlite3.Connection).enable_load_extension
+    except TypeError:
+        monkeypatch.setattr(provider, '_retrieve_with_vec', lambda *a, **k: [])
+        _seed_node(db_path, id="n1", content="test content")
+        result = provider.prefetch("test")
+        assert "test content" in result
+        return
+
+    def _blocked_enable_load(self, *args, **kwargs):
+        raise AttributeError("simulated macOS: extension loading blocked")
+
+    monkeypatch.setattr(sqlite3.Connection, "enable_load_extension", _blocked_enable_load)
     _seed_node(db_path, id="n1", content="test content")
     result = provider.prefetch("test")
     assert "test content" in result

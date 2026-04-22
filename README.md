@@ -12,6 +12,7 @@ expanded configuration (31 keys with sane defaults), and zero-config startup.
 
 - [Hermes Agent](https://github.com/nousresearch/hermes-agent) installed
 - `cashew-brain>=1.0.0` — installed automatically by `hermes plugins install`
+- `sqlite-vec` — optional, enables semantic search (install below if wanted)
 
 ## Install
 
@@ -117,6 +118,29 @@ Expected output shows `Provider: cashew` with `Plugin: installed` and `Status: a
 Both tools are registered automatically when Hermes loads the plugin.
 On each session start, `prefetch()` retrieves relevant context from the graph
 and injects it into the system prompt.
+
+## Semantic Search (Optional)
+
+`sqlite-vec` is an optional SQLite extension that enables vector similarity search.
+Without it, cashew falls back to keyword-based retrieval — still functional,
+but less precise.
+
+**Install:**
+```bash
+pip install sqlite-vec
+```
+
+You may also need to enable load extension support in your SQLite build:
+```bash
+sqlite3_config(SQLITE_ENABLE_LOAD_EXTENSION)
+```
+
+If sqlite-vec is not available at runtime, you'll see this INFO log on startup:
+```
+sqlite-vec not available; semantic search will use fallback
+```
+
+This is normal and expected on systems without sqlite-vec support.
 
 ## Uninstall
 

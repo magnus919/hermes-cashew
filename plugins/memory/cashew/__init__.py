@@ -471,7 +471,7 @@ class CashewMemoryProvider(MemoryProvider):
             """)
             logger.debug("vec_embeddings virtual table ready")
         except Exception:
-            logger.debug("sqlite-vec not available; semantic search will use fallback")
+            logger.info("sqlite-vec not available; semantic search will use fallback")
 
     def _vec_available(self, conn: sqlite3.Connection) -> bool:
         try:

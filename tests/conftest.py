@@ -58,7 +58,10 @@ if "agent.memory_provider" not in sys.modules:
 # Use find_spec to detect cashew-brain without importing it — importing core.context
 # would populate sys.modules['core.session'] with the real module, blocking later patches.
 import importlib.util as _igu
-_cashew_spec = _igu.find_spec("core.context")
+try:
+    _cashew_spec = _igu.find_spec("core.context")
+except ModuleNotFoundError:
+    _cashew_spec = None
 if "core.session" not in sys.modules and _cashew_spec is None:
     _core_pkg = types.ModuleType("core")
     _session_mod = types.ModuleType("core.session")

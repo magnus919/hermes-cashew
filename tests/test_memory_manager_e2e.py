@@ -1,23 +1,55 @@
 # tests/test_memory_manager_e2e.py
 # Phase 3 Plan 03-03 Task 4: TEST-01 + success criterion #4.
 # Single E2E lifecycle test through the stubbed MemoryManager.
+# Phase 9 update: tests seed a real SQLite DB instead of mocking ContextRetriever,
+# since handle_tool_call now uses _retrieve_with_vec / _retrieve_keyword directly.
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
-from unittest.mock import MagicMock
 
 from agent.memory_manager import MemoryManager  # via tests/_memory_manager_stub injection
 
 from plugins.memory.cashew import CashewMemoryProvider
+from plugins.memory.cashew.config import DEFAULTS, resolve_db_path
+
+
+def _seed_node(db_path, **kwargs):
+    conn = sqlite3.connect(str(db_path))
+    defaults = {
+        "id": "n1",
+        "content": "test content",
+        "node_type": "thought",
+        "domain": None,
+        "timestamp": "2026-01-01T00:00:00",
+        "access_count": 0,
+        "last_accessed": None,
+        "confidence": 0.5,
+        "source_file": None,
+        "decayed": 0,
+        "metadata": "{}",
+        "last_updated": None,
+        "mood_state": None,
+        "permanent": 0,
+        "tags": None,
+        "referent_time": None,
+        "reasoning": None,
+    }
+    defaults.update(kwargs)
+    columns = ", ".join(defaults.keys())
+    placeholders = ", ".join("?" * len(defaults))
+    conn.execute(
+        f"INSERT INTO thought_nodes ({columns}) VALUES ({placeholders})",
+        tuple(defaults.values()),
+    )
+    conn.commit()
+    conn.close()
 
 
 def test_memory_manager_e2e_lifecycle(tmp_path):
     """TEST-01: full MemoryManager lifecycle — add_provider -> initialize_all -> handle_tool_call
-    -> on_session_end -> shutdown_all. Success criterion #4: < 5s wall-clock.
-
-    Uses mocked ContextRetriever (no real DB, no real embedder) — satisfies
-    success criterion #5 (no network / embedding download traffic)."""
+    -> on_session_end -> shutdown_all. Success criterion #4: < 5s wall-clock."""
     t0 = time.monotonic()
 
     provider = CashewMemoryProvider()
@@ -29,27 +61,20 @@ def test_memory_manager_e2e_lifecycle(tmp_path):
 
     mgr.initialize_all(session_id="t-1", platform="cli", hermes_home=str(tmp_path))
 
-    # After initialize_all, provider._retriever exists (Plan 03-01 eager construction).
-    # Swap in a MagicMock so the tool call doesn't touch a real SQLite DB.
-    assert provider._retriever is not None
-    mock_nodes = [MagicMock(), MagicMock(), MagicMock()]
-    provider._retriever = MagicMock()
-    provider._retriever.retrieve.return_value = mock_nodes
-    provider._retriever.format_context.return_value = "seeded context about X"
+    # Phase 9: seed the DB instead of mocking _retriever.
+    db = resolve_db_path(tmp_path, DEFAULTS["cashew_db_path"])
+    _seed_node(db, id="n1", content="seeded context about X", node_type="thought")
 
-    result = mgr.handle_tool_call("cashew_query", {"query": "test"})
+    result = mgr.handle_tool_call("cashew_query", {"query": "seeded"})
     assert isinstance(result, str)
     parsed = json.loads(result)
     assert parsed["ok"] is True, f"expected success envelope; got {parsed}"
     assert parsed["tool"] == "cashew_query"
-    assert parsed["query"] == "test"
-    assert parsed["context"] == "seeded context about X"
-    assert parsed["node_count"] == 3  # len(mock_nodes)
+    assert parsed["query"] == "seeded"
+    assert "seeded context about X" in parsed["context"]
+    assert parsed["node_count"] == 1
 
-    # recall_k=3 from saved config should have been passed to retrieve as max_nodes.
-    provider._retriever.retrieve.assert_called_once_with("test", max_nodes=3)
-
-    # on_session_end + shutdown_all must be safe (Phase 3: no-ops on the queue — Phase 4 owns flush).
+    # on_session_end + shutdown_all must be safe.
     mgr.on_session_end([])
     mgr.shutdown_all()
 
@@ -83,19 +108,12 @@ def test_memory_manager_routes_unknown_tool_to_none(tmp_path):
 def test_full_lifecycle_with_sync_path(tmp_path, monkeypatch):
     """TEST-01 extended: MemoryManager.sync_all exercises the Phase 4 write path.
 
-    add_provider -> initialize_all -> handle_tool_call (Phase 3 cashew_query) ->
+    add_provider -> initialize_all -> handle_tool_call (Phase 9 cashew_query) ->
     sync_all x3 (Phase 4 write path) -> handle_tool_call (Phase 4 cashew_extract)
     -> on_session_end -> shutdown_all.
-
-    Mocks both:
-      - ContextRetriever instance (Phase 3 pattern) for cashew_query.
-      - core.session.end_session (Phase 4 pattern) for the worker drain
-        AND the cashew_extract synchronous path.
     """
     import threading
-    import time
     import types
-    from unittest.mock import MagicMock
 
     calls: list = []
     def _fake(**kwargs):
@@ -112,13 +130,12 @@ def test_full_lifecycle_with_sync_path(tmp_path, monkeypatch):
     start = time.monotonic()
     mgr.initialize_all("session-e2e-04", hermes_home=str(tmp_path))
 
-    # Swap in a mocked retriever so Phase 3 tools.py happy path works.
-    provider._retriever = MagicMock()
-    provider._retriever.retrieve.return_value = [MagicMock()]
-    provider._retriever.format_context.return_value = "recalled context"
+    # Phase 9: seed the DB instead of mocking _retriever.
+    db = resolve_db_path(tmp_path, DEFAULTS["cashew_db_path"])
+    _seed_node(db, id="n1", content="recalled context", node_type="thought")
 
-    # Phase 3 tool — recall path
-    q_result = mgr.handle_tool_call("cashew_query", {"query": "what did we decide"})
+    # Phase 3/9 tool — recall path
+    q_result = mgr.handle_tool_call("cashew_query", {"query": "recalled"})
     assert isinstance(q_result, str)
     assert json.loads(q_result)["ok"] is True
 
@@ -151,6 +168,4 @@ def test_full_lifecycle_with_sync_path(tmp_path, monkeypatch):
     )
 
     # Sanity: end_session was called at least once via the sync_all path
-    # (may be more via cashew_extract). Drop-oldest may have eliminated some
-    # of the 3 sync_all turns, but extract is synchronous so count >= 1.
     assert len(calls) >= 1

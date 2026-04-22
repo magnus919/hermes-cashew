@@ -44,38 +44,39 @@ def test_e2e_install_lifecycle_saves_config_and_reports_available(tmp_path):
 def test_e2e_install_lifecycle_schema_returns_field_descriptors(tmp_path):
     r'''INSTALL-04 Success Criterion #3:
     E2E test verifies get_config_schema() returns list-of-field-descriptors format.
+    Phase 10: schema expanded to 31 keys.
     '''
     t0 = time.monotonic()
-    
+
     schema = get_config_schema()
-    
+
     # Must return a list
     assert isinstance(schema, list), (
         f'get_config_schema() must return list, got {type(schema).__name__}'
     )
-    
-    # Must have exactly 4 entries (one per config key)
-    assert len(schema) == 4, f'Expected 4 field descriptors, got {len(schema)}'
-    
-    # Each entry must be a dict with required keys
-    required_keys = {'key', 'description', 'default'}
+
+    # Must have exactly 31 entries (Phase 10 expansion)
+    assert len(schema) == 31, f'Expected 31 field descriptors, got {len(schema)}'
+
+    # Each entry must be a dict with required keys (Phase 10 adds env_var)
+    required_keys = {'key', 'description', 'default', 'env_var'}
     for i, field in enumerate(schema):
         assert isinstance(field, dict), f'Field #{i} must be dict, got {type(field).__name__}'
         missing = required_keys - field.keys()
         assert not missing, f'Field #{i} missing keys: {missing}'
-    
-    # Verify the four expected keys are present
+
+    # Verify the four original expected keys are present with correct defaults
     keys = {f['key'] for f in schema}
     expected_keys = {'cashew_db_path', 'embedding_model', 'recall_k', 'sync_queue_timeout'}
-    assert keys == expected_keys, f'Expected keys {expected_keys}, got {keys}'
-    
-    # Verify default values match config.DEFAULTS
+    assert expected_keys.issubset(keys), f'Original 4 keys not found in schema'
+
+    # Verify default values match config.DEFAULTS for original keys
     defaults_by_key = {f['key']: f['default'] for f in schema}
     assert defaults_by_key['cashew_db_path'] == 'cashew/brain.db'
     assert defaults_by_key['embedding_model'] == 'all-MiniLM-L6-v2'
     assert defaults_by_key['recall_k'] == 5
     assert defaults_by_key['sync_queue_timeout'] == 30.0
-    
+
     elapsed = time.monotonic() - t0
     assert elapsed < 5.0, f'E2E schema check exceeded 5s budget: {elapsed:.2f}s'
 

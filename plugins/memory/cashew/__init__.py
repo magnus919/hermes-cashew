@@ -7,6 +7,8 @@ import pathlib
 import queue
 import threading  # Phase 4: non-daemon worker for sync_turn drain
 import time       # Phase 4: monotonic-clock polling in on_session_end
+import datetime   # Phase 9: recency scoring
+import math       # Phase 9: scoring functions
 from typing import Any, Dict, List
 
 try:
@@ -17,6 +19,8 @@ except ImportError:
 from .config import (
     CashewConfig,
     get_config_schema as _config_get_config_schema,
+    get_user_domain,
+    get_ai_domain,
     load_config,
     resolve_config_path,
     resolve_db_path,
@@ -464,6 +468,214 @@ class CashewMemoryProvider(MemoryProvider):
         except Exception:
             logger.info("sqlite-vec not available; semantic search will use fallback")
 
+    def _vec_available(self, conn: sqlite3.Connection) -> bool:
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_embeddings'"
+            )
+            return cursor.fetchone() is not None
+        except Exception:
+            return False
+
+    def _get_query_embedding(self, query: str) -> list[float] | None:
+        try:
+            from core.embeddings import embed_text
+            result = embed_text(query)
+            if hasattr(result, "tolist"):
+                return result.tolist()
+            return list(result)
+        except Exception:
+            return None
+
+    def _retrieve_with_vec(self, query: str, max_nodes: int) -> list[dict]:
+        try:
+            import sqlite3
+            conn = sqlite3.connect(str(self._db_path))
+            try:
+                if not self._vec_available(conn):
+                    return []
+                embedding = self._get_query_embedding(query)
+                if embedding is None:
+                    return []
+                cursor = conn.execute(
+                    "SELECT rowid, distance FROM vec_embeddings WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                    (json.dumps(embedding), max_nodes),
+                )
+                rows = cursor.fetchall()
+                nodes = []
+                for rowid, distance in rows:
+                    node_cursor = conn.execute(
+                        "SELECT * FROM thought_nodes WHERE id = ?", (str(rowid),)
+                    )
+                    node_row = node_cursor.fetchone()
+                    if node_row:
+                        node = dict(zip([col[0] for col in node_cursor.description], node_row))
+                        node["_source"] = "vec"
+                        nodes.append(node)
+                return nodes
+            finally:
+                conn.close()
+        except Exception:
+            logger.warning("cashew vec retrieval failed", exc_info=True)
+            return []
+
+    def _retrieve_bfs(self, seed_ids: list[str], max_nodes: int) -> list[dict]:
+        try:
+            import sqlite3
+            conn = sqlite3.connect(str(self._db_path))
+            try:
+                results = []
+                visited = set(seed_ids)
+                for seed_id in seed_ids:
+                    cursor = conn.execute(
+                        """
+                        SELECT child_id, weight FROM derivation_edges WHERE parent_id = ?
+                        UNION
+                        SELECT parent_id, weight FROM derivation_edges WHERE child_id = ?
+                        """,
+                        (seed_id, seed_id),
+                    )
+                    for connected_id, weight in cursor.fetchall():
+                        if connected_id not in visited:
+                            visited.add(connected_id)
+                            node_cursor = conn.execute(
+                                "SELECT * FROM thought_nodes WHERE id = ?", (connected_id,)
+                            )
+                            node_row = node_cursor.fetchone()
+                            if node_row:
+                                node = dict(
+                                    zip([col[0] for col in node_cursor.description], node_row)
+                                )
+                                node["_source"] = "bfs"
+                                results.append(node)
+                        if len(results) >= max_nodes:
+                            break
+                    if len(results) >= max_nodes:
+                        break
+                return results
+            finally:
+                conn.close()
+        except Exception:
+            logger.warning("cashew BFS retrieval failed", exc_info=True)
+            return []
+
+    def _retrieve_keyword(self, query: str, max_nodes: int) -> list[dict]:
+        try:
+            import sqlite3
+            conn = sqlite3.connect(str(self._db_path))
+            try:
+                cursor = conn.execute(
+                    """
+                    SELECT * FROM thought_nodes
+                    WHERE content LIKE ?
+                    ORDER BY referent_time DESC NULLS LAST, timestamp DESC
+                    LIMIT ?
+                    """,
+                    (f"%{query}%", max_nodes),
+                )
+                nodes = []
+                for row in cursor.fetchall():
+                    node = dict(zip([col[0] for col in cursor.description], row))
+                    node["_source"] = "keyword"
+                    nodes.append(node)
+                return nodes
+            finally:
+                conn.close()
+        except Exception:
+            logger.warning("cashew keyword retrieval failed", exc_info=True)
+            return []
+
+    def _format_context(self, nodes: list[dict]) -> str:
+        if not nodes:
+            return ""
+        lines = ["=== RELEVANT CONTEXT ==="]
+        for node in nodes:
+            domain = node.get("domain")
+            node_type = node.get("node_type")
+            content = node.get("content", "")
+            permanent = node.get("permanent") == 1
+            labels = []
+            if domain:
+                labels.append(f"domain: {domain}")
+            if node_type:
+                labels.append(f"type: {node_type}")
+            if permanent:
+                labels.append("permanent")
+            if labels:
+                prefix = f"[{' | '.join(labels)}]"
+                lines.append(f"{prefix} {content}")
+            else:
+                lines.append(content)
+        return "\n".join(lines)
+
+    def _apply_filters(self, nodes: list[dict], domain: str | None = None, tag: str | None = None) -> list[dict]:
+        if not domain and not tag:
+            return nodes
+        filtered = []
+        for node in nodes:
+            if domain and node.get("domain") != domain:
+                continue
+            if tag:
+                tags = node.get("tags")
+                if tags is None or tag not in str(tags):
+                    continue
+            filtered.append(node)
+        return filtered
+
+    def _score_nodes(self, nodes: list[dict], query_time: float | None = None) -> list[tuple[float, dict]]:
+        if query_time is None:
+            query_time = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        scored = []
+        for node in nodes:
+            score = 0.0
+            time_str = node.get("referent_time") or node.get("timestamp")
+            if time_str:
+                try:
+                    node_time = datetime.datetime.fromisoformat(
+                        time_str.replace("Z", "+00:00")
+                    ).timestamp()
+                    age_seconds = max(0, query_time - node_time)
+                    recency_score = math.exp(-age_seconds / (30 * 24 * 3600))
+                    score += recency_score * 0.3
+                except Exception:
+                    pass
+            confidence = node.get("confidence")
+            if confidence is not None:
+                score += confidence * 0.2
+            if node.get("permanent") == 1:
+                score *= 1.5
+            access_count = node.get("access_count", 0) or 0
+            access_score = min(1.0, math.log1p(access_count) / math.log1p(100))
+            score += access_score * 0.1
+            base_score = 0.4 if node.get("_source") == "vec" else 0.2
+            score += base_score
+            scored.append((score, node))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored
+
+    def _update_access_metrics(self, node_ids: list[str]) -> None:
+        if not node_ids:
+            return
+        try:
+            import sqlite3
+            conn = sqlite3.connect(str(self._db_path))
+            try:
+                placeholders = ",".join("?" * len(node_ids))
+                conn.execute(
+                    f"""
+                    UPDATE thought_nodes
+                    SET access_count = access_count + 1,
+                        last_accessed = CURRENT_TIMESTAMP
+                    WHERE id IN ({placeholders})
+                    """,
+                    node_ids,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            logger.warning("cashew access metrics update failed", exc_info=True)
+
     def _drain_once(self, turn: tuple[str, str]) -> None:
         """Persist one turn via Cashew's heuristic extractor.
 
@@ -537,38 +749,49 @@ class CashewMemoryProvider(MemoryProvider):
         self._retriever = None
         logger.debug("cashew provider shutdown complete (Phase 4 — worker drained)")
 
-    def prefetch(self, query: str) -> str:
+    def prefetch(self, query: str, domain: str | None = None, tag: str | None = None) -> str:
         """Return recalled-context string from Cashew, respecting `recall_k` (RECALL-01).
 
-        Contract (PHASE_DESIGN_NOTES Decision Point 1 + 03-RESEARCH.md §§1, 2, 8):
-        - Half-state guard: if `_retriever is None` (initialize was never called OR
-          corrupt config / resolve failure left the provider in the silent-degrade
-          state), return `""` without logging. `initialize()` already emitted the
-          WARNING when it set `_retriever = None`; we do not double-log.
-        - Happy path: `retrieve(query, max_nodes=recall_k)` + `format_context(nodes)`.
-          Both methods are synchronous per 03-RESEARCH.md §1. Empty result is valid
-          (returns `""` without logging — empty graph is not a failure).
-        - Failure path: `except Exception` (no Cashew exception taxonomy per
-          03-RESEARCH.md §2). Log exactly ONE `WARNING` with `exc_info=True` and
-          return `""`. Never raise into Hermes (silent-degrade is a PROJECT.md Key
-          Decision).
+        Phase 9: Uses three-tier retrieval (sqlite-vec → keyword fallback) with
+        hybrid scoring, filtering, and access metrics update.
+
+        Contract:
+        - Half-state guard: if `_retriever is None`, return `""` without logging.
+        - Tier 1: sqlite-vec semantic search via _retrieve_with_vec.
+        - Tier 2: keyword fallback via _retrieve_keyword.
+        - Results are filtered, scored, and access metrics are updated.
+        - Empty result is valid (returns `""` without logging).
+        - Failure path: `except Exception` logs ONE WARNING and returns `""`.
 
         Args:
-            query: The search query string. Passed through to Cashew's retrieve
-                call as a typed parameter — NO string concatenation into SQL (threat
-                T-03-01-01 mitigated by Cashew's parameterized queries).
+            query: The search query string.
+            domain: Optional domain filter (D-07).
+            tag: Optional tag filter (D-07).
 
         Returns:
-            Formatted context string on success (may be the empty string if Cashew
-            has nothing relevant or errored). Never None, never raises.
+            Formatted context string. Never None, never raises.
         """
         if self._retriever is None or self._config is None:
-            # Half-state: initialize() never ran OR ran and silent-degraded.
-            # The relevant WARNING was already emitted by initialize(); stay quiet.
             return ""
+        max_nodes = self._config.recall_k
         try:
-            nodes = self._retriever.retrieve(query, max_nodes=self._config.recall_k)
-            return self._retriever.format_context(nodes)
+            # Tier 1: sqlite-vec semantic search
+            nodes = self._retrieve_with_vec(query, max_nodes)
+            if not nodes:
+                # Tier 2: keyword fallback
+                nodes = self._retrieve_keyword(query, max_nodes)
+            if not nodes:
+                return ""
+            # Apply domain/tag filters
+            nodes = self._apply_filters(nodes, domain=domain, tag=tag)
+            # Score and rank
+            scored = self._score_nodes(nodes)
+            final_nodes = [node for score, node in scored[:max_nodes]]
+            # Update access metrics for returned nodes
+            node_ids = [n["id"] for n in final_nodes if "id" in n]
+            if node_ids:
+                self._update_access_metrics(node_ids)
+            return self._format_context(final_nodes)
         except Exception:
             logger.warning(
                 "cashew recall failed for query=%r",
@@ -609,24 +832,39 @@ class CashewMemoryProvider(MemoryProvider):
             JSON string — NEVER None, NEVER raises into Hermes.
         """
         if name == "cashew_query":
-            # -- Phase 3 branch preserved verbatim --
-            # Half-state guard (PHASE_DESIGN_NOTES Decision Point 1 + 03-RESEARCH.md §8):
-            # match Plan 03-01's prefetch contract. No log here — initialize already
-            # emitted the WARNING that set _retriever = None.
+            # Phase 9: Three-tier retrieval with scoring, filtering, and metrics.
+            # Half-state guard — no log here (initialize already warned).
             if self._retriever is None or self._config is None:
                 return build_error_envelope(
                     query=args.get("query"),
                     error_message="cashew recall failed",
                 )
             try:
-                query = args["query"]  # KeyError caught below — counts as tool-call failure
+                query = args["query"]  # KeyError caught below
                 max_nodes = args.get("max_nodes", self._config.recall_k)
-                nodes = self._retriever.retrieve(query, max_nodes=max_nodes)
-                context = self._retriever.format_context(nodes)
+                # Tier 1: sqlite-vec semantic search
+                nodes = self._retrieve_with_vec(query, max_nodes)
+                if not nodes:
+                    # Tier 2: keyword fallback
+                    nodes = self._retrieve_keyword(query, max_nodes)
+                if nodes:
+                    domain = args.get("domain")
+                    tag = args.get("tag")
+                    nodes = self._apply_filters(nodes, domain=domain, tag=tag)
+                    scored = self._score_nodes(nodes)
+                    final_nodes = [node for score, node in scored[:max_nodes]]
+                    node_ids = [n["id"] for n in final_nodes if "id" in n]
+                    if node_ids:
+                        self._update_access_metrics(node_ids)
+                    context = self._format_context(final_nodes)
+                    node_count = len(final_nodes)
+                else:
+                    context = ""
+                    node_count = 0
                 return build_success_envelope(
                     query=query,
                     context=context,
-                    node_count=len(nodes),
+                    node_count=node_count,
                 )
             except Exception:
                 logger.warning(
@@ -727,10 +965,15 @@ class CashewMemoryProvider(MemoryProvider):
         except Exception:
             graph_state = "unknown"
 
+        user_domain = get_user_domain(self._config)
+        ai_domain = get_ai_domain(self._config)
+
         return (
             f"[cashew] memory provider: available\n"
             f"graph: {graph_state}\n"
             f"recall depth: {recall_k}\n"
+            f"user domain: {user_domain}\n"
+            f"ai domain: {ai_domain}\n"
         )
 
     # All other ABC methods are inherited as no-ops from the ABC defaults (when Hermes is present).

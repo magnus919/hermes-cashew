@@ -50,6 +50,14 @@ from .tools import (  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+# Issue #18: sentence-transformers emits INFO-level progress bars and BertModel
+# load reports directly to the terminal during embedding. That noise leaks into
+# the Hermes UI and looks like broken output. Raise its logger to WARNING once
+# at module load so every embed_text / end_session call downstream stays quiet.
+# Leaves WARNING/ERROR from sentence_transformers untouched so real failures
+# (e.g. model file missing) still surface.
+logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+
 
 _SHUTDOWN = object()
 """Unique sentinel for graceful sync worker exit.

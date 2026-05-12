@@ -21,7 +21,7 @@ Hermes Agent memory provider plugin backed by Cashew (local SQLite knowledge gra
 
 - **No `~/.hermes` writes.** All paths scope under `hermes_home`. Tests use `tmp_path` fixture.
 - **`sync_turn` must return <10 ms.** Uses a bounded `queue.Queue(maxsize=16)` drained by a **non-daemon** worker thread. Sentinel is `_SHUTDOWN = object()`, not `None`.
-- **Cashew dependency is git+SHA pinned** (`cashew-brain @ git+https://github.com/rajkripal/cashew.git@90d1c73...`). Phase 5 will migrate to PyPI specifier before production release.
+- **Cashew dependency on PyPI** (`cashew-brain>=1.1.0,<2.0.0`).
 - **`HF_HUB_OFFLINE=1` etc. are process-wide.** Set in `conftest.py` before any Cashew import. Tests must never trigger the ~500 MB embedding model download.
 
 ## Developer Commands

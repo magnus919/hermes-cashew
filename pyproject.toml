@@ -11,8 +11,7 @@ license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [{ name = "Magnus Hedemark", email = "magnus919@pm.me" }]
 dependencies = [
-    # cashew-brain 1.1.0 with schema version marker (PR #8) — git+SHA pinned until PyPI release
-    "cashew-brain @ git+https://github.com/rajkripal/cashew.git@226181962e0032f523e17a659c708ed21b8799d6",
+    "cashew-brain>=1.1.0,<2.0.0",
 ]
 
 [project.optional-dependencies]

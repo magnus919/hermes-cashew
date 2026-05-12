@@ -8,10 +8,20 @@ import sys
 import types
 from abc import ABC, abstractmethod
 
+import pytest
+
 # CRITICAL: set BEFORE any Cashew-reachable import runs. Process-wide, persists for full session.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+
+
+@pytest.fixture(autouse=True)
+def _clear_cashew_env_vars(monkeypatch: pytest.MonkeyPatch):
+    """Strip CASHEW_* env vars so the user's Hermes session doesn't leak into test isolation."""
+    for key in list(os.environ):
+        if key.startswith("CASHEW_"):
+            monkeypatch.delenv(key, raising=False)
 
 # Synthesize agent.memory_provider if hermes-agent is not installed.
 # Verified minimal contract: MemoryProvider has `name` property and a set of abstract methods.

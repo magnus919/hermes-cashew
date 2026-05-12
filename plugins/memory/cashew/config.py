@@ -384,7 +384,20 @@ def load_config(hermes_home: str | os.PathLike[str]) -> CashewConfig:
                 elif isinstance(default_val, float):
                     merged[key] = float(env_val)
                 elif isinstance(default_val, list):
-                    merged[key] = [item.strip() for item in env_val.split(",") if item.strip()]
+                    env_trimmed = env_val.strip()
+                    if env_trimmed.startswith("[") and env_trimmed.endswith("]"):
+                        # Handle repr()/JSON format: "['a', 'b']" or '["a", "b"]'
+                        try:
+                            merged[key] = json.loads(env_trimmed.replace("'", '"'))
+                        except (json.JSONDecodeError, ValueError):
+                            inner = env_trimmed[1:-1]
+                            merged[key] = [
+                                item.strip().strip("'\"").strip()
+                                for item in inner.split(",")
+                                if item.strip()
+                            ]
+                    else:
+                        merged[key] = [item.strip() for item in env_val.split(",") if item.strip()]
                 else:
                     merged[key] = env_val
             except ValueError:

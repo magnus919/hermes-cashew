@@ -29,6 +29,7 @@ from plugins.memory.cashew.config import (
     save_config,
 )
 
+
 EXPECTED_KEY_COUNT = 30
 
 

@@ -25,7 +25,6 @@ def _seed_node(db_path, **kwargs):
         "timestamp": "2026-01-01T00:00:00",
         "access_count": 0,
         "last_accessed": None,
-        "confidence": 0.5,
         "source_file": None,
         "decayed": 0,
         "metadata": "{}",
@@ -34,7 +33,6 @@ def _seed_node(db_path, **kwargs):
         "permanent": 0,
         "tags": None,
         "referent_time": None,
-        "reasoning": None,
     }
     defaults.update(kwargs)
     columns = ", ".join(defaults.keys())

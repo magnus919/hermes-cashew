@@ -7,8 +7,6 @@ import pathlib
 import queue
 import threading  # Phase 4: non-daemon worker for sync_turn drain
 import time       # Phase 4: monotonic-clock polling in on_session_end
-import datetime   # Phase 9: recency scoring
-import math       # Phase 9: scoring functions
 from typing import Any, Dict, List
 
 try:
@@ -34,12 +32,7 @@ except ImportError:
     # initialize() will silent-degrade if ContextRetriever is unavailable at runtime.
     ContextRetriever = None  # type: ignore[assignment,misc]
 
-# Phase 3 Plan 02 — tool-surface helpers live in a dedicated module (PHASE_DESIGN_NOTES
-# Decision Point 2). `import json` is redundant with tools.py's own use of json.dumps
-# but is kept at module level for forward compatibility with future defensive parsing
-# of `args` if Hermes ever passes a JSON string instead of a dict.
-import json  # noqa: E402 — intentional: documented Phase 3 forward-compat hook
-from .tools import (  # noqa: E402
+from .tools import (
     CASHEW_EXTRACT_SCHEMA,
     CASHEW_QUERY_SCHEMA,
     build_error_envelope,
@@ -257,211 +250,52 @@ class CashewMemoryProvider(MemoryProvider):
     def _ensure_db_schema(self, db_path: pathlib.Path) -> None:
         """Create or migrate Cashew schema tables.
 
-        Cashew's _ensure_schema() only runs ALTER TABLE migrations (adds missing
-        columns) — it does NOT create tables from scratch, and does NOT alter
-        column constraints. On a fresh DB this method creates all three tables.
-        On an existing DB it migrates schemas that are missing constraints that
-        _create_edge / _create_node depend on (e.g. derivation_edges.timestamp
-        NOT NULL DEFAULT '').
-
-        This matches the schema expected by _create_node and _create_edge in
-        cashew-brain's core.session module.
+        Delegates to cashew-brain's core.db.ensure_schema() which handles
+        upstream table creation (thought_nodes, derivation_edges, embeddings,
+        hotspots, metrics), column migrations, index creation, and schema
+        version stamping (PRAGMA user_version = 3). Then applies hermes-specific
+        extensions (vec_embeddings virtual table for sqlite-vec).
         """
+        from core.db import ensure_schema
+        ensure_schema(str(db_path))
+
         import sqlite3
         conn = sqlite3.connect(str(db_path))
         try:
-            # Step 1: thought_nodes — base table + column migration (per D-07)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS thought_nodes (
-                    id TEXT PRIMARY KEY,
-                    content TEXT NOT NULL,
-                    node_type TEXT NOT NULL,
-                    domain TEXT,
-                    timestamp TEXT,
-                    access_count INTEGER DEFAULT 0,
-                    last_accessed TEXT,
-                    confidence REAL,
-                    source_file TEXT,
-                    decayed INTEGER DEFAULT 0,
-                    metadata TEXT DEFAULT '{}',
-                    last_updated TEXT,
-                    mood_state TEXT,
-                    permanent INTEGER DEFAULT 0,
-                    tags TEXT,
-                    referent_time TEXT,
-                    reasoning TEXT
-                )
-            """)
-            try:
-                conn.execute("BEGIN")
-                self._add_missing_columns(conn)
-                conn.execute("COMMIT")
-            except Exception:
-                conn.execute("ROLLBACK")
-                logger.warning("thought_nodes schema migration failed", exc_info=True)
-
-            # Step 2: derivation_edges — base table + timestamp constraint migration (per D-07)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS derivation_edges (
-                    parent_id TEXT,
-                    child_id TEXT,
-                    weight REAL,
-                    reasoning TEXT,
-                    confidence REAL,
-                    timestamp TEXT DEFAULT '',
-                    PRIMARY KEY (parent_id, child_id),
-                    FOREIGN KEY (parent_id) REFERENCES thought_nodes(id),
-                    FOREIGN KEY (child_id) REFERENCES thought_nodes(id)
-                )
-            """)
-            try:
-                conn.execute("BEGIN")
-                self._migrate_edges_timestamp_not_null(conn)
-                conn.execute("COMMIT")
-            except Exception:
-                conn.execute("ROLLBACK")
-                logger.warning("derivation_edges schema migration failed", exc_info=True)
-
-            # Step 3: embeddings table
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS embeddings (
-                    node_id TEXT PRIMARY KEY,
-                    vector BLOB NOT NULL,
-                    model TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    FOREIGN KEY (node_id) REFERENCES thought_nodes(id)
-                )
-            """)
-            try:
-                conn.execute("BEGIN")
-                conn.execute("COMMIT")
-            except Exception:
-                conn.execute("ROLLBACK")
-                logger.warning("embeddings schema migration failed", exc_info=True)
-
-            # Step 4: vec_embeddings virtual table (guarded, no explicit transaction needed — DDL auto-commits)
+            self._migrate_vec_embeddings(conn)
             self._create_vec_embeddings(conn)
-
         finally:
             conn.close()
 
-    def _add_missing_columns(self, conn: sqlite3.Connection) -> None:
-        _TARGET_COLUMNS = {
-            "reasoning": "TEXT",
-            "mood_state": "TEXT",
-            "metadata": "TEXT DEFAULT '{}'",
-            "permanent": "INTEGER DEFAULT 0",
-            "last_updated": "TEXT",
-            "last_accessed": "TEXT",
-            "access_count": "INTEGER DEFAULT 0",
-            "tags": "TEXT",
-            "referent_time": "TEXT",
-        }
-        _BACKFILL_DEFAULTS = {
-            "metadata": "{}",
-            "permanent": 0,
-            "access_count": 0,
-        }
-        cursor = conn.execute("PRAGMA table_info(thought_nodes)")
-        existing = {row[1] for row in cursor.fetchall()}
-        for col_name, col_def in _TARGET_COLUMNS.items():
-            if col_name not in existing:
-                conn.execute(f"ALTER TABLE thought_nodes ADD COLUMN {col_name} {col_def}")
-            if col_name in _BACKFILL_DEFAULTS:
-                default_val = _BACKFILL_DEFAULTS[col_name]
-                conn.execute(
-                    f"UPDATE thought_nodes SET {col_name} = ? WHERE {col_name} IS NULL",
-                    (default_val,),
-                )
+    def _migrate_vec_embeddings(self, conn: sqlite3.Connection) -> None:
+        """Migrate vec_embeddings from old schema (no node_id, no distance_metric)
+        to the canonical schema matching upstream cashew-brain v1.1.0.
 
-    def _migrate_edges_timestamp_not_null(self, conn: sqlite3.Connection) -> None:
-        """Migrate derivation_edges.timestamp to NOT NULL DEFAULT ''.
+        Old schema:  USING vec0(embedding float[384])
+        New schema:  USING vec0(node_id TEXT primary key, embedding float[384] distance_metric=cosine)
 
-        _create_edge in cashew-brain does NOT provide a timestamp value on
-        INSERT. If timestamp is nullable (the original verify.py schema had no
-        default), every insert raises IntegrityError: NOT NULL constraint failed.
-
-        SQLite does not support ALTER TABLE to change NOT NULL / DEFAULT on an
-        existing column, so we recreate the table and copy data.
-
-        Handles multiple historical schemas including:
-        - Missing confidence column (old init-db: had edge_type instead)
-        - id INTEGER auto-inc column (old init-db artifact)
-        - timestamp nullable with no default
-
-        Steps:
-          1. Inspect existing schema; check if migration is needed.
-          2. If table is empty and has wrong schema: DROP and recreate.
-          3. If table has rows: copy data, mapping columns correctly.
+        The old schema caused _retrieve_with_vec to return rowid values that never
+        matched thought_nodes.id (SHA hashes), making vec search always return 0.
         """
-        import sqlite3 as _sq
-
         try:
-            cursor = conn.execute("PRAGMA table_info(derivation_edges)")
-            cols = {row[1] for row in cursor.fetchall()}
-        except _sq.OperationalError:
-            return
-
-        if "timestamp" not in cols:
-            return
-
-        row_count = conn.execute("SELECT COUNT(*) FROM derivation_edges").fetchone()[0]
-
-        has_timestamp_default = False
-        try:
-            info = conn.execute("PRAGMA table_info(derivation_edges)").fetchall()
-            for col in info:
-                if col[1] == "timestamp" and col[4] is not None:
-                    has_timestamp_default = True
-        except Exception:
-            pass
-
-        if has_timestamp_default:
-            return
-
-        try:
-            cursor.execute("""
-                CREATE TABLE _derivation_edges_new (
-                    parent_id TEXT,
-                    child_id TEXT,
-                    weight REAL,
-                    reasoning TEXT,
-                    confidence REAL,
-                    timestamp TEXT DEFAULT '' NOT NULL,
-                    PRIMARY KEY (parent_id, child_id),
-                    FOREIGN KEY (parent_id) REFERENCES thought_nodes(id),
-                    FOREIGN KEY (child_id) REFERENCES thought_nodes(id)
-                )
-            """)
-
-            if row_count == 0:
-                pass
-            else:
-                has_confidence = "confidence" in cols
-                has_edge_type = "edge_type" in cols
-                has_id = "id" in cols
-
-                if has_confidence:
-                    src = "parent_id, child_id, weight, reasoning, confidence"
-                elif has_edge_type:
-                    src = "parent_id, child_id, weight, reasoning, NULL AS confidence"
-                else:
-                    src = "parent_id, child_id, weight, reasoning, NULL AS confidence"
-
-                cursor.execute(f"""
-                    INSERT INTO _derivation_edges_new
-                        (parent_id, child_id, weight, reasoning, confidence, timestamp)
-                    SELECT {src}, COALESCE(timestamp, '')
-                    FROM derivation_edges
-                """)
-
-            cursor.execute("DROP TABLE derivation_edges")
-            cursor.execute("ALTER TABLE _derivation_edges_new RENAME TO derivation_edges")
-        except _sq.OperationalError:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_embeddings'"
+            )
+            if cursor.fetchone() is None:
+                return
+            has_node_id = False
             try:
-                conn.execute("DROP TABLE IF EXISTS _derivation_edges_new")
+                conn.execute("SELECT node_id FROM vec_embeddings LIMIT 1")
+                has_node_id = True
             except Exception:
                 pass
+            if not has_node_id:
+                logger.info("Migrating vec_embeddings from old schema (dropping and recreating)")
+                conn.execute("DROP TABLE vec_embeddings")
+        except Exception:
+            logger.info("sqlite-vec not available; skipping vec_embeddings migration")
+
+
 
     def _create_vec_embeddings(self, conn: sqlite3.Connection) -> None:
         try:
@@ -473,130 +307,34 @@ class CashewMemoryProvider(MemoryProvider):
             conn.enable_load_extension(True)
             conn.load_extension("vec0")
             conn.execute("""
-                CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings USING vec0(
-                    embedding float[384]
-                )
+                CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings
+                USING vec0(node_id TEXT primary key, embedding float[384] distance_metric=cosine)
             """)
             logger.debug("vec_embeddings virtual table ready")
         except Exception:
             logger.info("sqlite-vec not available; semantic search will use fallback")
 
-    def _vec_available(self, conn: sqlite3.Connection) -> bool:
+    def _enrich_results(self, node_ids: list[str]) -> list[dict]:
+        """Fetch full node dicts from DB for upstream retrieval results.
+
+        Upstream RetrievalResult carries core fields (id, content, type, domain),
+        but Hermes-specific formatting needs permanent flag, tags, referent_time
+        etc. Batch-query the DB to get these.
+        """
+        if not node_ids:
+            return []
+        import sqlite3
+        conn = sqlite3.connect(str(self._db_path))
         try:
+            placeholders = ",".join("?" * len(node_ids))
             cursor = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_embeddings'"
+                f"SELECT * FROM thought_nodes WHERE id IN ({placeholders})", node_ids
             )
-            return cursor.fetchone() is not None
-        except Exception:
-            return False
-
-    def _get_query_embedding(self, query: str) -> list[float] | None:
-        try:
-            from core.embeddings import embed_text
-            result = embed_text(query)
-            if hasattr(result, "tolist"):
-                return result.tolist()
-            return list(result)
-        except Exception:
-            return None
-
-    def _retrieve_with_vec(self, query: str, max_nodes: int) -> list[dict]:
-        try:
-            import sqlite3
-            conn = sqlite3.connect(str(self._db_path))
-            try:
-                if not self._vec_available(conn):
-                    return []
-                embedding = self._get_query_embedding(query)
-                if embedding is None:
-                    return []
-                cursor = conn.execute(
-                    "SELECT rowid, distance FROM vec_embeddings WHERE embedding MATCH ? AND k = ? ORDER BY distance",
-                    (json.dumps(embedding), max_nodes),
-                )
-                rows = cursor.fetchall()
-                nodes = []
-                for rowid, distance in rows:
-                    node_cursor = conn.execute(
-                        "SELECT * FROM thought_nodes WHERE id = ?", (str(rowid),)
-                    )
-                    node_row = node_cursor.fetchone()
-                    if node_row:
-                        node = dict(zip([col[0] for col in node_cursor.description], node_row))
-                        node["_source"] = "vec"
-                        nodes.append(node)
-                return nodes
-            finally:
-                conn.close()
-        except Exception:
-            logger.warning("cashew vec retrieval failed", exc_info=True)
-            return []
-
-    def _retrieve_bfs(self, seed_ids: list[str], max_nodes: int) -> list[dict]:
-        try:
-            import sqlite3
-            conn = sqlite3.connect(str(self._db_path))
-            try:
-                results = []
-                visited = set(seed_ids)
-                for seed_id in seed_ids:
-                    cursor = conn.execute(
-                        """
-                        SELECT child_id, weight FROM derivation_edges WHERE parent_id = ?
-                        UNION
-                        SELECT parent_id, weight FROM derivation_edges WHERE child_id = ?
-                        """,
-                        (seed_id, seed_id),
-                    )
-                    for connected_id, weight in cursor.fetchall():
-                        if connected_id not in visited:
-                            visited.add(connected_id)
-                            node_cursor = conn.execute(
-                                "SELECT * FROM thought_nodes WHERE id = ?", (connected_id,)
-                            )
-                            node_row = node_cursor.fetchone()
-                            if node_row:
-                                node = dict(
-                                    zip([col[0] for col in node_cursor.description], node_row)
-                                )
-                                node["_source"] = "bfs"
-                                results.append(node)
-                        if len(results) >= max_nodes:
-                            break
-                    if len(results) >= max_nodes:
-                        break
-                return results
-            finally:
-                conn.close()
-        except Exception:
-            logger.warning("cashew BFS retrieval failed", exc_info=True)
-            return []
-
-    def _retrieve_keyword(self, query: str, max_nodes: int) -> list[dict]:
-        try:
-            import sqlite3
-            conn = sqlite3.connect(str(self._db_path))
-            try:
-                cursor = conn.execute(
-                    """
-                    SELECT * FROM thought_nodes
-                    WHERE content LIKE ?
-                    ORDER BY referent_time DESC NULLS LAST, timestamp DESC
-                    LIMIT ?
-                    """,
-                    (f"%{query}%", max_nodes),
-                )
-                nodes = []
-                for row in cursor.fetchall():
-                    node = dict(zip([col[0] for col in cursor.description], row))
-                    node["_source"] = "keyword"
-                    nodes.append(node)
-                return nodes
-            finally:
-                conn.close()
-        except Exception:
-            logger.warning("cashew keyword retrieval failed", exc_info=True)
-            return []
+            rows = cursor.fetchall()
+            cols = [col[0] for col in cursor.description]
+            return [dict(zip(cols, row)) for row in rows]
+        finally:
+            conn.close()
 
     def _format_context(self, nodes: list[dict]) -> str:
         if not nodes:
@@ -620,51 +358,6 @@ class CashewMemoryProvider(MemoryProvider):
             else:
                 lines.append(content)
         return "\n".join(lines)
-
-    def _apply_filters(self, nodes: list[dict], domain: str | None = None, tag: str | None = None) -> list[dict]:
-        if not domain and not tag:
-            return nodes
-        filtered = []
-        for node in nodes:
-            if domain and node.get("domain") != domain:
-                continue
-            if tag:
-                tags = node.get("tags")
-                if tags is None or tag not in str(tags):
-                    continue
-            filtered.append(node)
-        return filtered
-
-    def _score_nodes(self, nodes: list[dict], query_time: float | None = None) -> list[tuple[float, dict]]:
-        if query_time is None:
-            query_time = datetime.datetime.now(datetime.timezone.utc).timestamp()
-        scored = []
-        for node in nodes:
-            score = 0.0
-            time_str = node.get("referent_time") or node.get("timestamp")
-            if time_str:
-                try:
-                    node_time = datetime.datetime.fromisoformat(
-                        time_str.replace("Z", "+00:00")
-                    ).timestamp()
-                    age_seconds = max(0, query_time - node_time)
-                    recency_score = math.exp(-age_seconds / (30 * 24 * 3600))
-                    score += recency_score * 0.3
-                except Exception:
-                    pass
-            confidence = node.get("confidence")
-            if confidence is not None:
-                score += confidence * 0.2
-            if node.get("permanent") == 1:
-                score *= 1.5
-            access_count = node.get("access_count", 0) or 0
-            access_score = min(1.0, math.log1p(access_count) / math.log1p(100))
-            score += access_score * 0.1
-            base_score = 0.4 if node.get("_source") == "vec" else 0.2
-            score += base_score
-            scored.append((score, node))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return scored
 
     def _update_access_metrics(self, node_ids: list[str]) -> None:
         if not node_ids:
@@ -763,55 +456,90 @@ class CashewMemoryProvider(MemoryProvider):
         logger.debug("cashew provider shutdown complete (Phase 4 — worker drained)")
 
     def prefetch(self, query: str, domain: str | None = None, tag: str | None = None) -> str:
-        """Return recalled-context string from Cashew, respecting `recall_k` (RECALL-01).
+        """Return recalled-context string from Cashew (RECALL-01).
 
-        Phase 9: Uses three-tier retrieval (sqlite-vec → keyword fallback) with
-        hybrid scoring, filtering, and access metrics update.
+        Delegates to upstream cashew-brain's retrieve_recursive_bfs which handles
+        the full three-tier retrieval (sqlite-vec semantic search → graph BFS →
+        keyword fallback) with hybrid scoring. Hermes-specific fields (permanent
+        flag, tags) are enriched from the DB before formatting.
+
+        Falls back to SQL LIKE keyword search when upstream retrieval fails
+        (e.g. sqlite-vec or sentence-transformers unavailable in test environment).
 
         Contract:
-        - Half-state guard: if `_retriever is None`, return `""` without logging.
-        - Tier 1: sqlite-vec semantic search via _retrieve_with_vec.
-        - Tier 2: keyword fallback via _retrieve_keyword.
-        - Results are filtered, scored, and access metrics are updated.
+        - Half-state guard: if `_config is None`, return `""` without logging.
         - Empty result is valid (returns `""` without logging).
         - Failure path: `except Exception` logs ONE WARNING and returns `""`.
-
-        Args:
-            query: The search query string.
-            domain: Optional domain filter (D-07).
-            tag: Optional tag filter (D-07).
-
-        Returns:
-            Formatted context string. Never None, never raises.
         """
-        if self._retriever is None or self._config is None:
+        if self._config is None:
             return ""
         max_nodes = self._config.recall_k
         try:
-            # Tier 1: sqlite-vec semantic search
-            nodes = self._retrieve_with_vec(query, max_nodes)
-            if not nodes:
-                # Tier 2: keyword fallback
-                nodes = self._retrieve_keyword(query, max_nodes)
-            if not nodes:
-                return ""
-            # Apply domain/tag filters
-            nodes = self._apply_filters(nodes, domain=domain, tag=tag)
-            # Score and rank
-            scored = self._score_nodes(nodes)
-            final_nodes = [node for score, node in scored[:max_nodes]]
-            # Update access metrics for returned nodes
-            node_ids = [n["id"] for n in final_nodes if "id" in n]
-            if node_ids:
-                self._update_access_metrics(node_ids)
-            return self._format_context(final_nodes)
-        except Exception:
-            logger.warning(
-                "cashew recall failed for query=%r",
-                query,
-                exc_info=True,
+            from core.retrieval import retrieve_recursive_bfs
+            results = retrieve_recursive_bfs(
+                db_path=str(self._db_path),
+                query=query,
+                top_k=max_nodes,
+                domain=domain,
+                tags=[tag] if tag else None,
             )
-            return ""
+            if results:
+                node_ids = [r.node_id for r in results]
+                self._update_access_metrics(node_ids)
+                nodes = self._enrich_results(node_ids)
+                return self._format_context(nodes)
+        except Exception:
+            logger.debug("upstream retrieval failed, falling back to keyword", exc_info=True)
+        try:
+            nodes = self._keyword_search(query, max_nodes, domain, tag)
+            if nodes:
+                self._update_access_metrics([n["id"] for n in nodes])
+                return self._format_context(nodes)
+        except Exception:
+            logger.warning("cashew recall failed for query=%r", query, exc_info=True)
+        return ""
+
+    def _keyword_search(
+        self, query: str, max_nodes: int,
+        domain: str | None = None, tag: str | None = None,
+    ) -> list[dict]:
+        import sqlite3
+        conn = sqlite3.connect(str(self._db_path))
+        try:
+            where_clauses: list[str] = []
+            params: list = []
+            words = [w for w in query.split() if w]
+            if words:
+                where_clauses.append(
+                    "(" + " AND ".join(["content LIKE ?"] * len(words)) + ")"
+                )
+                params.extend(f"%{w}%" for w in words)
+            if domain:
+                where_clauses.append("domain = ?")
+                params.append(domain)
+            if tag:
+                where_clauses.append("tags LIKE ?")
+                params.append(f"%{tag}%")
+            order_params: list = []
+            if words:
+                order_params.append(f"%{query}%")
+            cursor = conn.execute(
+                f"""
+                SELECT * FROM thought_nodes
+                WHERE {' AND '.join(where_clauses) if where_clauses else '1=1'}
+                ORDER BY
+                    {'(CASE WHEN content LIKE ? THEN 1 ELSE 0 END) DESC,' if order_params else ''}
+                    referent_time DESC NULLS LAST,
+                    timestamp DESC
+                LIMIT ?
+                """,
+                (*params, *order_params, max_nodes),
+            )
+            rows = cursor.fetchall()
+            cols = [col[0] for col in cursor.description]
+            return [dict(zip(cols, row)) for row in rows]
+        finally:
+            conn.close()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         """Return the list of LLM tool schemas this provider exposes (RECALL-02 + SYNC-03).
@@ -845,32 +573,36 @@ class CashewMemoryProvider(MemoryProvider):
             JSON string — NEVER None, NEVER raises into Hermes.
         """
         if name == "cashew_query":
-            # Phase 9: Three-tier retrieval with scoring, filtering, and metrics.
-            # Half-state guard — no log here (initialize already warned).
-            if self._retriever is None or self._config is None:
+            if self._config is None:
                 return build_error_envelope(
                     query=args.get("query"),
                     error_message="cashew recall failed",
                 )
             try:
-                query = args["query"]  # KeyError caught below
+                query = args["query"]
                 max_nodes = args.get("max_nodes", self._config.recall_k)
-                # Tier 1: sqlite-vec semantic search
-                nodes = self._retrieve_with_vec(query, max_nodes)
-                if not nodes:
-                    # Tier 2: keyword fallback
-                    nodes = self._retrieve_keyword(query, max_nodes)
+                domain = args.get("domain")
+                tag = args.get("tag")
+                try:
+                    from core.retrieval import retrieve_recursive_bfs
+                    results = retrieve_recursive_bfs(
+                        db_path=str(self._db_path),
+                        query=query,
+                        top_k=max_nodes,
+                        domain=domain,
+                        tags=[tag] if tag else None,
+                    )
+                except Exception:
+                    results = None
+                if results:
+                    node_ids = [r.node_id for r in results]
+                    nodes = self._enrich_results(node_ids)
+                else:
+                    nodes = self._keyword_search(query, max_nodes, domain, tag)
                 if nodes:
-                    domain = args.get("domain")
-                    tag = args.get("tag")
-                    nodes = self._apply_filters(nodes, domain=domain, tag=tag)
-                    scored = self._score_nodes(nodes)
-                    final_nodes = [node for score, node in scored[:max_nodes]]
-                    node_ids = [n["id"] for n in final_nodes if "id" in n]
-                    if node_ids:
-                        self._update_access_metrics(node_ids)
-                    context = self._format_context(final_nodes)
-                    node_count = len(final_nodes)
+                    self._update_access_metrics([n["id"] for n in nodes])
+                    context = self._format_context(nodes)
+                    node_count = len(nodes)
                 else:
                     context = ""
                     node_count = 0
@@ -993,5 +725,15 @@ class CashewMemoryProvider(MemoryProvider):
 
 
 def register(ctx) -> None:
-    """Hermes discovery entry point — filesystem loader calls this."""
-    ctx.register_memory_provider(CashewMemoryProvider())
+    """Hermes discovery entry point — filesystem loader calls this.
+
+    Two code paths:
+    - Directory scanner (source="bundled"|"user" in plugins/memory/__init__.py):
+      ctx is a _ProviderCollector with register_memory_provider.
+    - Entry-point loader (source="entrypoint"): ctx is a PluginContext without
+      register_memory_provider — memory providers are discovered by the
+      directory scanner, not entry points.
+    """
+    register_fn = getattr(ctx, "register_memory_provider", None)
+    if register_fn is not None:
+        register_fn(CashewMemoryProvider())

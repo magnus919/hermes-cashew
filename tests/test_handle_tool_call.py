@@ -34,7 +34,6 @@ def _seed_node(db_path, **kwargs):
         "timestamp": "2026-01-01T00:00:00",
         "access_count": 0,
         "last_accessed": None,
-        "confidence": 0.5,
         "source_file": None,
         "decayed": 0,
         "metadata": "{}",
@@ -43,7 +42,6 @@ def _seed_node(db_path, **kwargs):
         "permanent": 0,
         "tags": None,
         "referent_time": None,
-        "reasoning": None,
     }
     defaults.update(kwargs)
     columns = ", ".join(defaults.keys())
@@ -167,8 +165,8 @@ def test_retrieval_exception_returns_error_envelope_and_logs_once(tmp_path, capl
     def _raise(*args, **kwargs):
         raise RuntimeError("database is locked")
 
-    monkeypatch.setattr(p, "_retrieve_with_vec", _raise)
-    monkeypatch.setattr(p, "_retrieve_keyword", _raise)
+    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", _raise)
+    monkeypatch.setattr(p, "_keyword_search", _raise)
     try:
         with caplog.at_level(logging.WARNING, logger="plugins.memory.cashew"):
             result = p.handle_tool_call("cashew_query", {"query": "x"})
@@ -192,8 +190,8 @@ def test_error_envelope_has_no_stack_trace_substrings(tmp_path, caplog, monkeypa
     def _raise(*args, **kwargs):
         raise sqlite3.OperationalError("database is locked /some/secret/path/brain.db")
 
-    monkeypatch.setattr(p, "_retrieve_with_vec", _raise)
-    monkeypatch.setattr(p, "_retrieve_keyword", _raise)
+    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", _raise)
+    monkeypatch.setattr(p, "_keyword_search", _raise)
     try:
         with caplog.at_level(logging.WARNING, logger="plugins.memory.cashew"):
             result = p.handle_tool_call("cashew_query", {"query": "x"})

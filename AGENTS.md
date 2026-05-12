@@ -33,6 +33,27 @@ pytest tests/test_name.py -xvs  # single file
 python3 -m pytest              # macOS fallback
 ```
 
+### Dev Install Quirks (pip install -e .)
+
+Hermes runs from its own venv at `~/.hermes/hermes-agent/venv/`. A dev install must be done
+in *that* venv, and a symlink is needed because Hermes inserts `~/.hermes/hermes-agent/`
+at the front of `sys.path` (hermes_cli/main.py:107), making its `plugins/__init__.py` a
+regular package that blocks PEP 420 namespace resolution for `pip install -e .`.
+
+```bash
+# 1. Install into Hermes venv
+~/.hermes/hermes-agent/venv/bin/python3 -m pip install -e ".[dev]"
+
+# 2. Symlink so import resolves within Hermes' regular plugins tree
+ln -sf "$PWD/plugins/memory/cashew" \
+       ~/.hermes/hermes-agent/plugins/memory/cashew
+```
+
+Without the symlink, the entry-point loader (`ep.load()` → `import plugins.memory.cashew`)
+fails with `ModuleNotFoundError`. End users who install via `hermes plugins install` are
+not affected — that path clones to `$HERMES_HOME/plugins/cashew/` and uses directory-based
+loading, which bypasses the entry point entirely.
+
 CI runs `pytest -xvs` with `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1`. A log-scan step fails if `Downloading.*MiniLM` appears.
 
 ## Threading Rule

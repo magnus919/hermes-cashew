@@ -45,7 +45,6 @@ DEFAULTS: dict[str, Any] = {
     "clustering_eps": 0.35,
     "clustering_min_samples": 3,
     "novelty_threshold": 0.82,
-    "confidence_threshold": 0.7,
     "max_think_iterations": 3,
     "think_cycle_nodes": 5,
     # GC (5)
@@ -89,7 +88,6 @@ class CashewConfig:
     clustering_eps: float = DEFAULTS["clustering_eps"]
     clustering_min_samples: int = DEFAULTS["clustering_min_samples"]
     novelty_threshold: float = DEFAULTS["novelty_threshold"]
-    confidence_threshold: float = DEFAULTS["confidence_threshold"]
     max_think_iterations: int = DEFAULTS["max_think_iterations"]
     think_cycle_nodes: int = DEFAULTS["think_cycle_nodes"]
     # GC
@@ -251,12 +249,6 @@ def get_config_schema() -> list[dict[str, Any]]:
             "description": "Score threshold (0-1) below which nodes are considered redundant.",
             "default": DEFAULTS["novelty_threshold"],
             "env_var": _env_var_name("novelty_threshold"),
-        },
-        {
-            "key": "confidence_threshold",
-            "description": "Minimum confidence (0-1) for extracted nodes to be persisted.",
-            "default": DEFAULTS["confidence_threshold"],
-            "env_var": _env_var_name("confidence_threshold"),
         },
         {
             "key": "max_think_iterations",

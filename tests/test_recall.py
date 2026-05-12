@@ -34,7 +34,6 @@ def _seed_node(db_path, **kwargs):
         "timestamp": "2026-01-01T00:00:00",
         "access_count": 0,
         "last_accessed": None,
-        "confidence": 0.5,
         "source_file": None,
         "decayed": 0,
         "metadata": "{}",
@@ -43,7 +42,6 @@ def _seed_node(db_path, **kwargs):
         "permanent": 0,
         "tags": None,
         "referent_time": None,
-        "reasoning": None,
     }
     defaults.update(kwargs)
     columns = ", ".join(defaults.keys())
@@ -124,8 +122,8 @@ def test_prefetch_retrieval_exception_logs_once_and_returns_empty(tmp_path, capl
     def _raise(*args, **kwargs):
         raise RuntimeError("database is locked")
 
-    monkeypatch.setattr(p, "_retrieve_with_vec", _raise)
-    monkeypatch.setattr(p, "_retrieve_keyword", _raise)
+    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", _raise)
+    monkeypatch.setattr(p, "_keyword_search", _raise)
     try:
         with caplog.at_level(logging.WARNING, logger="plugins.memory.cashew"):
             result = p.prefetch("test")
@@ -133,7 +131,7 @@ def test_prefetch_retrieval_exception_logs_once_and_returns_empty(tmp_path, capl
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert len(warnings) == 1, f"expected 1 WARNING; got {len(warnings)}"
         assert "cashew recall failed" in warnings[0].getMessage()
-        assert warnings[0].exc_info is not None, "exc_info must be attached"
+        assert warnings[0].exc_info is not None
     finally:
         p.shutdown()
 

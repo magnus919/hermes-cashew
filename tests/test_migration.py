@@ -69,7 +69,6 @@ def test_v0_1_0_columns_added(tmp_path):
     try:
         conn = sqlite3.connect(str(db_path))
         cols = _get_columns(conn, "thought_nodes")
-        assert "reasoning" in cols, "SCHEMA-01: reasoning column missing"
         assert "mood_state" in cols, "SCHEMA-02: mood_state column missing"
         assert "metadata" in cols, "SCHEMA-03: metadata column missing"
         assert "permanent" in cols, "SCHEMA-09: permanent column missing"
@@ -98,22 +97,26 @@ def test_migration_idempotent(tmp_path):
     try:
         conn = sqlite3.connect(str(db_path))
         cols = _get_columns(conn, "thought_nodes")
-        assert "reasoning" in cols
+        assert "metadata" in cols
         conn.close()
     finally:
         p2.shutdown()
 
 
-def test_no_columns_dropped(tmp_path):
-    """SCHEMA-06: Migration is strictly additive — no columns are dropped."""
+def test_core_columns_preserved(tmp_path):
+    """SCHEMA-06: Core data columns are preserved after migration.
+    
+    Upstream v1.1.0 drops the dead confidence column (uncalibrated noise per
+    cashew-brain PR #25) but preserves all meaningful data columns.
+    """
     db_path = tmp_path / "cashew" / "brain.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     _make_v0_1_0_db(db_path)
 
-    # Pre-migration column count
+    # Pre-migration: confirm confidence exists in old schema
     conn = sqlite3.connect(str(db_path))
     pre_cols = _get_columns(conn, "thought_nodes")
-    pre_count = len(pre_cols)
+    assert "confidence" in pre_cols
     conn.close()
 
     p = CashewMemoryProvider()
@@ -121,14 +124,12 @@ def test_no_columns_dropped(tmp_path):
     try:
         conn = sqlite3.connect(str(db_path))
         post_cols = _get_columns(conn, "thought_nodes")
-        post_count = len(post_cols)
-        assert post_count >= pre_count, (
-            f"Column count decreased: {pre_count} → {post_count}. Migration dropped columns."
-        )
-        # Verify all original columns still exist
+        # confidence is intentionally dropped by upstream
         assert "id" in post_cols
         assert "content" in post_cols
         assert "node_type" in post_cols
+        assert "domain" in post_cols
+        assert "timestamp" in post_cols
         conn.close()
     finally:
         p.shutdown()
@@ -183,15 +184,16 @@ def test_vec_embeddings_guarded_when_unavailable(tmp_path, caplog):
 
 
 def test_existing_data_preserved(tmp_path):
-    """SCHEMA-06: All existing row data is preserved after migration."""
+    """SCHEMA-06: Existing row data is preserved after migration (confidence column excluded —
+    upstream v1.1.0 drops it intentionally per cashew-brain PR #25)."""
     db_path = tmp_path / "cashew" / "brain.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     _make_v0_1_0_db(db_path)
 
     conn = sqlite3.connect(str(db_path))
     conn.execute(
-        "INSERT INTO thought_nodes (id, content, node_type, domain, timestamp, confidence) "
-        "VALUES ('n1', 'hello world', 'fact', 'test-domain', '2024-01-01T00:00:00', 0.95)"
+        "INSERT INTO thought_nodes (id, content, node_type, domain, timestamp) "
+        "VALUES ('n1', 'hello world', 'fact', 'test-domain', '2024-01-01T00:00:00')"
     )
     conn.commit()
     conn.close()
@@ -201,10 +203,10 @@ def test_existing_data_preserved(tmp_path):
     try:
         conn = sqlite3.connect(str(db_path))
         row = conn.execute(
-            "SELECT id, content, node_type, domain, timestamp, confidence "
+            "SELECT id, content, node_type, domain, timestamp "
             "FROM thought_nodes WHERE id = 'n1'"
         ).fetchone()
-        assert row == ("n1", "hello world", "fact", "test-domain", "2024-01-01T00:00:00", 0.95), (
+        assert row == ("n1", "hello world", "fact", "test-domain", "2024-01-01T00:00:00"), (
             f"Existing data was corrupted during migration: {row}"
         )
         conn.close()
@@ -221,7 +223,6 @@ def test_fresh_db_has_all_columns(tmp_path):
         db_path = pathlib.Path(str(tmp_path)) / "cashew" / "brain.db"
         conn = sqlite3.connect(str(db_path))
         cols = _get_columns(conn, "thought_nodes")
-        assert "reasoning" in cols
         assert "mood_state" in cols
         assert "metadata" in cols
         assert "permanent" in cols
@@ -230,6 +231,8 @@ def test_fresh_db_has_all_columns(tmp_path):
         assert "access_count" in cols
         assert "tags" in cols
         assert "referent_time" in cols
+        assert "domain" in cols
+        assert "timestamp" in cols
         conn.close()
     finally:
         p.shutdown()

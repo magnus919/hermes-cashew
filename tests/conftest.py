@@ -105,6 +105,9 @@ def fake_embedder(monkeypatch):
         import core.embeddings  # noqa: F401
         for attr in ("load_embeddings", "load_all_embeddings", "embed_text", "embed_nodes"):
             monkeypatch.setattr(f"core.embeddings.{attr}", _stub, raising=False)
+        import core.session
+        for attr in ("embed_text", "embed_nodes"):
+            monkeypatch.setattr(f"core.session.{attr}", _stub, raising=False)
     except ImportError:
         pass
     yield
@@ -112,12 +115,16 @@ def fake_embedder(monkeypatch):
 
 @pytest.fixture
 def home_snapshot():
-    """Snapshot ~/.hermes mtime + recursive file listing before/after a test.
+    """Snapshot ~/.hermes file listing before/after a test.
 
     Used by tests/test_no_home_leak.py to satisfy TEST-03: any plugin code path
     that writes under the user's real $HOME during a tmp_path-scoped lifecycle
     is a profile-isolation violation. Yields a dict with the pre-test snapshot;
     the test calls `assert_unchanged()` (also yielded) to verify post-test state.
+
+    Tracks only file path existence (not mtime) so concurrent background
+    processes (gateway, MCP servers) appending to logs don't cause false
+    positives.
 
     If ~/.hermes does not exist pre-test, asserts it does not exist post-test.
     Never creates files under ~ — purely observational.
@@ -127,17 +134,13 @@ def home_snapshot():
 
     def _snapshot():
         if not home_hermes.exists():
-            return {"exists": False, "mtime": None, "files": frozenset()}
+            return {"exists": False, "files": frozenset()}
         files = frozenset(
-            (p.relative_to(home_hermes).as_posix(), p.stat().st_mtime_ns)
+            p.relative_to(home_hermes).as_posix()
             for p in home_hermes.rglob("*")
             if p.is_file()
         )
-        return {
-            "exists": True,
-            "mtime": home_hermes.stat().st_mtime_ns,
-            "files": files,
-        }
+        return {"exists": True, "files": files}
 
     pre = _snapshot()
 
@@ -147,14 +150,10 @@ def home_snapshot():
             f"~/.hermes existence changed: pre={pre['exists']} post={post['exists']}"
         )
         if pre["exists"]:
-            assert pre["mtime"] == post["mtime"], (
-                f"~/.hermes mtime changed: pre={pre['mtime']} post={post['mtime']}"
-            )
             new_files = post["files"] - pre["files"]
             removed_files = pre["files"] - post["files"]
             assert not new_files, f"~/.hermes gained files during test: {sorted(new_files)}"
             assert not removed_files, f"~/.hermes lost files during test: {sorted(removed_files)}"
 
     yield {"pre": pre, "assert_unchanged": assert_unchanged}
-    # Belt-and-suspenders: if the test forgot to call assert_unchanged, do it here.
     assert_unchanged()

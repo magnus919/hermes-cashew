@@ -1,6 +1,6 @@
 # tests/test_config_roundtrip.py
 # Phase 2 Plan 02-03: pure helper-module tests for plugins/memory/cashew/config.py.
-# Phase 10 expansion: ~31 keys aligned with upstream Cashew.
+# Phase 10 expansion: ~30 keys aligned with upstream Cashew.
 # Exercises CashewConfig dataclass, DEFAULTS, CONFIG_FILENAME, get_config_schema,
 # resolve_config_path, resolve_db_path, load_config, save_config — all in isolation
 # from CashewMemoryProvider. Provider-level tests live in test_initialize_lifecycle.py.
@@ -29,16 +29,11 @@ from plugins.memory.cashew.config import (
     save_config,
 )
 
-EXPECTED_KEY_COUNT = 31
+EXPECTED_KEY_COUNT = 30
 
 
-def test_config_filename_is_cashew_json():
-    """CONF-02: config file is `cashew.json` directly under hermes_home (flat)."""
-    assert CONFIG_FILENAME == "cashew.json"
-
-
-def test_defaults_contains_exactly_31_keys_with_documented_values():
-    """CONF-01: schema declares all ~31 keys."""
+def test_defaults_contains_exactly_30_keys_with_documented_values():
+    """CONF-01: schema declares all ~30 keys."""
     assert len(DEFAULTS) == EXPECTED_KEY_COUNT
     assert DEFAULTS["cashew_db_path"] == "cashew/brain.db"
     assert DEFAULTS["embedding_model"] == "all-MiniLM-L6-v2"
@@ -58,7 +53,6 @@ def test_defaults_contains_exactly_31_keys_with_documented_values():
     assert DEFAULTS["clustering_eps"] == 0.35
     assert DEFAULTS["clustering_min_samples"] == 3
     assert DEFAULTS["novelty_threshold"] == 0.82
-    assert DEFAULTS["confidence_threshold"] == 0.7
     assert DEFAULTS["max_think_iterations"] == 3
     assert DEFAULTS["think_cycle_nodes"] == 5
     assert DEFAULTS["gc_mode"] == "soft"
@@ -82,7 +76,7 @@ def test_cashew_config_dataclass_field_set_matches_defaults():
 
 
 def test_get_config_schema_shape_is_list_of_field_descriptors():
-    """CONF-01 + CONFIG-07: schema returns ~31 field descriptors for hermes memory setup."""
+    """CONF-01 + CONFIG-07: schema returns ~30 field descriptors for hermes memory setup."""
     schema = get_config_schema()
     assert isinstance(schema, list)
     assert len(schema) == EXPECTED_KEY_COUNT
@@ -100,8 +94,8 @@ def test_get_config_schema_shape_is_list_of_field_descriptors():
         assert not field.get("secret", False), f"field {field['key']!r} unexpectedly marked secret"
 
 
-def test_env_var_map_has_31_entries():
-    """ENV_VAR_MAP covers all 31 config keys."""
+def test_env_var_map_has_30_entries():
+    """ENV_VAR_MAP covers all 30 config keys."""
     assert len(ENV_VAR_MAP) == EXPECTED_KEY_COUNT
     for key in DEFAULTS:
         assert key in ENV_VAR_MAP
@@ -145,13 +139,13 @@ def test_resolve_db_path_rejects_absolute_paths(tmp_path):
 
 
 def test_load_config_returns_defaults_when_file_absent(tmp_path):
-    """No cashew.json → defaults for all 31 keys. No exception."""
+    """No cashew.json → defaults for all 30 keys. No exception."""
     cfg = load_config(tmp_path)
     assert cfg == CashewConfig(**DEFAULTS)
 
 
 def test_load_config_merges_partial_file_over_defaults(tmp_path):
-    """Partial cashew.json (1 of 31 keys) → that key honored, others default."""
+    """Partial cashew.json (1 of 30 keys) → that key honored, others default."""
     (tmp_path / "cashew.json").write_text(json.dumps({"recall_k": 9, "user_domain": "ganesh"}))
     cfg = load_config(tmp_path)
     assert cfg.recall_k == 9

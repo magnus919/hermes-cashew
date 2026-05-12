@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import json
+import logging
+import sqlite3
+import threading
 import time
 
 from plugins.memory.cashew import CashewMemoryProvider
-from plugins.memory.cashew.config import get_config_schema
+from plugins.memory.cashew.config import get_config_schema, resolve_db_path, DEFAULTS
 
 
 def test_e2e_install_lifecycle_saves_config_and_reports_available(tmp_path):
@@ -55,8 +58,9 @@ def test_e2e_install_lifecycle_schema_returns_field_descriptors(tmp_path):
         f'get_config_schema() must return list, got {type(schema).__name__}'
     )
 
-    # Must have exactly 31 entries (Phase 10 expansion)
-    assert len(schema) == 31, f'Expected 31 field descriptors, got {len(schema)}'
+    from plugins.memory.cashew.config import DEFAULTS
+    expected = len(DEFAULTS)
+    assert len(schema) == expected, f'Expected {expected} field descriptors, got {len(schema)}'
 
     # Each entry must be a dict with required keys (Phase 10 adds env_var)
     required_keys = {'key', 'description', 'default', 'env_var'}
@@ -126,3 +130,84 @@ def test_e2e_install_lifecycle_full_provider_init_and_shutdown(tmp_path):
     
     elapsed = time.monotonic() - t0
     assert elapsed < 5.0, f'Full E2E lifecycle exceeded 5s budget: {elapsed:.2f}s'
+
+
+def test_e2e_full_lifecycle_with_retrieval_and_sync(tmp_path):
+    """INSTALL-04 Criterion 1 + 3: Full E2E lifecycle exercising prefetch,
+    sync_turn, and proper teardown — verifying the complete pipeline works
+    end-to-end with real retrieval via keyword fallback."""
+    t0 = time.monotonic()
+    hermes_home = tmp_path
+
+    provider = CashewMemoryProvider()
+    provider.save_config({"recall_k": 5}, str(hermes_home))
+    provider.initialize("e2e-full", hermes_home=str(hermes_home))
+    try:
+        assert provider._config is not None
+        assert provider._retriever is not None
+
+        db_path = resolve_db_path(hermes_home, DEFAULTS["cashew_db_path"])
+
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "INSERT INTO thought_nodes (id, content, node_type, domain, timestamp) "
+            "VALUES ('n1', 'E2E test content for retrieval', 'test', 'e2e', '2026-01-01T00:00:00')"
+        )
+        conn.commit()
+        conn.close()
+
+        context = provider.prefetch("E2E test")
+        assert "E2E test content" in context, f"prefetch should find seeded node, got: {context!r}"
+        assert "=== RELEVANT CONTEXT ===" in context
+
+        provider.sync_turn("hello from test", "hello from assistant")
+        assert provider._sync_queue is not None
+        assert provider._sync_queue.unfinished_tasks >= 1
+
+        provider.on_session_end([])
+
+    finally:
+        provider.shutdown()
+
+    elapsed = time.monotonic() - t0
+    assert elapsed < 15.0, f"E2E full lifecycle exceeded 15s budget: {elapsed:.2f}s"
+
+
+def test_concurrent_sync_stress_no_db_locked(tmp_path):
+    """INSTALL-04 Criterion 4: Multiple threads calling sync_turn concurrently
+    must not produce 'database is locked' errors. Exercises the write path
+    under concurrent load that simulates bursty multi-session patterns."""
+    hermes_home = tmp_path
+    provider = CashewMemoryProvider()
+    provider.save_config({"sync_queue_timeout": 10.0}, str(hermes_home))
+    provider.initialize("stress", hermes_home=str(hermes_home))
+    thread_count = 4
+    turns_per_thread = 10
+    barrier = threading.Barrier(thread_count)
+    errors: list[Exception] = []
+    lock = threading.Lock()
+
+    def _worker(tid: int):
+        try:
+            barrier.wait()
+            for i in range(turns_per_thread):
+                provider.sync_turn(f"stress_u{tid}", f"stress_a{tid}")
+        except Exception as e:
+            with lock:
+                errors.append(e)
+
+    threads = [
+        threading.Thread(target=_worker, args=(tid,), daemon=True)
+        for tid in range(thread_count)
+    ]
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+
+    provider.shutdown()
+
+    assert not errors, f"Concurrent sync_turn raised errors: {errors}"
+    # Queue must have drained or be empty after shutdown
+    assert provider._sync_queue is None or provider._sync_queue.unfinished_tasks == 0

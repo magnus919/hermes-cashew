@@ -33,7 +33,6 @@ def _seed_node(db_path, **kwargs):
         "timestamp": "2026-01-01T00:00:00",
         "access_count": 0,
         "last_accessed": None,
-        "confidence": 0.5,
         "source_file": None,
         "decayed": 0,
         "metadata": "{}",
@@ -42,7 +41,6 @@ def _seed_node(db_path, **kwargs):
         "permanent": 0,
         "tags": None,
         "referent_time": None,
-        "reasoning": None,
     }
     defaults.update(kwargs)
     columns = ", ".join(defaults.keys())
@@ -124,15 +122,6 @@ def test_empty_filter_returns_all_nodes(provider, db_path):
     assert "alpha" in result
     assert "beta" in result
     assert "gamma" in result
-
-
-def test_hybrid_scoring_includes_confidence(provider, db_path):
-    _seed_node(db_path, id="high_conf", content="high confidence test", confidence=0.9)
-    _seed_node(db_path, id="low_conf", content="low confidence test", confidence=0.1)
-    result = provider.prefetch("test")
-    high_idx = result.find("high confidence test")
-    low_idx = result.find("low confidence test")
-    assert high_idx < low_idx and high_idx != -1
 
 
 def test_permanent_flag_visible_in_context(provider, db_path):

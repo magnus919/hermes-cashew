@@ -1,6 +1,44 @@
 # Changelog
 
-## v0.3.0 (2026-05-12) — Stop Vibe-Coding, Start Integrating
+## v0.3.1 (2026-05-12) — Open Source Ready
+
+Open source contribution conventions, CI fixes, and PyPI publish cleanup.
+Follow-up to the v0.3.0 refactor.
+
+### Added
+
+- **CONTRIBUTING.md** — full open source contribution guide with DCO
+  sign-off, Conventional Commits, PR process, and development setup
+- **Issue templates** — bug report and feature request templates
+- **PR template** — structured pull request template
+
+### Changed
+
+- **PyPI dependency**: cashew-brain switched from git+SHA pin to
+  `>=1.1.0,<2.0.0` (PyPI rejected direct dependency URLs)
+- **Config env var parsing**: list-typed env vars now handle both
+  comma-separated (`a,b,c`) and Python repr() format (`['a', 'b']`)
+- **Release workflow**: now gates publishing behind tests passing,
+  added `workflow_dispatch` trigger for manual re-runs
+- **Test isolation**: `CASHEW_*` env vars stripped in conftest to
+  prevent Hermes session variables from leaking into tests
+
+### Fixed
+
+- **Entry point test**: updated to match v0.3.0's module-load contract
+  (entry point returns module, not callable)
+- **macOS fallback test**: removed reference to deleted `_retrieve_with_vec`
+  method; gracefully skips mock when sqlite3.Connection is immutable
+- **Release pipeline**: v0.3.0 PyPI publish failed due to direct dependency;
+  retagged and published as v0.3.1
+
+### Closed Issues
+
+9 open issues reconciled against thin-adapter architecture:
+
+- **Closed (fixed/out of scope)**: #9, #10, #12, #13, #14, #20
+- **Re-scoped**: #8 (resolved-by #11), #15 (privacy → exclude_tags)
+- **Kept**: #11 (LLM integration — the remaining core gap)
 
 This release is an object lesson in the dangers of **vibe coding** — the
 trap of building from scratch when you should be integrating. We caught

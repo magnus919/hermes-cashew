@@ -88,6 +88,7 @@ class CashewMemoryProvider(MemoryProvider):
         # matches the WARNING-log count. See B-02 revision in
         # PHASE_DESIGN_NOTES (2026-04-20).
         self._model_fn: Callable[[str], str] | None = None
+        self._think_counter: int = 0
 
     @property
     def name(self) -> str:
@@ -508,6 +509,25 @@ class CashewMemoryProvider(MemoryProvider):
             conversation_text=f"User: {user}\nAssistant: {assistant}",
             model_fn=self._model_fn,
         )
+        # Run think cycle periodically if LLM is wired
+        if self._model_fn is not None and self._config and self._config.think_interval > 0:
+            self._think_counter += 1
+            if self._think_counter >= self._config.think_interval:
+                self._think_counter = 0
+                try:
+                    from core.session import think_cycle
+                    result = think_cycle(
+                        db_path=str(self._db_path),
+                        model_fn=self._model_fn,
+                    )
+                    if result.new_nodes:
+                        logger.info(
+                            "think cycle produced %d insight(s) on cluster: %s",
+                            len(result.new_nodes),
+                            result.cluster_topic or "unknown",
+                        )
+                except Exception:
+                    logger.warning("think cycle failed", exc_info=True)
 
     def on_session_end(self, messages: list) -> None:
         """Best-effort bounded drain; does NOT stop the worker (ABC-06).

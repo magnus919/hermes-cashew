@@ -61,6 +61,7 @@ DEFAULTS: dict[str, Any] = {
     "pattern_detection": True,
     # LLM integration
     "llm_aux_role": None,
+    "think_interval": 10,
 }
 
 
@@ -108,6 +109,7 @@ class CashewConfig:
     pattern_detection: bool = DEFAULTS["pattern_detection"]
     # LLM integration
     llm_aux_role: str | None = DEFAULTS["llm_aux_role"]
+    think_interval: int = DEFAULTS["think_interval"]
 
 
 def _env_var_name(key: str) -> str:
@@ -337,6 +339,17 @@ def get_config_schema() -> list[dict[str, Any]]:
             ),
             "default": DEFAULTS["llm_aux_role"],
             "env_var": _env_var_name("llm_aux_role"),
+        },
+        {
+            "key": "think_interval",
+            "description": (
+                "Number of sync turns between think cycles. When an LLM is "
+                "configured (via llm_aux_role), the plugin runs upstream "
+                "think_cycle() every N turns to discover cross-domain "
+                "connections and generate insight nodes. Set to 0 to disable."
+            ),
+            "default": DEFAULTS["think_interval"],
+            "env_var": _env_var_name("think_interval"),
         },
     ]
     return schema

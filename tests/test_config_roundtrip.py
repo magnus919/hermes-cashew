@@ -30,11 +30,11 @@ from plugins.memory.cashew.config import (
 )
 
 
-EXPECTED_KEY_COUNT = 31
+EXPECTED_KEY_COUNT = 32
 
 
-def test_defaults_contains_exactly_31_keys_with_documented_values():
-    """CONF-01: schema declares all ~31 keys."""
+def test_defaults_contains_exactly_32_keys_with_documented_values():
+    """CONF-01: schema declares all ~32 keys."""
     assert len(DEFAULTS) == EXPECTED_KEY_COUNT
     assert DEFAULTS["cashew_db_path"] == "cashew/brain.db"
     assert DEFAULTS["embedding_model"] == "all-MiniLM-L6-v2"

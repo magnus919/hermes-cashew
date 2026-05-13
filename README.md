@@ -5,8 +5,8 @@ that stores conversation context in a local [Cashew](https://github.com/rajkripa
 thought graph with semantic search and automatic context recall. Get from zero to
 a working install in under five minutes.
 
-**v0.2.0** brings semantic search via sqlite-vec, recursive graph traversal,
-expanded configuration (31 keys with sane defaults), and zero-config startup.
+**v0.4.0** adds LLM-powered extraction, think cycles, and sleep synthesis
+via the `auxiliary.memory` convention — no API keys in plugin config.
 
 ## Prerequisites
 
@@ -118,6 +118,51 @@ Expected output shows `Provider: cashew` with `Plugin: installed` and `Status: a
 Both tools are registered automatically when Hermes loads the plugin.
 On each session start, `prefetch()` retrieves relevant context from the graph
 and injects it into the system prompt.
+
+## LLM Integration (Optional)
+
+By default, hermes-cashew uses heuristic-only extraction — it stores
+conversation turns without LLM involvement. To enable LLM-powered features
+(typed nodes, think cycles, sleep synthesis), configure an auxiliary model
+in Hermes' own `config.yaml`:
+
+```yaml
+auxiliary:
+  memory:
+    provider: openrouter          # any Hermes-supported provider
+    model: openai/gpt-4o-mini     # any model available on that provider
+```
+
+Then add the role name to `cashew.json`:
+
+```json
+{
+  "cashew_db_path": "cashew/brain.db",
+  "llm_aux_role": "memory"
+}
+```
+
+The plugin reads your Hermes config, resolves the API key from the
+appropriate environment variable, and constructs an OpenAI-compatible
+callable for upstream cashew-brain. No credentials are stored in the
+plugin config.
+
+**What this enables upstream:**
+
+- **LLM extraction** — structured knowledge extraction with typed nodes,
+  confidence scores, tags, and domain assignment
+- **Think cycles** — cross-domain synthesis, generates `insight` nodes
+  from clusters of related knowledge
+- **Sleep synthesis** — graph consolidation, pattern detection, and
+  contradiction discovery during idle cycles
+
+Without `llm_aux_role`, the plugin uses heuristic-only extraction — no
+API calls, no LLM cost, zero-config.
+
+**Design note:** The `auxiliary.memory` convention is provider-agnostic.
+Any memory provider plugin can declare `llm_aux_role` and reference the
+same `auxiliary.memory` section, making this a standard pattern across
+the Hermes plugin ecosystem.
 
 ## Semantic Search (Optional)
 

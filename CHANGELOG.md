@@ -1,12 +1,20 @@
 # Changelog
 
-## v0.3.1 (2026-05-12) — Open Source Ready
+## v0.4.0 (2026-05-12) — Brain Operations
 
-Open source contribution conventions, CI fixes, and PyPI publish cleanup.
-Follow-up to the v0.3.0 refactor.
+LLM integration via `auxiliary.memory` convention. The plugin now
+delegates LLM-powered operations (extraction, think cycles, sleep
+synthesis) to a Hermes auxiliary model instead of hardcoded
+`model_fn=None`. Open source conventions established, issue tracker
+reconciled against thin-adapter architecture.
 
 ### Added
 
+- **LLM integration**: `llm_aux_role` config key — set to `"memory"`
+  in cashew.json to wire upstream LLM features. Plugin reads Hermes
+  own config.yaml to find `auxiliary.<role>`, resolves credentials,
+  and constructs an OpenAI-compatible callable for upstream. ~80 lines,
+  zero Hermes core changes. See README for setup guide.
 - **CONTRIBUTING.md** — full open source contribution guide with DCO
   sign-off, Conventional Commits, PR process, and development setup
 - **Issue templates** — bug report and feature request templates
@@ -14,33 +22,35 @@ Follow-up to the v0.3.0 refactor.
 
 ### Changed
 
-- **PyPI dependency**: cashew-brain switched from git+SHA pin to
-  `>=1.1.0,<2.0.0` (PyPI rejected direct dependency URLs)
-- **Config env var parsing**: list-typed env vars now handle both
-  comma-separated (`a,b,c`) and Python repr() format (`['a', 'b']`)
 - **Release workflow**: now gates publishing behind tests passing,
   added `workflow_dispatch` trigger for manual re-runs
 - **Test isolation**: `CASHEW_*` env vars stripped in conftest to
   prevent Hermes session variables from leaking into tests
+- **Config env var parsing**: list-typed env vars now handle both
+  comma-separated (`a,b,c`) and Python repr() format (`['a', 'b']`)
+- **PyPI dependency**: cashew-brain switched from git+SHA pin to
+  `>=1.1.0,<2.0.0` (PyPI rejected direct dependency URLs)
 
 ### Fixed
 
-- **Entry point test**: updated to match v0.3.0's module-load contract
+- **Entry point test**: updated to match v0.3.0 module-load contract
   (entry point returns module, not callable)
 - **macOS fallback test**: removed reference to deleted `_retrieve_with_vec`
   method; gracefully skips mock when sqlite3.Connection is immutable
-- **Release pipeline**: v0.3.0 PyPI publish failed due to direct dependency;
-  retagged and published as v0.3.1
 
-### Closed Issues
+### Issue Tracking
 
-9 open issues reconciled against thin-adapter architecture:
+All 9 open issues reconciled against thin-adapter architecture:
 
-- **Closed (fixed/out of scope)**: #9, #10, #12, #13, #14, #20
-- **Re-scoped**: #8 (resolved-by #11), #15 (privacy → exclude_tags)
-- **Kept**: #11 (LLM integration — the remaining core gap)
+- **Closed**: #8 (think cycles), #9 (warm daemon), #10 (dashboard),
+  #12 (domain separation), #13 (extractors), #14 (novelty gate),
+  #20 (schema fork)
+- **Re-scoped**: #15 (privacy → exclude_tags)
+- **Implemented & closed**: #11 (LLM integration)
 
-This release is an object lesson in the dangers of **vibe coding** — the
+1 open issue remains: #15 (privacy / exclude_tags passthrough).
+
+## v0.3.0 (2026-05-12) — Stop Vibe-Coding, Start Integrating
 trap of building from scratch when you should be integrating. We caught
 ourselves reimplementing large swaths of cashew-brain (our upstream
 dependency) instead of wrapping it. The result was:

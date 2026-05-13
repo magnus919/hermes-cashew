@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.7.2 (2026-05-12) — Spec Compliance
+
+Compliance fixes from the memory provider plugin audit.
+
+### Added
+- **README.md** in plugin directory (required by the plugin spec).
+
+### Changed
+- **Worker thread**: `daemon=False` → `daemon=True` to match the Hermes
+  memory provider spec threading contract.
+
+### Fixed
+- **Sleep cycle shutdown fallback**: While upstream fix #11410 means
+  `on_session_end()` fires on session expiry in current Hermes, adding a
+  fallback in `shutdown()` protects against edge cases where the session
+  end path is skipped (crash, process kill, long-running sleep cycle
+  interrupted by restart). Uses a flag to prevent duplication when both
+  paths fire in sequence.
+
 ## v0.7.1 (2026-05-12) — Sleep on Session End
 
 Moved sleep cycle from `shutdown()` to `on_session_end()` and fixed a

@@ -89,6 +89,7 @@ class CashewMemoryProvider(MemoryProvider):
         # PHASE_DESIGN_NOTES (2026-04-20).
         self._model_fn: Callable[[str], str] | None = None
         self._think_counter: int = 0
+        self._sleep_cycle_ran: bool = False
 
     @property
     def name(self) -> str:
@@ -187,7 +188,7 @@ class CashewMemoryProvider(MemoryProvider):
         self._sync_worker = threading.Thread(
             target=self._worker_loop,
             name=f"cashew-sync-{self._session_id}",
-            daemon=False,
+            daemon=True,
         )
         self._sync_worker.start()
 
@@ -540,14 +541,7 @@ class CashewMemoryProvider(MemoryProvider):
         sleep cycle here rather than in shutdown() (GH#33).
         """
         if self._sync_queue is None:
-            logger.debug("on_session_end: not initialized, skipping")
             return  # not initialized or silent-degraded
-        logger.info(
-            "on_session_end called: %d unfinished, model_fn=%s, sleep_cycles=%s",
-            self._sync_queue.unfinished_tasks,
-            self._model_fn is not None,
-            self._config.sleep_cycles if self._config else "no-config",
-        )
         timeout = self._config.sync_queue_timeout if self._config is not None else 30.0
         deadline = time.monotonic() + timeout
         while self._sync_queue.unfinished_tasks > 0 and time.monotonic() < deadline:
@@ -556,12 +550,6 @@ class CashewMemoryProvider(MemoryProvider):
         # Run sleep cycle after drain if LLM is wired (GH#33).
         # Sleep consolidation is a flush operation — on_session_end() is the correct
         # lifecycle hook per Hermes memory provider docs ("final extraction/flush").
-        gate_model_fn = self._model_fn is not None
-        gate_sleep_cycles = self._config.sleep_cycles if self._config else False
-        logger.info(
-            "sleep cycle gate: model_fn=%s, sleep_cycles=%r (type=%s)",
-            gate_model_fn, gate_sleep_cycles, type(gate_sleep_cycles).__name__,
-        )
         if self._model_fn is not None and self._config is not None and self._config.sleep_cycles:
             try:
                 from core.sleep import run_sleep_cycle
@@ -582,6 +570,7 @@ class CashewMemoryProvider(MemoryProvider):
                 )
             except Exception:
                 logger.warning("sleep cycle failed", exc_info=True)
+            self._sleep_cycle_ran = True
 
     def shutdown(self) -> None:
         """Post sentinel, bounded-join worker, clear references (ABC-05 + SYNC-05).
@@ -615,6 +604,29 @@ class CashewMemoryProvider(MemoryProvider):
                     "cashew sync worker did not exit within %ss; abandoning",
                     timeout,
                 )
+        # Fallback sleep cycle: upstream Hermes bug #11205 means
+        # on_session_end() is NOT called on gateway session expiry — only
+        # on graceful shutdown. If on_session_end() already ran the sleep
+        # cycle (gateway shutdown, CLI exit), skip to avoid duplication.
+        if not self._sleep_cycle_ran and self._model_fn is not None and self._config is not None and self._config.sleep_cycles:
+            try:
+                from core.sleep import run_sleep_cycle
+                result = run_sleep_cycle(
+                    db_path=str(self._db_path),
+                    model_fn=self._model_fn,
+                )
+                logger.info(
+                    "sleep cycle (shutdown fallback): %d cross-links, %d dedups, %d dreams, %d decayed, "
+                    "%d promoted, %d demoted",
+                    result.get("cross_links_created", 0),
+                    result.get("deduplications", 0),
+                    result.get("dream_nodes_created", 0),
+                    result.get("nodes_decayed", 0),
+                    result.get("core_promotions", 0),
+                    result.get("core_demotions", 0),
+                )
+            except Exception:
+                logger.warning("sleep cycle (shutdown fallback) failed", exc_info=True)
         # Clear state. _hermes_home persists (see Phase 2 Plan 02-02 rationale).
         self._sync_queue = None
         self._sync_worker = None

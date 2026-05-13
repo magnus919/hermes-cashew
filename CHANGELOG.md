@@ -1,6 +1,23 @@
 # Changelog
 
-## v0.7.0 (2026-05-12) — Brain Consolidation
+## v0.7.1 (2026-05-12) — Sleep on Session End
+
+Moved sleep cycle from `shutdown()` to `on_session_end()` and fixed a
+silent `AttributeError` on the return value.
+
+### Fixed
+
+- **Sleep cycle now runs on `on_session_end()` instead of `shutdown()`**:
+  `on_session_end()` is the correct lifecycle hook for "final extraction/flush"
+  per the Hermes memory provider docs. `shutdown()` is for connection cleanup.
+  This makes sleep cycles observable and testable — they fire after every
+  conversation session, not just on process restart. (GH#33)
+
+- **Return type bug in sleep cycle logging**: Upstream `run_sleep_cycle()`
+  returns a plain `Dict`, but the code was accessing `.new_nodes` and
+  `.new_edges` attributes — causing a silent `AttributeError` caught by the
+  generic exception wrapper. Fixed to use `result.get(...)` with meaningful
+  metric names (cross-links, dedups, dreams, decayed, promotions, demotions).
 
 Sleep cycles on shutdown and think cycles on a periodic interval.
 Together they complete the upstream brain operation pipeline —

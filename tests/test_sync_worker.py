@@ -85,7 +85,7 @@ def test_worker_starts_after_initialize_on_happy_path(tmp_path):
         assert threading.active_count() == baseline + 1
         assert p._sync_worker is not None
         assert p._sync_worker.is_alive()
-        assert p._sync_worker.daemon is False
+        assert p._sync_worker.daemon is True
         assert p._sync_worker.name.startswith("cashew-sync-")
         assert "test-sync" in p._sync_worker.name
     finally:

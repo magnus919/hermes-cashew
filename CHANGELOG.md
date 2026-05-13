@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.7.4 (2026-05-13) — Remove Sleep Cycle from Lifecycle Hooks
+
+### Removed
+
+- **Sleep cycle removed from `on_session_end()` and `shutdown()`**: The
+  upstream `run_sleep_cycle()` is too heavyweight to run synchronously in
+  lifecycle hooks. With 6K+ nodes and 59K+ edges, it computes a full N×N
+  embedding similarity matrix (36M+ comparisons), performs Bron–Kerbosch
+  clique detection, and runs per-node graph traversals via
+  `calculate_node_metrics()` — taking hours and accumulating overlapping
+  instances when multiple session ends fire. Sleep consolidation will be
+  reimplemented in a dedicated background thread with a mutex guard and
+  configurable interval (see GH#42).
+- **`sleep_cycles` config flag is now a no-op** until the redesign is
+  complete. Set it to `False` in `cashew.json` to avoid confusion.
+
 ## v0.7.3 (2026-05-12) — sqlite-vec Fix
 
 ### Fixed

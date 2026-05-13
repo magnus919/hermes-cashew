@@ -530,12 +530,14 @@ class CashewMemoryProvider(MemoryProvider):
                     logger.warning("think cycle failed", exc_info=True)
 
     def on_session_end(self, messages: list) -> None:
-        """Best-effort bounded drain; does NOT stop the worker (ABC-06).
+        """Best-effort bounded drain + sleep cycle; does NOT stop the worker (ABC-06).
 
         Polls unfinished_tasks with the same sync_queue_timeout that shutdown()
-        uses. Worker stays alive for subsequent sessions. No WARNING on timeout —
-        this method is advisory; shutdown() is authoritative. See 04-RESEARCH.md
-        §6.10 + PHASE_DESIGN_NOTES Decision Point 4.
+        uses, then runs sleep consolidation if LLM is wired. Worker stays alive
+        for subsequent sessions. No WARNING on timeout — this method is advisory;
+        shutdown() is authoritative. See 04-RESEARCH.md
+        §6.10 + PHASE_DESIGN_NOTES Decision Point 4. Changed in v0.7.1 to run
+        sleep cycle here rather than in shutdown() (GH#33).
         """
         if self._sync_queue is None:
             return  # not initialized or silent-degraded
@@ -544,6 +546,29 @@ class CashewMemoryProvider(MemoryProvider):
         while self._sync_queue.unfinished_tasks > 0 and time.monotonic() < deadline:
             time.sleep(0.05)
         # Intentional: no WARNING on incomplete drain — shutdown() will log if it also times out.
+        # Run sleep cycle after drain if LLM is wired (GH#33).
+        # Sleep consolidation is a flush operation — on_session_end() is the correct
+        # lifecycle hook per Hermes memory provider docs ("final extraction/flush").
+        if self._model_fn is not None and self._config is not None and self._config.sleep_cycles:
+            try:
+                from core.sleep import run_sleep_cycle
+
+                result = run_sleep_cycle(
+                    db_path=str(self._db_path),
+                    model_fn=self._model_fn,
+                )
+                logger.info(
+                    "sleep cycle: %d cross-links, %d dedups, %d dreams, %d decayed, "
+                    "%d promoted, %d demoted",
+                    result.get("cross_links_created", 0),
+                    result.get("deduplications", 0),
+                    result.get("dream_nodes_created", 0),
+                    result.get("nodes_decayed", 0),
+                    result.get("core_promotions", 0),
+                    result.get("core_demotions", 0),
+                )
+            except Exception:
+                logger.warning("sleep cycle failed", exc_info=True)
 
     def shutdown(self) -> None:
         """Post sentinel, bounded-join worker, clear references (ABC-05 + SYNC-05).
@@ -577,22 +602,6 @@ class CashewMemoryProvider(MemoryProvider):
                     "cashew sync worker did not exit within %ss; abandoning",
                     timeout,
                 )
-        # Run sleep cycle on shutdown if LLM is wired. Best-effort within
-        # remaining timeout budget — worker has finished, state is valid.
-        if self._model_fn is not None and self._config is not None and self._config.sleep_cycles:
-            try:
-                from core.sleep import run_sleep_cycle
-                result = run_sleep_cycle(
-                    db_path=str(self._db_path),
-                    model_fn=self._model_fn,
-                )
-                logger.info(
-                    "sleep cycle: %d new nodes, %d new edges",
-                    len(result.new_nodes),
-                    len(result.new_edges),
-                )
-            except Exception:
-                logger.warning("sleep cycle failed", exc_info=True)
         # Clear state. _hermes_home persists (see Phase 2 Plan 02-02 rationale).
         self._sync_queue = None
         self._sync_worker = None

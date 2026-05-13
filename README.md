@@ -5,8 +5,8 @@ that stores conversation context in a local [Cashew](https://github.com/rajkripa
 thought graph with semantic search and automatic context recall. Get from zero to
 a working install in under five minutes.
 
-**v0.5.0** adds privacy controls via `exclude_tags` filtering on all retrieval
-paths — integrate with `vault:private` tagging or any custom tag convention.
+**v0.7.0** adds think cycles on a periodic interval and sleep cycles on
+shutdown — the full upstream brain operation pipeline is now wired.
 
 ## Prerequisites
 
@@ -169,9 +169,16 @@ plugin config.
 - **LLM extraction** — structured knowledge extraction with typed nodes,
   confidence scores, tags, and domain assignment
 - **Think cycles** — cross-domain synthesis, generates `insight` nodes
-  from clusters of related knowledge
+  from clusters of related knowledge. Runs every `think_interval` sync
+  turns (default 10). Configure via `cashew.json`:
+  ```json
+  {"llm_aux_role": "memory", "think_interval": 10}
+  ```
+  Set `think_interval` to 0 to disable.
 - **Sleep synthesis** — graph consolidation, pattern detection, and
-  contradiction discovery during idle cycles
+  contradiction discovery. Runs automatically on provider shutdown
+  (gateway restart) when the LLM is wired. Controlled by the existing
+  `sleep_cycles` config flag (default True).
 
 Without `llm_aux_role`, the plugin uses heuristic-only extraction — no
 API calls, no LLM cost, zero-config.

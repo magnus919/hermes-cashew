@@ -577,6 +577,22 @@ class CashewMemoryProvider(MemoryProvider):
                     "cashew sync worker did not exit within %ss; abandoning",
                     timeout,
                 )
+        # Run sleep cycle on shutdown if LLM is wired. Best-effort within
+        # remaining timeout budget — worker has finished, state is valid.
+        if self._model_fn is not None and self._config is not None and self._config.sleep_cycles:
+            try:
+                from core.sleep import run_sleep_cycle
+                result = run_sleep_cycle(
+                    db_path=str(self._db_path),
+                    model_fn=self._model_fn,
+                )
+                logger.info(
+                    "sleep cycle: %d new nodes, %d new edges",
+                    len(result.new_nodes),
+                    len(result.new_edges),
+                )
+            except Exception:
+                logger.warning("sleep cycle failed", exc_info=True)
         # Clear state. _hermes_home persists (see Phase 2 Plan 02-02 rationale).
         self._sync_queue = None
         self._sync_worker = None

@@ -415,7 +415,11 @@ class CashewMemoryProvider(MemoryProvider):
             if cursor.fetchone() is not None:
                 return
             conn.enable_load_extension(True)
-            conn.load_extension("vec0")
+            try:
+                import sqlite_vec
+                sqlite_vec.load(conn)
+            except (ImportError, AttributeError):
+                conn.load_extension("vec0")
             conn.execute("""
                 CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings
                 USING vec0(node_id TEXT primary key, embedding float[384] distance_metric=cosine)

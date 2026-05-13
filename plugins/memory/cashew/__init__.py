@@ -565,7 +565,8 @@ class CashewMemoryProvider(MemoryProvider):
         self._retriever = None
         logger.debug("cashew provider shutdown complete (Phase 4 — worker drained)")
 
-    def prefetch(self, query: str, domain: str | None = None, tag: str | None = None) -> str:
+    def prefetch(self, query: str, domain: str | None = None, tag: str | None = None,
+                 exclude_tags: list[str] | None = None) -> str:
         """Return recalled-context string from Cashew (RECALL-01).
 
         Delegates to upstream cashew-brain's retrieve_recursive_bfs which handles
@@ -592,6 +593,7 @@ class CashewMemoryProvider(MemoryProvider):
                 top_k=max_nodes,
                 domain=domain,
                 tags=[tag] if tag else None,
+                exclude_tags=exclude_tags,
             )
             if results:
                 node_ids = [r.node_id for r in results]
@@ -601,7 +603,7 @@ class CashewMemoryProvider(MemoryProvider):
         except Exception:
             logger.debug("upstream retrieval failed, falling back to keyword", exc_info=True)
         try:
-            nodes = self._keyword_search(query, max_nodes, domain, tag)
+            nodes = self._keyword_search(query, max_nodes, domain, tag, exclude_tags)
             if nodes:
                 self._update_access_metrics([n["id"] for n in nodes])
                 return self._format_context(nodes)
@@ -612,6 +614,7 @@ class CashewMemoryProvider(MemoryProvider):
     def _keyword_search(
         self, query: str, max_nodes: int,
         domain: str | None = None, tag: str | None = None,
+        exclude_tags: list[str] | None = None,
     ) -> list[dict]:
         import sqlite3
         conn = sqlite3.connect(str(self._db_path))
@@ -630,6 +633,11 @@ class CashewMemoryProvider(MemoryProvider):
             if tag:
                 where_clauses.append("tags LIKE ?")
                 params.append(f"%{tag}%")
+            if exclude_tags:
+                for ex_tag in exclude_tags:
+                    if ex_tag:
+                        where_clauses.append("(tags IS NULL OR tags NOT LIKE ?)")
+                        params.append(f"%{ex_tag}%")
             order_params: list = []
             if words:
                 order_params.append(f"%{query}%")
@@ -693,6 +701,7 @@ class CashewMemoryProvider(MemoryProvider):
                 max_nodes = args.get("max_nodes", self._config.recall_k)
                 domain = args.get("domain")
                 tag = args.get("tag")
+                exclude_tags = args.get("exclude_tags")
                 try:
                     from core.retrieval import retrieve_recursive_bfs
                     results = retrieve_recursive_bfs(
@@ -701,6 +710,7 @@ class CashewMemoryProvider(MemoryProvider):
                         top_k=max_nodes,
                         domain=domain,
                         tags=[tag] if tag else None,
+                        exclude_tags=exclude_tags,
                     )
                 except Exception:
                     results = None
@@ -708,7 +718,7 @@ class CashewMemoryProvider(MemoryProvider):
                     node_ids = [r.node_id for r in results]
                     nodes = self._enrich_results(node_ids)
                 else:
-                    nodes = self._keyword_search(query, max_nodes, domain, tag)
+                    nodes = self._keyword_search(query, max_nodes, domain, tag, exclude_tags)
                 if nodes:
                     self._update_access_metrics([n["id"] for n in nodes])
                     context = self._format_context(nodes)

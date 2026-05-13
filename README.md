@@ -5,8 +5,8 @@ that stores conversation context in a local [Cashew](https://github.com/rajkripa
 thought graph with semantic search and automatic context recall. Get from zero to
 a working install in under five minutes.
 
-**v0.4.0** adds LLM-powered extraction, think cycles, and sleep synthesis
-via the `auxiliary.memory` convention — no API keys in plugin config.
+**v0.5.0** adds privacy controls via `exclude_tags` filtering on all retrieval
+paths — integrate with `vault:private` tagging or any custom tag convention.
 
 ## Prerequisites
 
@@ -118,6 +118,23 @@ Expected output shows `Provider: cashew` with `Plugin: installed` and `Status: a
 Both tools are registered automatically when Hermes loads the plugin.
 On each session start, `prefetch()` retrieves relevant context from the graph
 and injects it into the system prompt.
+
+## Privacy Controls (Optional)
+
+Nodes in the thought graph can carry tags. The `cashew_query` tool accepts an
+`exclude_tags` parameter to filter out nodes with specific tags from results:
+
+```json
+{"query": "prior decisions", "exclude_tags": ["vault:private"]}
+```
+
+This works in both the upstream retrieval path (sqlite-vec / BFS) and the
+keyword fallback. Common use cases:
+
+- **Privacy**: Tag sensitive nodes with `vault:private` to exclude them from
+  group or shared contexts
+- **Domain isolation**: Exclude nodes from specific domains during broad queries
+- **Declassification**: Remove exclusion to reveal previously private nodes
 
 ## LLM Integration (Optional)
 

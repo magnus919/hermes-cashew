@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.5.0 (2026-05-12) — Privacy & Visibility
+
+Privacy controls via `exclude_tags` filtering on all retrieval paths.
+The final open issue from the original milestone plan is resolved.
+
+### Added
+
+- **exclude_tags filtering**: `cashew_query` tool accepts optional
+  `exclude_tags` array parameter to filter out tagged nodes from results.
+  Works in both upstream retrieval (`retrieve_recursive_bfs()`) and
+  keyword fallback (SQL `NOT LIKE` exclusion).
+- **Privacy Controls section**: documented in README with use cases
+  (vault:private tagging, domain isolation, declassification).
+
 ## v0.4.0 (2026-05-12) — Brain Operations
 
 LLM integration via `auxiliary.memory` convention. The plugin now

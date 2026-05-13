@@ -59,6 +59,8 @@ DEFAULTS: dict[str, Any] = {
     "sleep_cycles": True,
     "decay_pruning": True,
     "pattern_detection": True,
+    # LLM integration
+    "llm_aux_role": None,
 }
 
 
@@ -104,6 +106,8 @@ class CashewConfig:
     sleep_cycles: bool = DEFAULTS["sleep_cycles"]
     decay_pruning: bool = DEFAULTS["decay_pruning"]
     pattern_detection: bool = DEFAULTS["pattern_detection"]
+    # LLM integration
+    llm_aux_role: str | None = DEFAULTS["llm_aux_role"]
 
 
 def _env_var_name(key: str) -> str:
@@ -321,6 +325,18 @@ def get_config_schema() -> list[dict[str, Any]]:
             "description": "Enable automatic pattern detection across node clusters.",
             "default": DEFAULTS["pattern_detection"],
             "env_var": _env_var_name("pattern_detection"),
+        },
+        {
+            "key": "llm_aux_role",
+            "description": (
+                "Hermes auxiliary role to use for LLM-powered operations "
+                "(think cycles, sleep synthesis, LLM extraction). Set to the "
+                "name of an auxiliary.memory section in Hermes config.yaml. "
+                "When unset or null, falls back to heuristic-only extraction "
+                "with no LLM calls."
+            ),
+            "default": DEFAULTS["llm_aux_role"],
+            "env_var": _env_var_name("llm_aux_role"),
         },
     ]
     return schema

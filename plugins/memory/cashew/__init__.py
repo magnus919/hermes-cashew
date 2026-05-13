@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import pathlib
 import queue
 import threading  # Phase 4: non-daemon worker for sync_turn drain
 import time       # Phase 4: monotonic-clock polling in on_session_end
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 try:
     from agent.memory_provider import MemoryProvider
@@ -86,6 +87,7 @@ class CashewMemoryProvider(MemoryProvider):
         # test_burst_default_queue_drops_oldest_cleanly to assert counter
         # matches the WARNING-log count. See B-02 revision in
         # PHASE_DESIGN_NOTES (2026-04-20).
+        self._model_fn: Callable[[str], str] | None = None
 
     @property
     def name(self) -> str:
@@ -160,6 +162,7 @@ class CashewMemoryProvider(MemoryProvider):
             self._db_path.parent.mkdir(parents=True, exist_ok=True)
             self._ensure_db_schema(self._db_path)
             self._retriever = ContextRetriever(db_path=str(self._db_path))
+            self._model_fn = self._build_model_fn()
             # Phase 4: start the sync worker AFTER all worker-read state
             # is populated (db_path, session_id, sync_queue). Pitfall 4.
             self._start_sync_worker()
@@ -186,6 +189,111 @@ class CashewMemoryProvider(MemoryProvider):
             daemon=False,
         )
         self._sync_worker.start()
+
+    # ------------------------------------------------------------------
+    # LLM integration via auxiliary.memory convention
+    # ------------------------------------------------------------------
+
+    # Well-known provider-to-env-var mappings for API key resolution.
+    # Used when the auxiliary config does not explicitly provide an api_key.
+    _PROVIDER_ENV_MAP: dict[str, str] = {
+        "openai": "OPENAI_API_KEY",
+        "openrouter": "OPENROUTER_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "opencode-go": "OPENCODE_GO_API_KEY",
+        "opencode-zen": "OPENCODE_ZEN_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+        "google": "GOOGLE_API_KEY",
+        "xai": "XAI_API_KEY",
+        "github": "COPILOT_GITHUB_TOKEN",
+        "huggingface": "HF_TOKEN",
+    }
+
+    def _build_model_fn(self) -> Callable[[str], str] | None:
+        """Construct an LLM callable from the configured auxiliary.memory role.
+
+        Reads Hermes' own config.yaml to find the auxiliary.<role> section,
+        resolves the API key from config or well-known env vars, and returns
+        an OpenAI-compatible callable. Returns None when:
+        - No llm_aux_role is configured (heuristic-only mode)
+        - The auxiliary section or API key cannot be found (logs warning)
+        """
+        role = self._config.llm_aux_role if self._config else None
+        if not role:
+            return None
+
+        config_path = self._hermes_home / "config.yaml" if self._hermes_home else pathlib.Path()
+        if not config_path or not config_path.exists():
+            logger.warning(
+                "llm_aux_role=%r but %s not found; falling back to heuristic extraction",
+                role, config_path,
+            )
+            return None
+
+        try:
+            import yaml
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            aux_config = (raw or {}).get("auxiliary", {}).get(role, {})
+        except Exception:
+            logger.warning(
+                "llm_aux_role=%r: failed to parse %s; falling back to heuristic extraction",
+                role, config_path, exc_info=True,
+            )
+            return None
+
+        model = aux_config.get("model")
+        if not model:
+            logger.warning(
+                "llm_aux_role=%r: no model in auxiliary.%r config; "
+                "falling back to heuristic extraction", role, role,
+            )
+            return None
+
+        provider = aux_config.get("provider", "openai")
+        base_url = aux_config.get("base_url", "https://api.openai.com/v1").rstrip("/")
+
+        # Resolve API key: explicit config > env var by provider convention
+        api_key = aux_config.get("api_key")
+        if not api_key:
+            env_var = self._PROVIDER_ENV_MAP.get(provider)
+            if env_var:
+                api_key = os.environ.get(env_var)
+
+        if not api_key:
+            logger.warning(
+                "llm_aux_role=%r: no API key for provider=%r; "
+                "falling back to heuristic extraction", role, provider,
+            )
+            return None
+
+        logger.info(
+            "llm_aux_role=%r: using %s %s via %s",
+            role, provider, model, base_url,
+        )
+
+        def _model_fn(prompt: str) -> str:
+            """OpenAI-compatible chat completion callable for upstream cashew-brain."""
+            try:
+                import httpx
+                resp = httpx.post(
+                    f"{base_url}/chat/completions",
+                    json={
+                        "model": model,
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    timeout=120,
+                )
+                resp.raise_for_status()
+                return resp.json()["choices"][0]["message"]["content"]
+            except Exception:
+                logger.warning(
+                    "LLM call failed for llm_aux_role=%r (model=%s)",
+                    role, model, exc_info=True,
+                )
+                return ""
+
+        return _model_fn
 
     def sync_turn(self, user_content: str, assistant_content: str, session_id: str = "") -> None:
         """Hot-path enqueue of a completed turn (SYNC-01).
@@ -383,12 +491,14 @@ class CashewMemoryProvider(MemoryProvider):
             logger.warning("cashew access metrics update failed", exc_info=True)
 
     def _drain_once(self, turn: tuple[str, str]) -> None:
-        """Persist one turn via Cashew's heuristic extractor.
+        """Persist one turn via Cashew's heuristic extractor (or LLM if configured).
 
         Lazy-imports core.session so the plugin module loads even when cashew-brain
         is not installed (matches Phase 1 Pattern 3 for agent.memory_provider).
-        model_fn=None uses Cashew's built-in heuristic extractor (04-RESEARCH.md
-        §§1, 6.2 — no LLM round-trip).
+        When self._model_fn is set (via llm_aux_role config), upstream receives
+        the LLM callable and can perform LLM extraction, think cycles, and sleep
+        synthesis. When None, Cashew's built-in heuristic extractor is used
+        (04-RESEARCH.md §§1, 6.2 — no LLM round-trip).
         """
         from core.session import end_session  # lazy import (see 04-RESEARCH.md §9 + test strategy §11)
         user, assistant, session_id = turn
@@ -396,7 +506,7 @@ class CashewMemoryProvider(MemoryProvider):
             db_path=str(self._db_path),
             session_id=session_id or self._session_id,
             conversation_text=f"User: {user}\nAssistant: {assistant}",
-            model_fn=None,
+            model_fn=self._model_fn,
         )
 
     def on_session_end(self, messages: list) -> None:
@@ -637,7 +747,7 @@ class CashewMemoryProvider(MemoryProvider):
                     db_path=str(self._db_path),
                     session_id=self._session_id,
                     conversation_text=f"User: {user}\nAssistant: {assistant}",
-                    model_fn=None,
+                    model_fn=self._model_fn,
                 )
                 return build_extract_success_envelope(
                     new_nodes=len(result.new_nodes),

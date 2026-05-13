@@ -88,7 +88,6 @@ class CashewMemoryProvider(MemoryProvider):
         # matches the WARNING-log count. See B-02 revision in
         # PHASE_DESIGN_NOTES (2026-04-20).
         self._model_fn: Callable[[str], str] | None = None
-        self._think_counter: int = 0
         self._sleep_cycle_ran: bool = False
 
     @property
@@ -374,6 +373,14 @@ class CashewMemoryProvider(MemoryProvider):
         try:
             self._migrate_vec_embeddings(conn)
             self._create_vec_embeddings(conn)
+            # Hermes provider metadata store (persistent counters, flags)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS hermes_provider_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+            conn.commit()
         finally:
             conn.close()
 
@@ -516,9 +523,9 @@ class CashewMemoryProvider(MemoryProvider):
         )
         # Run think cycle periodically if LLM is wired
         if self._model_fn is not None and self._config and self._config.think_interval > 0:
-            self._think_counter += 1
-            if self._think_counter >= self._config.think_interval:
-                self._think_counter = 0
+            counter = self._load_think_counter() + 1
+            if counter >= self._config.think_interval:
+                counter = 0
                 try:
                     from core.session import think_cycle
                     result = think_cycle(
@@ -533,6 +540,38 @@ class CashewMemoryProvider(MemoryProvider):
                         )
                 except Exception:
                     logger.warning("think cycle failed", exc_info=True)
+            self._save_think_counter(counter)
+
+    def _load_think_counter(self) -> int:
+        """Read persistent think counter from DB. Resets to 0 on any error."""
+        try:
+            import sqlite3
+            conn = sqlite3.connect(str(self._db_path))
+            try:
+                row = conn.execute(
+                    "SELECT value FROM hermes_provider_meta WHERE key='think_counter'"
+                ).fetchone()
+                return int(row[0]) if row else 0
+            finally:
+                conn.close()
+        except Exception:
+            return 0
+
+    def _save_think_counter(self, value: int) -> None:
+        """Write persistent think counter to DB."""
+        try:
+            import sqlite3
+            conn = sqlite3.connect(str(self._db_path))
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO hermes_provider_meta (key, value) VALUES ('think_counter', ?)",
+                    (str(value),),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            pass
 
     def on_session_end(self, messages: list) -> None:
         """Best-effort bounded drain + sleep cycle; does NOT stop the worker (ABC-06).

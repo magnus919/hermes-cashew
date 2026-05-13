@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.7.3 (2026-05-12) — sqlite-vec Fix
+
+### Fixed
+- **sqlite-vec not loading on macOS**: Changed `conn.load_extension("vec0")`
+  to prefer `sqlite_vec.load(conn)` (from the pip package), with fallback
+  to bare name. The old code failed silently on macOS because vec0.dylib
+  isn't in the standard library load path. Install sqlite-vec in the
+  Hermes venv to enable vector search acceleration.
+
 ## v0.7.2 (2026-05-12) — Spec Compliance
 
 Compliance fixes from the memory provider plugin audit.

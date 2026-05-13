@@ -540,7 +540,14 @@ class CashewMemoryProvider(MemoryProvider):
         sleep cycle here rather than in shutdown() (GH#33).
         """
         if self._sync_queue is None:
+            logger.debug("on_session_end: not initialized, skipping")
             return  # not initialized or silent-degraded
+        logger.info(
+            "on_session_end called: %d unfinished, model_fn=%s, sleep_cycles=%s",
+            self._sync_queue.unfinished_tasks,
+            self._model_fn is not None,
+            self._config.sleep_cycles if self._config else "no-config",
+        )
         timeout = self._config.sync_queue_timeout if self._config is not None else 30.0
         deadline = time.monotonic() + timeout
         while self._sync_queue.unfinished_tasks > 0 and time.monotonic() < deadline:
@@ -549,6 +556,12 @@ class CashewMemoryProvider(MemoryProvider):
         # Run sleep cycle after drain if LLM is wired (GH#33).
         # Sleep consolidation is a flush operation — on_session_end() is the correct
         # lifecycle hook per Hermes memory provider docs ("final extraction/flush").
+        gate_model_fn = self._model_fn is not None
+        gate_sleep_cycles = self._config.sleep_cycles if self._config else False
+        logger.info(
+            "sleep cycle gate: model_fn=%s, sleep_cycles=%r (type=%s)",
+            gate_model_fn, gate_sleep_cycles, type(gate_sleep_cycles).__name__,
+        )
         if self._model_fn is not None and self._config is not None and self._config.sleep_cycles:
             try:
                 from core.sleep import run_sleep_cycle

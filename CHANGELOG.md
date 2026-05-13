@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.7.0 (2026-05-12) — Brain Consolidation
+
+Sleep cycles on shutdown and think cycles on a periodic interval.
+Together they complete the upstream brain operation pipeline —
+extraction → thinking → sleeping → consolidation.
+
+### Added
+
+- **think_interval**: Config key (default 10) controls how many sync
+  turns pass between upstream think_cycle() calls. Discovers cross-
+  domain connections and generates insight nodes. Set to 0 to disable.
+- **Sleep cycles on shutdown**: Calls upstream run_sleep_cycle() when
+  the provider shuts down (gateway restart), if LLM is wired and
+  sleep_cycles is True. Graph consolidation without blocking the hot
+  path.
+- **README**: LLM Integration section updated with think_interval docs.
+
+## v0.6.0 (2026-05-12) — Think Cycles
+
+*Release was published but changelog entry was deferred to v0.7.0.
+All v0.6.0 changes are included in the v0.7.0 entry above.*
+
 ## v0.5.0 (2026-05-12) — Privacy & Visibility
 
 Privacy controls via `exclude_tags` filtering on all retrieval paths.

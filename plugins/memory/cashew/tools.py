@@ -63,15 +63,6 @@ CASHEW_QUERY_SCHEMA: dict[str, Any] = {
                 "minimum": 1,
                 "maximum": 20,
             },
-            "exclude_tags": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": (
-                    "Optional list of tag strings to exclude from results. "
-                    "Nodes matching any of these tags will be filtered out. "
-                    "Useful for privacy controls (e.g. ['vault:private'])."
-                ),
-            },
         },
         "required": ["query"],
         "additionalProperties": False,

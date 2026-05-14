@@ -12,7 +12,7 @@ Thin adapter around upstream [cashew-brain](https://github.com/rajkripal/cashew)
 - **Retrieval**: Three-tier (sqlite-vec → BFS → keyword), delegated to upstream `retrieve_recursive_bfs()`.
 - **Schema**: Upstream `core.db.ensure_schema()` — no custom migration layer.
 - **Threading**: Bounded `queue.Queue(maxsize=16)` + single non-daemon worker. Sentinel is `_SHADOW = object()`.
-- **Open issues**: 1 remaining — #15 (privacy / exclude_tags passthrough).
+- **Open issues**: 0 remaining. #15 (privacy / exclude_tags), #35 (spec compliance), #36 (on_pre_compress), and #38 (sleep cycle redesign) all resolved.
 
 ## Project Conventions
 

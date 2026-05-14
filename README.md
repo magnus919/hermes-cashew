@@ -5,7 +5,7 @@ that stores conversation context in a local [Cashew](https://github.com/rajkripa
 thought graph with semantic search and automatic context recall. Get from zero to
 a working install in under five minutes.
 
-**v0.7.0** adds think cycles on a periodic interval. **v0.8.0** re-enables the sleep cycle with a ground-up refactored implementation — vectorized cross-linking, batched DB writes, ~4s at 7K nodes.
+**v0.7.0** adds think cycles on a periodic interval. **v0.8.0** re-enables the sleep cycle with a ground-up refactored implementation — vectorized cross-linking, batched DB writes, ~4s at 7K nodes. **v0.9.0** adds conversation-arc insight extraction via `on_pre_compress`.
 
 ## Prerequisites
 
@@ -180,6 +180,11 @@ plugin config.
   and LLM-powered dream generation. Processes 7K nodes in ~4 seconds
   (vs hours in the upstream O(N²) implementation). Work-capped at 2,000
   nodes per cycle — converges gradually over multiple sessions.
+- **Pre-compress insight extraction** — Before context compression discards
+  old messages, extracts conversation-arc patterns (topic shifts, framing
+  changes, implicit decisions) using a dedicated LLM prompt. Creates
+  `insight`/`observation` nodes in the graph. Requires `llm_aux_role`
+  configuration. Silent-degrades without LLM.
 
 Without `llm_aux_role`, the plugin uses heuristic-only extraction — no
 API calls, no LLM cost, zero-config.

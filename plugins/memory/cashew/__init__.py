@@ -61,6 +61,39 @@ legitimate test-code payloads and with Python 3.13's queue.Queue.shutdown()
 signal path. See 04-RESEARCH.md §6.4 for rationale.
 """
 
+# ── on_pre_compress prompt template ──────────────────────────────────────────
+# Dedicated prompt for forest-level conversation-arc extraction.
+# Not a reuse of end_session's prompt — asks about meta-patterns, not content.
+PRE_COMPRESS_PROMPT_TEMPLATE = """You are analyzing a conversation about to be compressed.
+Your job is to identify the forest-level patterns — signals visible across
+multiple turns that no single turn would reveal.
+
+For each signal, produce a JSON object with:
+- "type": one of "insight" or "observation" (use insight for non-obvious connections)
+- "domain": "{user_domain}" if about the human, "{ai_domain}" if about the system
+- "content": standalone statement capturing the cross-turn pattern
+- "tags": short descriptive labels (e.g. "communication_style", "topic_shift", "decision")
+- "keep": true/false
+
+Look for:
+- **Topic arc**: what was this conversation *really* about? Topic shifts vs. deep dives.
+- **Framing shifts**: did someone change their stance or framing as the conversation progressed?
+- **Implicit decisions**: choices made without explicit deliberation
+- **Unstated subjects**: topics conspicuously present in subtext but never named
+- **Structural gaps**: what wasn't asked / what was assumed
+- **Recurring patterns**: interaction patterns that recurred across multiple exchanges
+
+BAD: "The user asked about X and the assistant explained Y" (turn-level summary)
+BAD: "They discussed embeddings" (too vague — what *about* embeddings?)
+OK: "Discussion shifted from architecture to cost 3 times — cost is the binding constraint"
+GOOD: "User challenges assumptions by asking 'why' before accepting any solution — recurring pattern across topics"
+
+Respond with ONLY a JSON array. No markdown, no explanation, no code fences.
+
+Conversation about to be compressed:
+{messages_text}
+"""
+
 
 class CashewMemoryProvider(MemoryProvider):
     """Cashew thought-graph memory provider for Hermes Agent."""
@@ -571,6 +604,163 @@ class CashewMemoryProvider(MemoryProvider):
                 conn.close()
         except Exception:
             pass
+
+    def on_pre_compress(self, messages: list) -> str:
+        """Extract forest-level conversation-arc insights before compression.
+
+        Uses a dedicated LLM prompt (different from end_session's per-turn
+        prompt) to identify topic shifts, framing changes, implicit decisions,
+        unstated subjects, and recurring patterns that only become visible
+        across multiple turns.
+
+        Persists insight/observation nodes to the Cashew graph and returns
+        a short summary string for the compressor.
+
+        Silent-degrades to "" when no LLM is wired, insufficient exchanges,
+        or any failure (never raises).
+        """
+        if self._model_fn is None or self._db_path is None:
+            return ""
+
+        import json as _json
+
+        exchanges = self._extract_exchanges(messages)
+        # Need at least 3 user+assistant exchanges for arc detection
+        if len(exchanges) < 6:
+            return ""
+
+        # Cap at 20 most recent messages to bound prompt cost
+        messages_text = "\n\n".join(exchanges[-20:])
+
+        try:
+            user_domain = self._config.user_domain if self._config else "user"
+            ai_domain = self._config.ai_domain if self._config else "ai"
+
+            prompt = PRE_COMPRESS_PROMPT_TEMPLATE.format(
+                user_domain=user_domain,
+                ai_domain=ai_domain,
+                messages_text=messages_text,
+            )
+
+            response = self._model_fn(prompt)
+            if not response or not response.strip():
+                return ""
+
+            # Parse JSON — handle markdown code fences (same pattern as end_session)
+            cleaned = response.strip()
+            if cleaned.startswith("```"):
+                start = cleaned.find("[")
+                if start == -1:
+                    return ""
+                end = cleaned.rfind("]")
+                if end == -1:
+                    return ""
+                cleaned = cleaned[start:end + 1]
+
+            items = _json.loads(cleaned)
+            if not isinstance(items, list):
+                return ""
+
+            # Filter to items marked for retention
+            items = [it for it in items if it.get("keep", True)]
+            if not items:
+                return ""
+
+            # Persist to graph
+            created = self._create_insight_nodes(items)
+            if created == 0:
+                return ""
+
+            # Build summary string for compressor
+            summaries = []
+            for item in items[:3]:
+                content = item.get("content", "")
+                if content:
+                    summaries.append(f"- {content[:200]}")
+            if summaries:
+                return "Cashew insight extraction:\n" + "\n".join(summaries)
+            return ""
+
+        except _json.JSONDecodeError:
+            logger.warning("on_pre_compress: failed to parse LLM response", exc_info=True)
+            return ""
+        except Exception:
+            logger.warning("on_pre_compress failed", exc_info=True)
+            return ""
+
+    def _extract_exchanges(self, messages: list) -> list[str]:
+        """Extract user/assistant text exchanges from OpenAI-format messages.
+
+        Handles multimodal content (list-of-parts format) by extracting only
+        text parts. Filters out system and tool messages. Returns a list of
+        "role: content" strings in conversation order.
+        """
+        exchanges: list[str] = []
+        for msg in messages:
+            role = msg.get("role", "")
+            if role not in ("user", "assistant"):
+                continue
+
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                # Multimodal: extract text parts only
+                parts: list[str] = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text = part.get("text", "")
+                        if text:
+                            parts.append(text)
+                content = " ".join(parts)
+
+            if isinstance(content, str) and content.strip():
+                exchanges.append(f"{role}: {content.strip()}")
+        return exchanges
+
+    def _create_insight_nodes(self, items: list[dict]) -> int:
+        """Create insight/observation nodes in the Cashew graph.
+
+        Uses upstream _create_node / _set_node_tags for persistence, then
+        calls embed_nodes to generate embeddings. Returns node count.
+
+        Silent-degrades: logs warning on failure, never raises.
+        """
+        from core.session import _create_node, _set_node_tags
+        from core.embeddings import embed_nodes
+
+        db_path = str(self._db_path)
+        count = 0
+
+        for item in items:
+            content = item.get("content", "")
+            node_type = item.get("type", "insight")
+            domain = item.get("domain", "user")
+            tags = item.get("tags", [])
+
+            if not content or not content.strip():
+                continue
+
+            try:
+                node_id = _create_node(
+                    db_path=db_path,
+                    content=content.strip(),
+                    node_type=node_type,
+                    session_id="pre_compress",
+                    domain=domain,
+                )
+                if tags and isinstance(tags, list):
+                    _set_node_tags(db_path, node_id, tags)
+                count += 1
+            except Exception:
+                logger.warning("on_pre_compress: failed to create node", exc_info=True)
+                continue
+
+        if count > 0:
+            try:
+                embed_nodes(db_path)
+            except Exception:
+                logger.warning("on_pre_compress: embedding failed", exc_info=True)
+
+        return count
 
     def on_session_end(self, messages: list) -> None:
         """Best-effort bounded drain + optional sleep cycle (ABC-06).

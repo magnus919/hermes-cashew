@@ -1,6 +1,6 @@
 # __init__.py (repo root — dual-context implementation)
 #
-# FLAT-ENTRY (Hermes): Loaded as hermes_plugins.cashew (Hermes 0.8.8+) or _hermes_user_memory.cashew older Hermes)
+# FLAT-ENTRY (Hermes): Loaded as hermes_plugins.cashew (Hermes 0.8.8+) or _hermes_user_memory.cashew (older Hermes)
 # Python sets __package__ to the parent namespace (a synthetic module in sys.modules).
 # We detect flat-entry by __spec__.parent not being a real package in sys.modules.
 # We provide the full implementation by pre-populating sys.modules and exec'ing the
@@ -18,7 +18,7 @@ import os
 # Detect flat-entry: __spec__.parent is a Hermes synthetic namespace (hermes_plugins or _hermes_user_memory).
 # In pip/test, this root __init__.py is NOT loaded (namespace package skips it).
 _spec_parent = getattr(__spec__, "parent", "") or ""
-_is_flat = _spec_parent.startswith("_hermes_user_memory") or _spec_parent.startswith("_hermes") or _spec_parent == "hermes_plugins"
+_is_flat = _spec_parent.startswith("_hermes_user_memory") or _spec_parent.startswith("_hermes") or _spec_parent == "hermes_plugins" or _spec_parent.startswith("hermes_plugins.")
 
 if _is_flat:
     _root = os.path.dirname(os.path.abspath(__file__))

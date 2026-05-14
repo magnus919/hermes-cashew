@@ -377,6 +377,9 @@ def _evaluate_permanence(conn: sqlite3.Connection) -> dict:
     try:
         from core.permanence import promote_permanent_nodes
         db_path = conn.execute("PRAGMA database_list").fetchone()[2]
+        if not db_path:
+            # :memory: or temp database — use direct SQL
+            raise ImportError("in-memory DB")
         stats = promote_permanent_nodes(db_path, access_threshold=10)
         logger.info(
             "sleep: permanence promoted %d nodes (threshold=10)",

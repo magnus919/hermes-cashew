@@ -77,7 +77,9 @@ def _create_schema(conn: sqlite3.Connection) -> None:
 
         CREATE TABLE IF NOT EXISTS embeddings (
             node_id TEXT PRIMARY KEY,
-            vector BLOB NOT NULL
+            vector BLOB NOT NULL,
+            model TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         );
     """)
 
@@ -94,11 +96,13 @@ def _insert_node(conn, id_: str, content: str, node_type: str = "observation",
     )
 
 
-def _insert_embedding(conn, nid: str, seed: int = 42) -> None:
+def _insert_embedding(conn, nid: str, seed: int = 42,
+                     model: str = "all-MiniLM-L6-v2") -> None:
     vec = _make_fake_embedding(nid, seed)
     conn.execute(
-        "INSERT OR REPLACE INTO embeddings (node_id, vector) VALUES (?, ?)",
-        (nid, vec.tobytes()),
+        "INSERT OR REPLACE INTO embeddings (node_id, vector, model, updated_at) "
+        "VALUES (?, ?, ?, datetime('now'))",
+        (nid, vec.tobytes(), model),
     )
 
 
@@ -570,6 +574,61 @@ def test_embed_orphans_no_orphans(small_graph):
     # All nodes in small_graph have embeddings already
     count = _embed_orphans(conn)
     assert count == 0
+    conn.close()
+
+
+def test_embed_orphans_regression_not_null_schema(db_path):
+    """Regression: _embed_orphans handles the production schema with model +
+    updated_at NOT NULL constraints (issue #41).
+
+    The production embeddings table has NOT NULL on ``model`` and ``updated_at``.
+    Earlier code used ``model_name`` (wrong column) in the primary INSERT, then
+    omitted both constrained columns in the fallback, causing IntegrityError.
+    """
+    conn = sqlite3.connect(db_path)
+    # Schema is already the production one (set by _create_schema in db_path
+    # fixture). Verify.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(embeddings)").fetchall()}
+    assert "model" in cols, "test schema must include model column"
+    assert "updated_at" in cols, "test schema must include updated_at column"
+
+    # Insert a node without an embedding row (an orphan)
+    _insert_node(conn, "orphan1", "this node needs an embedding", node_type="observation")
+    conn.commit()
+
+    count = _embed_orphans(conn)
+    assert count == 1, "should have embedded 1 orphan"
+
+    # Verify the embedding row exists with all columns populated
+    row = conn.execute(
+        "SELECT node_id, model, updated_at FROM embeddings WHERE node_id='orphan1'"
+    ).fetchone()
+    assert row is not None, "embedding row should exist"
+    assert row[1] == "all-MiniLM-L6-v2", f"expected model='all-MiniLM-L6-v2', got {row[1]!r}"
+    assert row[2] is not None and len(str(row[2])) > 0, "updated_at should be set"
+
+    conn.close()
+
+
+def test_embed_orphans_mixed_orphans(db_path):
+    """Embedding gap closure works with a mix of orphaned and already-embedded nodes."""
+    conn = sqlite3.connect(db_path)
+    # Add one node with embedding, two without
+    _insert_node(conn, "has_embed", "already embedded content")
+    _insert_embedding(conn, "has_embed", seed=1)
+    _insert_node(conn, "needs_embed_a", "orphan content A")
+    _insert_node(conn, "needs_embed_b", "orphan content B")
+    conn.commit()
+
+    count = _embed_orphans(conn)
+    assert count == 2, "should embed exactly the 2 orphans"
+
+    # has_embed should still have its original embedding
+    row = conn.execute(
+        "SELECT model FROM embeddings WHERE node_id='has_embed'"
+    ).fetchone()
+    assert row is not None, "original embedding should still exist"
+
     conn.close()
 
 

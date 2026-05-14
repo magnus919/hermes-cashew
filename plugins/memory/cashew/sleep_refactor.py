@@ -572,10 +572,12 @@ def _embed_orphans(conn: sqlite3.Connection) -> int:
             try:
                 conn.execute(
                     "INSERT OR REPLACE INTO embeddings "
-                    "(node_id, vector, model_name) VALUES (?, ?, ?)",
+                    "(node_id, vector, model, updated_at) "
+                    "VALUES (?, ?, ?, datetime('now'))",
                     (nid, blob, "all-MiniLM-L6-v2"),
                 )
             except sqlite3.OperationalError:
+                # Fallback for legacy schemas without model/updated_at columns
                 conn.execute(
                     "INSERT OR REPLACE INTO embeddings (node_id, vector) VALUES (?, ?)",
                     (nid, blob),

@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.8.1 (2026-05-14) — Embedding Gap Closure Fix
+
+### Fixed
+
+- **GH#41** — `_embed_orphans()` failed with `NOT NULL constraint failed:
+  embeddings.model` on every orphaned node. The primary INSERT used
+  `model_name` (wrong column name — schema column is `model`), and the
+  fallback omitted both `model` and `updated_at` (both NOT NULL). Orphaned
+  nodes were never embedded, so the gap never closed.
+  ([#42](https://github.com/magnus919/hermes-cashew/pull/42))
+
+### Changed
+
+- **Test schema** — `_create_schema` in tests now matches the upstream
+  `embeddings` table exactly (with `model TEXT NOT NULL` and
+  `updated_at TEXT NOT NULL`), preventing future column-mismatch regressions.
+
 ## v0.8.0 (2026-05-14) — Refactored Sleep Cycle Re-enabled
 
 ### Added

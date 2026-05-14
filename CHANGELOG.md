@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.9.0 (2026-05-14) — Forest-Level Insight Extraction
+
+### Added
+
+- **`on_pre_compress` hook** — Implements the `on_pre_compress(messages)` ABC
+  method on `CashewMemoryProvider`. Uses a dedicated LLM extraction prompt
+  (separate from `end_session`'s per-turn prompt) to identify conversation-arc
+  patterns — topic shifts, framing changes, implicit decisions, unstated
+  subjects, and recurring interaction patterns. Creates `insight`/`observation`
+  nodes in the Cashew graph via upstream `_create_node` + `embed_nodes`.
+  Silent-degrades without LLM configuration.
+  ([#36](https://github.com/magnus919/hermes-cashew/issues/36))
+
+### Changed
+
+- **Both `plugin.yaml` files** — Added `on_pre_compress` to the hooks list.
+
 ## v0.8.2 (2026-05-14) — Hermes `hermes_plugins` Namespace Fix
 
 ### Fixed

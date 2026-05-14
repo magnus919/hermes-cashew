@@ -5,7 +5,7 @@ that stores conversation context in a local [Cashew](https://github.com/rajkripa
 thought graph with semantic search and automatic context recall. Get from zero to
 a working install in under five minutes.
 
-**v0.7.0** adds think cycles on a periodic interval. **v0.7.4** removes the sleep cycle from lifecycle hooks (it was causing runaway CPU on large graphs — see GH#42).
+**v0.7.0** adds think cycles on a periodic interval. **v0.8.0** re-enables the sleep cycle with a ground-up refactored implementation — vectorized cross-linking, batched DB writes, ~4s at 7K nodes.
 
 ## Prerequisites
 
@@ -174,9 +174,12 @@ plugin config.
   {"llm_aux_role": "memory", "think_interval": 10}
   ```
   Set `think_interval` to 0 to disable.
-- **Sleep synthesis** — Temporarily removed in v0.7.4 (see GH#42). The
-  upstream `run_sleep_cycle()` will be reimplemented in a background thread
-  with a mutex guard. The `sleep_cycles` config flag is a no-op until then.
+- **Sleep synthesis** — Runs at session end via `on_session_end()` when
+  `sleep_cycles: true`. Nine-phase consolidation pipeline: cross-linking,
+  dedup, garbage collection, permanence evaluation, core memory promotion,
+  and LLM-powered dream generation. Processes 7K nodes in ~4 seconds
+  (vs hours in the upstream O(N²) implementation). Work-capped at 2,000
+  nodes per cycle — converges gradually over multiple sessions.
 
 Without `llm_aux_role`, the plugin uses heuristic-only extraction — no
 API calls, no LLM cost, zero-config.

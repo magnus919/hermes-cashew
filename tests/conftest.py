@@ -123,6 +123,67 @@ def fake_embedder(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _mock_heavy_imports(monkeypatch: pytest.MonkeyPatch):
+    """Mock sklearn and SentenceTransformer so sleep_refactor tests run offline.
+
+    Provides a pure-numpy cosine_similarity fallback and a no-op SentenceTransformer.
+    """
+    import numpy as np
+
+    def _numpy_cosine_similarity(X: np.ndarray) -> np.ndarray:
+        """Pure numpy cosine similarity — replaces sklearn for tests."""
+        norms = np.linalg.norm(X, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        X_norm = X / norms
+        return np.dot(X_norm, X_norm.T)
+
+    class _FakeSentenceTransformer:
+        """No-op SentenceTransformer that returns deterministic embeddings."""
+
+        def __init__(self, model_name: str = ""):
+            self.model_name = model_name
+
+        def encode(self, texts, normalize_embeddings: bool = True, **kwargs) -> np.ndarray:
+            if isinstance(texts, str):
+                texts = [texts]
+            # Deterministic: hash-based embedding
+            dim = 384
+            vecs = np.zeros((len(texts), dim), dtype=np.float32)
+            for i, t in enumerate(texts):
+                seed = abs(hash(t)) % 2**31
+                rng = np.random.RandomState(seed)
+                vecs[i] = rng.randn(dim).astype(np.float32)
+            if normalize_embeddings:
+                norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+                norms[norms == 0] = 1.0
+                vecs = vecs / norms
+            return vecs if len(vecs) > 1 else vecs[0]
+
+    # Mock sklearn.metrics.pairwise.cosine_similarity
+    monkeypatch.setattr(
+        "sklearn.metrics.pairwise.cosine_similarity",
+        _numpy_cosine_similarity,
+        raising=False,
+    )
+
+    # Mock SentenceTransformer at the import level — used inside _embed_orphans()
+    import sys
+    _had_st = "sentence_transformers" in sys.modules
+    _saved_st = sys.modules.get("sentence_transformers")
+    fake_st_module = type(sys)("sentence_transformers")
+    fake_st_module.SentenceTransformer = _FakeSentenceTransformer
+    sys.modules["sentence_transformers"] = fake_st_module
+
+    yield
+
+    # Restore original sentence_transformers module
+    if _had_st:
+        sys.modules["sentence_transformers"] = _saved_st
+    else:
+        sys.modules.pop("sentence_transformers", None)
+
+
 @pytest.fixture
 def home_snapshot():
     """Snapshot ~/.hermes file listing before/after a test.

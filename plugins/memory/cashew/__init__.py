@@ -573,12 +573,13 @@ class CashewMemoryProvider(MemoryProvider):
             pass
 
     def on_session_end(self, messages: list) -> None:
-        """Best-effort bounded drain; does NOT stop the worker (ABC-06).
+        """Best-effort bounded drain + optional sleep cycle (ABC-06).
 
         Polls unfinished_tasks with the same sync_queue_timeout that shutdown()
-        uses. Worker stays alive for subsequent sessions. No WARNING on timeout —
-        this method is advisory; shutdown() is authoritative. See 04-RESEARCH.md
-        §6.10 + PHASE_DESIGN_NOTES Decision Point 4.
+        uses. Worker stays alive for subsequent sessions. After drain, runs
+        the refactored sleep cycle if configured (sleep_cycles=true, model_fn
+        wired). No WARNING on timeout — this method is advisory; shutdown() is
+        authoritative.
         """
         if self._sync_queue is None:
             return  # not initialized or silent-degraded
@@ -586,7 +587,23 @@ class CashewMemoryProvider(MemoryProvider):
         deadline = time.monotonic() + timeout
         while self._sync_queue.unfinished_tasks > 0 and time.monotonic() < deadline:
             time.sleep(0.05)
-        # Intentional: no WARNING on incomplete drain — shutdown() will log if it also times out.
+
+        # Refactored sleep cycle (v0.8.0): runs in ~4s at 7K nodes.
+        # Safe to call from lifecycle hooks — bounded by MAX_NODES_PER_CYCLE.
+        if (
+            self._config is not None
+            and self._config.sleep_cycles
+            and self._db_path is not None
+        ):
+            try:
+                from .sleep_refactor import run_sleep_cycle
+                run_sleep_cycle(
+                    db_path=str(self._db_path),
+                    limit=2000,
+                    model_fn=self._model_fn,
+                )
+            except Exception:
+                logger.warning("sleep cycle failed", exc_info=True)
 
     def shutdown(self) -> None:
         """Post sentinel, bounded-join worker, clear references (ABC-05 + SYNC-05).

@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.8.0 (2026-05-14) — Refactored Sleep Cycle Re-enabled
+
+### Added
+
+- **`plugins/memory/cashew/sleep_refactor.py`** — ground-up refactored sleep
+  cycle replacing the upstream O(N²) implementation. Nine-phase pipeline:
+  vectorized cross-linking (numpy + batched DB writes), connected-component
+  dedup, node metrics, garbage collection, permanence evaluation, core memory
+  promotion, LLM-powered dream generation, and embedding gap closure.
+  Processes 7,100 nodes in ~4 seconds (vs hours → timeout upstream).
+
+- **Sleep cycle re-enabled in `on_session_end()`** — runs automatically at
+  session end when `sleep_cycles: true` in `cashew.json` and an LLM is wired
+  via `llm_aux_role`. Work-capped at 2,000 nodes per cycle, converging
+  gradually over ~3-4 sessions.
+
+### Changed
+
+- **`sleep_cycles` config flag is no longer a no-op** — now gates the
+  refactored sleep cycle in `on_session_end()`. Set to `true` to enable.
+
+### Fixed
+
+- **GH#39** — Sleep cycle removed in v0.7.4 due to upstream performance
+  (100% CPU for hours at 7K nodes). Replaced with vectorized refactored
+  implementation.
+
 ## v0.7.4 (2026-05-13) — Remove Sleep Cycle from Lifecycle Hooks
 
 ### Removed

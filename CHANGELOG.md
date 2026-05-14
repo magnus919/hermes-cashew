@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.8.2 (2026-05-14) — Hermes `hermes_plugins` Namespace Fix
+
+### Fixed
+
+- **GH#43** — Root `__init__.py` flat-entry detection missed Hermes' `hermes_plugins`
+  synthetic namespace (introduced in Hermes 0.8.8+), causing the plugin to silently
+  fail registration. The `_is_flat` check now includes `_spec_parent == "hermes_plugins"`
+  alongside the existing `_hermes*` prefix checks.
+  ([#44](https://github.com/magnus919/hermes-cashew/pull/44))
+
 ## v0.8.1 (2026-05-14) — Embedding Gap Closure Fix
 
 ### Fixed

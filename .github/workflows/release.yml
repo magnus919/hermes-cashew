@@ -64,6 +64,13 @@ jobs:
             exit 1
           fi
           echo "Version match: v$PACKAGE_VERSION"
+      - name: Sync plugin.yaml versions to pyproject.toml
+        run: |
+          VERSION="$(grep -Po '^version = \"\K[^\"]+' pyproject.toml)"
+          for f in plugin.yaml plugins/memory/cashew/plugin.yaml; do
+            sed -i "s/^version: .*/version: ${VERSION}/" "$f"
+            echo "→ $f: version ${VERSION}"
+          done
       - name: Install build dependencies
         run: pip install build
       - name: Build wheel and sdist

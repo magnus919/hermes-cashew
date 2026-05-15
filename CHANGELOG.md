@@ -1,8 +1,23 @@
 # Changelog
 
-## v0.9.0 (2026-05-14) — Forest-Level Insight Extraction
+## v0.9.0 (2026-05-15) — First-Load Bootstrap & Forest-Level Insight Extraction
 
 ### Added
+
+- **Auto-generate `cashew.json` on first load** — when `initialize()` finds no
+  config file, it writes one with all 32 DEFAULTS so `is_available()` returns
+  `True` immediately after install. Existing configs are never overwritten.
+  ([#47](https://github.com/magnus919/hermes-cashew/issues/47))
+
+- **`llm_aux_role` defaults to `"memory"`** — LLM-powered extraction is active
+  out of the box instead of requiring manual configuration. The plugin
+  auto-populates `auxiliary.memory` in Hermes `config.yaml` from the main
+  model config if absent. ([#47](https://github.com/magnus919/hermes-cashew/issues/47))
+
+- **`is_available()` returns `True` when deps are present** — a fresh install
+  shows green in `hermes memory status` even without a `cashew.json` file,
+  because `initialize()` will generate defaults on first run.
+  ([#47](https://github.com/magnus919/hermes-cashew/issues/47))
 
 - **`on_pre_compress` hook** — Implements the `on_pre_compress(messages)` ABC
   method on `CashewMemoryProvider`. Uses a dedicated LLM extraction prompt

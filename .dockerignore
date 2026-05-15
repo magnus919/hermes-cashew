@@ -1,0 +1,10 @@
+.venv
+.git
+__pycache__
+*.pyc
+*.pyo
+.DS_Store
+venv
+node_modules
+.planning
+graphify-out

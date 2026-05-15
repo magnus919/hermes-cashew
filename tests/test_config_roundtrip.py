@@ -66,6 +66,8 @@ def test_defaults_contains_exactly_32_keys_with_documented_values():
     assert DEFAULTS["sleep_cycles"] is True
     assert DEFAULTS["decay_pruning"] is True
     assert DEFAULTS["pattern_detection"] is True
+    assert DEFAULTS["llm_aux_role"] == "memory"
+    assert DEFAULTS["think_interval"] == 10
 
 
 def test_cashew_config_dataclass_field_set_matches_defaults():

@@ -10,9 +10,17 @@ def test_name_is_cashew():
 
 
 def test_is_available_false_before_config():
-    """ABC-03: is_available returns False with zero I/O before Phase 2 config round-trip."""
-    provider = CashewMemoryProvider()
-    assert provider.is_available() is False
+    """ABC-03: is_available returns False when deps are unavailable and no config exists."""
+    import plugins.memory.cashew as cashew_mod
+    from plugins.memory.cashew import ContextRetriever as real_retriever
+    # Temporarily null ContextRetriever to simulate no-cashew-brain scenario
+    original = cashew_mod.ContextRetriever
+    cashew_mod.ContextRetriever = None
+    try:
+        provider = CashewMemoryProvider()
+        assert provider.is_available() is False
+    finally:
+        cashew_mod.ContextRetriever = original
 
 
 def test_is_available_no_filesystem_calls(monkeypatch):

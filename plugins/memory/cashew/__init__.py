@@ -95,6 +95,102 @@ Conversation about to be compressed:
 """
 
 
+# ── First-load bootstrap helpers ──────────────────────────────────────
+
+
+def _ensure_config_file(hermes_home: pathlib.Path) -> None:
+    """Write default cashew.json if none exists (first-load bootstrap).
+
+    Uses generate_default_config from config.py which never overwrites
+    an existing file. Safe to call on every initialize() — no-op after
+    the first run.
+    """
+    from .config import generate_default_config
+
+    generate_default_config(hermes_home)
+
+
+def _ensure_auxiliary_memory(hermes_home: pathlib.Path) -> None:
+    """Auto-populate auxiliary.memory in Hermes config.yaml if absent.
+
+    When llm_aux_role="memory" is set (the new default) but the user has
+    no auxiliary.memory section in their Hermes config.yaml, the plugin
+    reads the main model config (provider, model, base_url) and creates an
+    auxiliary.memory section with matching settings. This makes LLM-powered
+    extraction work out of the box without manual config editing.
+
+    Safe to call repeatedly — only writes when auxiliary.memory is absent
+    and the main model config provides usable values. Never overwrites an
+    existing auxiliary.memory section.
+    """
+    config_path = hermes_home / "config.yaml"
+    if not config_path.exists():
+        return
+
+    try:
+        import yaml
+
+        raw = config_path.read_text(encoding="utf-8")
+        data = yaml.safe_load(raw) or {}
+    except Exception:
+        logger.warning(
+            "failed to read %s for auxiliary.memory auto-population",
+            config_path,
+            exc_info=True,
+        )
+        return
+
+    # Don't touch existing auxiliary.memory config
+    aux = data.get("auxiliary", {})
+    if "memory" in aux:
+        return
+
+    model_section = data.get("model", {})
+    provider = model_section.get("provider")
+    default_model = model_section.get("default")
+    base_url = model_section.get("base_url")
+
+    if not provider or not default_model:
+        logger.info(
+            "cannot auto-populate auxiliary.memory: "
+            "model.provider=%r model.default=%r",
+            provider,
+            default_model,
+        )
+        return
+
+    # Build the auxiliary.memory section
+    memory_config: dict[str, str | int] = {
+        "provider": provider,
+        "model": default_model,
+    }
+    if base_url:
+        memory_config["base_url"] = base_url
+
+    if "auxiliary" not in data:
+        data["auxiliary"] = {}
+    data["auxiliary"]["memory"] = memory_config
+
+    try:
+        config_path.write_text(
+            yaml.safe_dump(data, default_flow_style=False, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+        logger.info(
+            "auto-populated auxiliary.memory from main model config: "
+            "provider=%s model=%s",
+            provider,
+            default_model,
+        )
+    except Exception:
+        logger.warning(
+            "failed to write auxiliary.memory to %s",
+            config_path,
+            exc_info=True,
+        )
+
+
+# ── on_pre_compress prompt template ──────────────────────────────────
 class CashewMemoryProvider(MemoryProvider):
     """Cashew thought-graph memory provider for Hermes Agent."""
 
@@ -127,22 +223,31 @@ class CashewMemoryProvider(MemoryProvider):
         return "cashew"
 
     def is_available(self) -> bool:
-        """Return True iff a Cashew config file exists under hermes_home.
+        """Return True iff the provider can be initialized.
 
-        Contract (per ROADMAP Phase 2 Success #3 + Phase 1 RESEARCH.md Pitfall 5):
-        zero I/O beyond ONE Path.exists() probe. No file content is read here.
-        Hermes calls is_available() before initialize using a temporary provider
-        instance — we probe the default config location if _hermes_home has not
-        been set yet.
+        Two-path check:
+        1. Config file exists under hermes_home (legacy fast path)
+        2. Plugin dependencies are importable (first-load path) — if cashew-brain
+           was installed successfully, ContextRetriever was set at module import
+           time, and initialize() will generate defaults on first run.
+
+        The second path ensures a fresh install shows green in `hermes memory
+        status` without requiring manual cashew.json creation.
         """
+        # Fast path: config file exists
         if self._hermes_home is not None:
-            return resolve_config_path(self._hermes_home).exists()
-        # Fallback for pre-initialize check
-        try:
-            from hermes_constants import get_hermes_home
-            return resolve_config_path(get_hermes_home()).exists()
-        except Exception:
-            return False
+            if resolve_config_path(self._hermes_home).exists():
+                return True
+        else:
+            try:
+                from hermes_constants import get_hermes_home  # type: ignore[import-untyped]
+                if resolve_config_path(get_hermes_home()).exists():
+                    return True
+            except Exception:
+                pass
+
+        # Fallback: deps are importable — initialize() will generate defaults
+        return ContextRetriever is not None
 
     def get_config_schema(self) -> Dict[str, Any]:
         """Return the JSON-Schema-shaped dict Hermes uses to drive `hermes memory setup` (CONF-01)."""
@@ -183,6 +288,12 @@ class CashewMemoryProvider(MemoryProvider):
         self._sync_queue = queue.Queue(maxsize=16)
         try:
             self._config = load_config(self._hermes_home)
+            # First-load bootstrap: generate default cashew.json and
+            # auto-populate auxiliary.memory if absent. Safe to call
+            # on every initialize() — no-op after the first run.
+            _ensure_config_file(self._hermes_home)
+            if self._config.llm_aux_role:
+                _ensure_auxiliary_memory(self._hermes_home)
             self._db_path = resolve_db_path(self._hermes_home, self._config.cashew_db_path)
             # Phase 3 eager construction (PHASE_DESIGN_NOTES Decision Point 1).
             # ContextRetriever.__init__ is lazy — no SQLite open, no embedding load yet.
@@ -223,7 +334,6 @@ class CashewMemoryProvider(MemoryProvider):
         )
         self._sync_worker.start()
 
-    # ------------------------------------------------------------------
     # LLM integration via auxiliary.memory convention
     # ------------------------------------------------------------------
 
@@ -257,7 +367,7 @@ class CashewMemoryProvider(MemoryProvider):
 
         config_path = self._hermes_home / "config.yaml" if self._hermes_home else pathlib.Path()
         if not config_path or not config_path.exists():
-            logger.warning(
+            logger.info(
                 "llm_aux_role=%r but %s not found; falling back to heuristic extraction",
                 role, config_path,
             )

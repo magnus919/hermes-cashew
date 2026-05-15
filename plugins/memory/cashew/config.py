@@ -59,8 +59,10 @@ DEFAULTS: dict[str, Any] = {
     "sleep_cycles": True,
     "decay_pruning": True,
     "pattern_detection": True,
-    # LLM integration
-    "llm_aux_role": None,
+    # LLM integration — "memory" activates LLM-powered extraction by default
+    # via auxiliary.memory in Hermes config.yaml. On first load, the plugin
+    # auto-populates auxiliary.memory from the main model config if absent.
+    "llm_aux_role": "memory",
     "think_interval": 10,
 }
 
@@ -108,7 +110,7 @@ class CashewConfig:
     decay_pruning: bool = DEFAULTS["decay_pruning"]
     pattern_detection: bool = DEFAULTS["pattern_detection"]
     # LLM integration
-    llm_aux_role: str | None = DEFAULTS["llm_aux_role"]
+    llm_aux_role: str = DEFAULTS["llm_aux_role"]
     think_interval: int = DEFAULTS["think_interval"]
 
 
@@ -331,11 +333,13 @@ def get_config_schema() -> list[dict[str, Any]]:
         {
             "key": "llm_aux_role",
             "description": (
-                "Hermes auxiliary role to use for LLM-powered operations "
-                "(think cycles, sleep synthesis, LLM extraction). Set to the "
-                "name of an auxiliary.memory section in Hermes config.yaml. "
-                "When unset or null, falls back to heuristic-only extraction "
-                "with no LLM calls."
+                "Hermes auxiliary role for LLM-powered operations "
+                "(think cycles, sleep synthesis, LLM extraction). "
+                "Defaults to 'memory', which reads from auxiliary.memory "
+                "in Hermes config.yaml. The plugin auto-populates "
+                "auxiliary.memory from the main model config on first load "
+                "if absent. Set to null or empty string to disable LLM "
+                "extraction and use heuristic-only mode."
             ),
             "default": DEFAULTS["llm_aux_role"],
             "env_var": _env_var_name("llm_aux_role"),
@@ -435,6 +439,21 @@ def load_config(hermes_home: str | os.PathLike[str]) -> CashewConfig:
     known = {f.name for f in dataclasses.fields(CashewConfig)}
     filtered = {k: v for k, v in merged.items() if k in known}
     return CashewConfig(**filtered)
+
+
+def generate_default_config(hermes_home: str | os.PathLike[str]) -> pathlib.Path:
+    """Write a default cashew.json if none exists.
+
+    Creates the config file at $HERMES_HOME/cashew.json with all DEFAULTS,
+    so subsequent is_available() checks find it. Existing files are never
+    overwritten — this is a one-time bootstrap on first load.
+
+    Returns the path written, or the existing path if file already existed.
+    """
+    path = resolve_config_path(hermes_home)
+    if path.exists():
+        return path
+    return save_config(dict(DEFAULTS), hermes_home)
 
 
 def save_config(values: dict[str, Any], hermes_home: str | os.PathLike[str]) -> pathlib.Path:

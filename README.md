@@ -5,7 +5,11 @@ that stores conversation context in a local [Cashew](https://github.com/rajkripa
 thought graph with semantic search and automatic context recall. Get from zero to
 a working install in under five minutes.
 
-**v0.7.0** adds think cycles on a periodic interval. **v0.8.0** re-enables the sleep cycle with a ground-up refactored implementation — vectorized cross-linking, batched DB writes, ~4s at 7K nodes. **v0.9.0** adds conversation-arc insight extraction via `on_pre_compress`.
+**v0.9.0** auto-generates `cashew.json` with defaults on first load, enables
+LLM-powered extraction by default (no manual `auxiliary.memory` setup), and
+adds forest-level insight extraction via `on_pre_compress`. **v0.8.0**
+re-enabled the sleep cycle with a ground-up refactored implementation —
+vectorized cross-linking, batched DB writes, ~4s at 7K nodes.
 
 ## Prerequisites
 
@@ -43,29 +47,22 @@ hermes memory setup
 
 ## Zero-Config Startup
 
-hermes-cashew works out of the box — all 31 configuration keys have sane
-defaults. Create `~/.hermes/cashew.json` only if you want to override them:
+hermes-cashew works out of the box — all 32 configuration keys have sane
+defaults. On first agent startup, the plugin auto-generates `~/.hermes/cashew.json`
+with the full default configuration and auto-populates `auxiliary.memory` in
+Hermes `config.yaml` from the main model config, so LLM-powered extraction
+is active without any manual setup.
+
+Created `~/.hermes/cashew.json` only if you want to override specific defaults.
+The file is never overwritten once it exists:
 
 ```bash
+# Optional: override individual defaults
 cat > ~/.hermes/cashew.json << 'EOF'
 {
-  "cashew_db_path": "cashew/brain.db",
-  "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
-  "recall_k": 5,
-  "user_domain": "cli/user",
-  "ai_domain": "cli/ai",
-  "sync_queue_timeout": 30,
-  "vec_dimension": 384,
-  "gc_interval_turns": 100,
-  "gc_delete_probability": 0.01,
-  "enable_query_decomposition": true,
-  "max_tokens_per_node": 512,
-  "feature_bfs_retrieval": true,
-  "feature_semantic_search": true,
-  "feature_context_summarization": false,
-  "max_depth": 3,
-  "similarity_threshold": 0.7,
-  "max_nodes_per_query": 20
+  "recall_k": 10,
+  "think_interval": 15,
+  "user_domain": "user"
 }
 EOF
 ```
@@ -135,45 +132,35 @@ keyword fallback. Common use cases:
 - **Domain isolation**: Exclude nodes from specific domains during broad queries
 - **Declassification**: Remove exclusion to reveal previously private nodes
 
-## LLM Integration (Optional)
+## LLM Integration
 
-By default, hermes-cashew uses heuristic-only extraction — it stores
-conversation turns without LLM involvement. To enable LLM-powered features
-(typed nodes, think cycles, sleep synthesis), configure an auxiliary model
-in Hermes' own `config.yaml`:
+hermes-cashew enables LLM-powered extraction by default — `llm_aux_role` is
+set to `"memory"`, and the plugin auto-populates `auxiliary.memory` in Hermes
+`config.yaml` from the main model config on first load.
 
-```yaml
-auxiliary:
-  memory:
-    provider: openrouter          # any Hermes-supported provider
-    model: openai/gpt-4o-mini     # any model available on that provider
+No manual configuration is needed. To verify LLM extraction is active:
+
+```bash
+grep "using" ~/.hermes/logs/agent.log | grep "llm_aux_role"
+# Expected: llm_aux_role='memory': using <provider> <model> via <base_url>
 ```
 
-Then add the role name to `cashew.json`:
+To disable LLM extraction (heuristic-only mode), set `llm_aux_role` to null in
+`cashew.json`:
 
 ```json
-{
-  "cashew_db_path": "cashew/brain.db",
-  "llm_aux_role": "memory"
-}
+{"llm_aux_role": null}
 ```
 
-The plugin reads your Hermes config, resolves the API key from the
-appropriate environment variable, and constructs an OpenAI-compatible
-callable for upstream cashew-brain. No credentials are stored in the
-plugin config.
+Or remove the section entirely — the default will regenerate it on next start.
 
-**What this enables upstream:**
+### What the LLM enables upstream
 
 - **LLM extraction** — structured knowledge extraction with typed nodes,
   confidence scores, tags, and domain assignment
 - **Think cycles** — cross-domain synthesis, generates `insight` nodes
   from clusters of related knowledge. Runs every `think_interval` sync
-  turns (default 10). Configure via `cashew.json`:
-  ```json
-  {"llm_aux_role": "memory", "think_interval": 10}
-  ```
-  Set `think_interval` to 0 to disable.
+  turns (default 10). Set `think_interval` to 0 to disable.
 - **Sleep synthesis** — Runs at session end via `on_session_end()` when
   `sleep_cycles: true`. Nine-phase consolidation pipeline: cross-linking,
   dedup, garbage collection, permanence evaluation, core memory promotion,

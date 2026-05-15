@@ -6,7 +6,7 @@ Hermes Agent memory provider plugin backed by Cashew (local SQLite knowledge gra
 
 Thin adapter around upstream [cashew-brain](https://github.com/rajkripal/cashew) — the plugin delegates retrieval, schema management, and LLM operations to upstream. Custom code is limited to Hermes integration surface (config, tools, threading).
 
-## Current State (v0.4.0)
+## Current State (v0.8.2)
 
 - **LLM integration**: `llm_aux_role` config key references `auxiliary.<role>` in Hermes `config.yaml`. Plugin reads Hermes config, resolves credentials, wires `model_fn` callable to upstream. No API keys in plugin config.
 - **Retrieval**: Three-tier (sqlite-vec → BFS → keyword), delegated to upstream `retrieve_recursive_bfs()`.
@@ -38,7 +38,9 @@ git push -u origin HEAD
 
 ### Release Process
 
-Releases are triggered by pushing a `v*` tag. The release workflow gates on tests passing, builds the wheel, and publishes to PyPI via trusted publishing.
+Releases are triggered by pushing a `v*` tag. The release workflow gates on tests passing, auto-syncs plugin manifest versions, builds the wheel, and publishes to PyPI via trusted publishing.
+
+**Important:** You only bump the version in `pyproject.toml` and `CHANGELOG.md` — CI automatically syncs both `plugin.yaml` files to match before building. See [Plugin Version Manifest](#plugin-version-manifest).
 
 ```bash
 # After PR is merged to main:
@@ -58,14 +60,37 @@ The `auxiliary.memory` convention is designed for any Hermes memory provider. Wh
 - `plugins/memory/cashew/__init__.py` — provider implementation (CashewMemoryProvider + register).
 - `plugins/memory/cashew/config.py` — CashewConfig dataclass, DEFAULTS, load/save, schema (31 keys).
 - `plugins/memory/cashew/tools.py` — JSON envelope builders for tool call responses.
-- `plugins/memory/cashew/plugin.yaml` — bundled-loader hook manifest (hooks: [on_session_end]).
-- `plugin.yaml` (root) — `hermes plugins install` manifest, must stay in sync with the above.
+- `plugins/memory/cashew/plugin.yaml` — bundled-loader hook manifest (hooks: [on_session_end, on_pre_compress]). Must match `plugin.yaml` (root).
+- `plugin.yaml` (root) — `hermes plugins install` manifest. CI auto-syncs version from `pyproject.toml` on release.
 - `tests/` — pytest, MemoryManager stub + fake `agent.memory_provider` ABC in `sys.modules`.
 - `.github/workflows/tests.yml` — **do not rename**; filename locked for trusted-publisher config.
 - `.github/workflows/release.yml` — **do not rename**; OIDC bound to filename.
 - `.planning/` — historical GSD workflow artifacts from v0.1/v0.2 development. Schematic reference only; current work is tracked in GitHub issues.
 
 `plugins/` and `plugins/memory/` are PEP 420 namespace packages — do NOT add `__init__.py`.
+
+## Plugin Version Manifest
+
+Hermes-cashew has **three** version-bearing files, and they must all agree:
+
+| File | What it controls | Who bumps it |
+|------|------------------|-------------|
+| `pyproject.toml` | PyPI package version (`pip install`, wheel metadata) | **You** — in the release commit |
+| `plugin.yaml` (root) | Version shown by `hermes plugins install` / `hermes plugin status` | **CI** — auto-synced in the `build` job of `release.yml` |
+| `plugins/memory/cashew/plugin.yaml` | Version in bundled-loader installs (same manifest format) | **CI** — auto-synced (same step as root) |
+
+**The rule:** you only bump `pyproject.toml` when cutting a release. CI reads the version from `pyproject.toml` and patches both `plugin.yaml` files with `sed` before building the wheel and sdist. This happens in the `Sync plugin.yaml versions to pyproject.toml` step of the release workflow, immediately after version-tag validation.
+
+If you ever need to check that all three are in sync locally:
+```bash
+PYPROJ="$(grep -Po '^version = \"\K[^\"]+' pyproject.toml)"
+for f in plugin.yaml plugins/memory/cashew/plugin.yaml; do
+  YAML="$(grep -Po '^version: \K.*' "$f")"
+  if [ "$PYPROJ" != "$YAML" ]; then
+    echo "MISMATCH: $f says $YAML, pyproject.toml says $PYPROJ"
+  fi
+done
+```
 
 ## Key Constraints
 

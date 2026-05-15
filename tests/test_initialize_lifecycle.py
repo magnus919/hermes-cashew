@@ -16,10 +16,18 @@ from plugins.memory.cashew import CashewMemoryProvider
 from plugins.memory.cashew.config import CashewConfig, DEFAULTS, CONFIG_FILENAME
 
 
-def test_fresh_provider_is_not_available():
-    """ABC-04 + Phase 2 Success #3: pre-initialize, is_available is False unconditionally."""
+def test_fresh_provider_is_not_available_without_deps(monkeypatch):
+    """ABC-04 + Phase 2 Success #3: pre-initialize is False when ContextRetriever unavailable."""
+    from plugins.memory.cashew import ContextRetriever as real_retriever
+    # Simulate no-cashew-brain scenario by nulling ContextRetriever
+    # (as happens at module import when cashew-brain is not installed).
+    import plugins.memory.cashew as cashew_mod
+    monkeypatch.setattr(cashew_mod, "ContextRetriever", None)
     p = CashewMemoryProvider()
+    # Without deps AND without config file, is_available must be False
     assert p.is_available() is False
+    monkeypatch.undo()
+    assert p.is_available() is True, "restored: with deps and no file, should be available"
 
 
 def test_shutdown_pre_initialize_is_safe_noop():
@@ -125,14 +133,31 @@ def test_full_roundtrip_save_then_initialize(tmp_path):
         p.shutdown()
 
 
-def test_is_available_transitions_false_to_true_after_save_config(tmp_path):
-    """Phase 2 Success #3: is_available True iff cashew.json exists under hermes_home."""
+def test_initialize_generates_config_file_on_first_load(tmp_path):
+    """First-load bootstrap: initialize() writes cashew.json when none exists."""
+    p = CashewMemoryProvider()
+    assert not (tmp_path / CONFIG_FILENAME).exists(), "precondition: no config file"
+    p.initialize("s", hermes_home=str(tmp_path))
+    try:
+        assert (tmp_path / CONFIG_FILENAME).exists(), "initialize() must create cashew.json"
+        assert p.is_available() is True, "is_available must be True after file exists"
+    finally:
+        p.shutdown()
+
+
+def test_initialize_does_not_overwrite_existing_config(tmp_path):
+    """First-load bootstrap: existing cashew.json is never overwritten."""
+    existing = {"recall_k": 42, "user_domain": "custom"}
+    (tmp_path / CONFIG_FILENAME).write_text(json.dumps(existing))
     p = CashewMemoryProvider()
     p.initialize("s", hermes_home=str(tmp_path))
     try:
-        assert p.is_available() is False, "no cashew.json yet"
-        p.save_config({}, str(tmp_path))
-        assert p.is_available() is True, "cashew.json now exists"
+        # Verify our custom values survived
+        assert p._config.recall_k == 42
+        assert p._config.user_domain == "custom"
+        # Verify the file wasn't replaced wholesale
+        on_disk = json.loads((tmp_path / CONFIG_FILENAME).read_text())
+        assert on_disk["recall_k"] == 42
     finally:
         p.shutdown()
 
@@ -225,3 +250,67 @@ def test_get_config_schema_returns_helper_module_schema():
     from plugins.memory.cashew.config import get_config_schema as helper_schema
     p = CashewMemoryProvider()
     assert p.get_config_schema() == helper_schema()
+
+
+# ── First-load bootstrap tests ──────────────────────────────────────────
+
+
+def test_ensure_config_file_writes_defaults(tmp_path):
+    """_ensure_config_file writes cashew.json when absent, no-ops when present."""
+    from plugins.memory.cashew import _ensure_config_file
+    assert not (tmp_path / "cashew.json").exists()
+    _ensure_config_file(tmp_path)
+    assert (tmp_path / "cashew.json").exists()
+    # Second call is no-op (file already exists)
+    mtime = (tmp_path / "cashew.json").stat().st_mtime_ns
+    _ensure_config_file(tmp_path)
+    assert (tmp_path / "cashew.json").stat().st_mtime_ns == mtime
+
+
+def test_ensure_auxiliary_memory_populates_from_main_model(tmp_path):
+    """_ensure_auxiliary_memory creates auxiliary.memory from model section."""
+    from plugins.memory.cashew import _ensure_auxiliary_memory
+    config_yaml = tmp_path / "config.yaml"
+    config_yaml.write_text("""model:
+  provider: openrouter
+  default: openrouter/auto
+  base_url: https://openrouter.ai/api/v1
+""")
+    assert not (tmp_path / "cashew.json").exists()
+    _ensure_auxiliary_memory(tmp_path)
+    import yaml
+    data = yaml.safe_load(config_yaml.read_text())
+    aux_memory = data.get("auxiliary", {}).get("memory", {})
+    assert aux_memory["provider"] == "openrouter"
+    assert aux_memory["model"] == "openrouter/auto"
+    assert aux_memory["base_url"] == "https://openrouter.ai/api/v1"
+
+
+def test_ensure_auxiliary_memory_does_not_overwrite_existing(tmp_path):
+    """_ensure_auxiliary_memory never overwrites existing auxiliary.memory."""
+    from plugins.memory.cashew import _ensure_auxiliary_memory
+    config_yaml = tmp_path / "config.yaml"
+    config_yaml.write_text("""model:
+  provider: openrouter
+  default: openrouter/auto
+auxiliary:
+  memory:
+    provider: custom
+    model: custom-model
+""")
+    _ensure_auxiliary_memory(tmp_path)
+    import yaml
+    data = yaml.safe_load(config_yaml.read_text())
+    assert data["auxiliary"]["memory"]["provider"] == "custom"
+    assert data["auxiliary"]["memory"]["model"] == "custom-model"
+
+
+def test_ensure_config_file_called_from_initialize(tmp_path):
+    """initialize() writes cashew.json when none exists."""
+    p = CashewMemoryProvider()
+    assert not (tmp_path / "cashew.json").exists()
+    p.initialize("s", hermes_home=str(tmp_path))
+    try:
+        assert (tmp_path / "cashew.json").exists()
+    finally:
+        p.shutdown()

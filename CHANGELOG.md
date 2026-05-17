@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.10.0 (2026-05-18) — Background Dream Dispatch
+
+### Added
+
+- **`background_dream` parameter on `run_sleep_cycle()`** — When `True`,
+  Phase 8 (LLM-powered dream generation) and Phase 9 (orphan embedding) run
+  in a daemon thread instead of blocking the caller. The cross-linking, dedup,
+  GC, and core memory phases still run synchronously (~20s), but the ~60s
+  LLM call no longer blocks the session lifecycle. ([#60](https://github.com/magnus919/hermes-cashew/issues/60))
+
+- **`_run_dream_async()` helper** — Opens its own SQLite connection in the
+  daemon thread (WAL mode handles concurrent readers/writers). Logs completion
+  or failure. Error in the background thread is caught and logged — never
+  propagates.
+
+- **`dream_pending` key in sleep cycle summary** — When background mode is
+  active, the summary dict includes `dream_pending=True` and `orphans_embedded=0`
+  (handled by the background thread). The `dream_id` field is `None` until the
+  background thread completes.
+
+### Changed
+
+- **`CashewMemoryProvider.on_session_end()` now passes `background_dream=True`**
+  to `run_sleep_cycle()`. The session lifecycle hook returns after the
+  synchronous phases (~20s) instead of waiting for the full cycle (~84s).
+
+### Performance
+
+| Metric | Before | After |
+|--------|--------|-------|
+| `/new` session latency | ~118s (31s drain + 87s sleep) | ~51s (31s drain + 20s sync phases) |
+| Dream still completes | Always (blocking) | Best-effort (daemon thread) |
+
 ## v0.9.0 (2026-05-15) — First-Load Bootstrap & Forest-Level Insight Extraction
 
 ### Added

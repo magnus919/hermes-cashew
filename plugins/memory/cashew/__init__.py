@@ -530,12 +530,15 @@ class CashewMemoryProvider(MemoryProvider):
         import sqlite3
         conn = sqlite3.connect(str(db_path))
         try:
-            conn.enable_load_extension(True)
             try:
-                import sqlite_vec
-                sqlite_vec.load(conn)
-            except (ImportError, AttributeError):
-                conn.load_extension("vec0")
+                conn.enable_load_extension(True)
+                try:
+                    import sqlite_vec
+                    sqlite_vec.load(conn)
+                except (ImportError, AttributeError):
+                    conn.load_extension("vec0")
+            except Exception:
+                pass  # sqlite-vec not available; individual callers handle their own fallback
             self._migrate_vec_embeddings(conn)
             self._create_vec_embeddings(conn)
             # Hermes provider metadata store (persistent counters, flags)
@@ -942,6 +945,7 @@ class CashewMemoryProvider(MemoryProvider):
                     db_path=str(self._db_path),
                     limit=2000,
                     model_fn=self._model_fn,
+                    background_dream=True,
                 )
             except Exception:
                 logger.warning("sleep cycle failed", exc_info=True)

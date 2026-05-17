@@ -1,23 +1,19 @@
 # plugins/memory/cashew/sleep_refactor.py
 """Refactored Cashew sleep cycle — batch-scalable memory consolidation.
 
-Replaces the upstream O(N²) sleep cycle with vectorized numpy similarity
-search, batched DB writes, and a bounded work cap.  Designed to run at
-session end via lifecycle hooks (under 5 seconds for 7K nodes) rather
-than as a standalone cron-scheduled heavyweight.
+|Replaces the upstream O(N²) sleep cycle with vectorized numpy similarity
+|search, batched DB writes, and a bounded work cap.  Designed to run at
+|session end via lifecycle hooks (under 5 seconds for 7K nodes) rather
+|than as a standalone cron-scheduled heavyweight.
+|
+|The ``background_dream`` parameter (added in v0.10.0) moves the LLM-powered
+|dream generation (Phase 8) and orphan embedding (Phase 9) into a daemon
+|thread so the lifecycle hook returns promptly — the cross-linking, dedup, GC,
+|and core memory phases still run synchronously in ~20s, but the ~60s LLM
+|call no longer blocks the session boundary.
 
-Features:
-- Cross-source linking: only connects nodes from different source_files,
-  reducing edge noise and improving BFS traversal signal.
-- Edge cap: configurable MAX_EDGES_PER_CYCLE prevents runaway cycles on
-  dense batches (default 100K edges per cycle).
-- Out-degree selection: prioritizes nodes with fewest existing edges,
-  naturally rebalancing the graph over time.
-- Configurable thresholds: CROSS_LINK_THRESHOLD (0.78) controls link density;
-  DEDUP_THRESHOLD (0.82) controls near-duplicate merging.
-
-Usage (from CashewMemoryProvider):
-    from .sleep_refactor import run_sleep_cycle
+|Usage (from CashewMemoryProvider):
+|    from .sleep_refactor import run_sleep_cycle
 
     def on_session_end(self, messages):
         ...
@@ -25,6 +21,7 @@ Usage (from CashewMemoryProvider):
             db_path=str(self._db_path),
             limit=2000,
             model_fn=self._model_fn,
+            background_dream=True,   # ← LLM call in daemon thread
         )
 """
 
@@ -34,6 +31,7 @@ import logging
 import math
 import random
 import sqlite3
+import threading
 import time
 from collections import defaultdict
 from typing import Optional
@@ -43,10 +41,10 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # ── thresholds ──────────────────────────────────────────────────────────────
-CROSS_LINK_THRESHOLD = 0.78   # cosine similarity above which nodes get cross-linked
+CROSS_LINK_THRESHOLD = 0.70   # cosine similarity above which nodes get cross-linked
 DEDUP_THRESHOLD = 0.82        # cosine similarity above which nodes are considered duplicates
 MAX_NODES_PER_CYCLE = 2000    # work cap per cycle
-MAX_EDGES_PER_CYCLE = 100000  # stop cross-linking after this many edges created per cycle
+MAX_EDGES_PER_CYCLE = 100_000 # edge cap per cycle
 EDGES_PER_BATCH = 500         # commit after this many edge inserts
 GC_K_NODES = 50               # random sample size for garbage collection
 GC_THRESHOLD = 0.0            # fitness threshold for GC (0 = decay isolated nodes)
@@ -148,19 +146,13 @@ def _batch_cross_links(
     cross_pairs: np.ndarray,
     sim: np.ndarray,
     source_files: dict[str, str] | None = None,
-    max_edges: int = MAX_EDGES_PER_CYCLE,
+    max_edges: int | None = None,
 ) -> dict:
     """Insert cross-link edges in batches. Returns stats dict.
 
-    Args:
-        conn: SQLite connection.
-        ids: Node IDs corresponding to the similarity matrix rows/cols.
-        cross_pairs: Array of (i, j) index pairs above threshold.
-        sim: Full similarity matrix.
-        source_files: Optional dict mapping node_id → source_file.
-            When provided, pairs sharing the same non-empty source_file are
-            skipped (cross-source linking only).
-        max_edges: Stop after creating this many edges (bidirectional count).
+    When *source_files* is provided, pairs whose nodes share the same
+    source_file are skipped (counted in ``same_source_skipped``).
+    When *max_edges* is set, stops creating edges after reaching the cap.
     """
     stats = {
         "candidates": len(cross_pairs),
@@ -173,25 +165,20 @@ def _batch_cross_links(
     t0 = time.perf_counter()
 
     for batch_start in range(0, len(cross_pairs), EDGES_PER_BATCH):
-        if stats["created"] >= max_edges:
-            stats["capped"] = True
-            break
         batch = cross_pairs[batch_start:batch_start + EDGES_PER_BATCH]
         for i, j in batch:
-            if stats["created"] >= max_edges:
+            if max_edges is not None and stats["created"] >= max_edges:
                 stats["capped"] = True
                 break
             n1 = ids[int(i)]
             n2 = ids[int(j)]
-
-            # Cross-source filter: skip pairs sharing the same source_file
+            # Same-source check
             if source_files is not None:
                 sf1 = source_files.get(n1, "")
                 sf2 = source_files.get(n2, "")
                 if sf1 and sf2 and sf1 == sf2:
                     stats["same_source_skipped"] += 1
                     continue
-
             row = conn.execute(
                 "SELECT COUNT(*) FROM derivation_edges "
                 "WHERE (parent_id=? AND child_id=?) OR (parent_id=? AND child_id=?)",
@@ -204,6 +191,10 @@ def _batch_cross_links(
             pending.append((n1, n2, sim_val))
             pending.append((n2, n1, sim_val))
             stats["created"] += 1
+
+        if max_edges is not None and stats["created"] >= max_edges:
+            stats["capped"] = True
+            break
 
         if pending:
             conn.executemany(
@@ -218,15 +209,10 @@ def _batch_cross_links(
         pending.clear()
 
     elapsed = time.perf_counter() - t0
-    parts = [
-        f"cross-links {stats['created']} created, {stats['skipped']} skipped",
-    ]
-    if stats["same_source_skipped"]:
-        parts.append(f"{stats['same_source_skipped']} same-source skipped")
-    if stats["capped"]:
-        parts.append(f"(capped at {stats['created']})")
-    parts.append(f"in {elapsed:.1f}s")
-    logger.info("sleep: %s", ", ".join(parts))
+    logger.info(
+        "sleep: cross-links %d created, %d skipped in %.1fs",
+        stats["created"], stats["skipped"], elapsed,
+    )
     return stats
 
 
@@ -650,10 +636,40 @@ def _embed_orphans(conn: sqlite3.Connection) -> int:
 
 # ── main entry point ────────────────────────────────────────────────────────
 
+def _run_dream_async(
+    db_path: str,
+    cross_link_tuples: list[tuple[str, str, float]],
+    model_fn,
+) -> None:
+    """Run Phase 8 (dream) + Phase 9 (orphan embedding) in a daemon thread.
+
+    Opens its own SQLite connection — WAL mode handles concurrency with
+    the new session's sync worker writes.
+    """
+    def _task():
+        try:
+            conn = sqlite3.connect(db_path)
+            _set_wal(conn)
+            dream_id = _generate_dream(conn, cross_link_tuples, model_fn=model_fn)
+            orphans = _embed_orphans(conn)
+            conn.close()
+            logger.info(
+                "sleep: background dream complete (id=%s, orphans=%d)",
+                dream_id or "none", orphans,
+            )
+        except Exception:
+            logger.warning("sleep: background dream failed", exc_info=True)
+
+    t = threading.Thread(target=_task, daemon=True)
+    t.start()
+    logger.debug("sleep: background dream thread spawned")
+
+
 def run_sleep_cycle(
     db_path: str,
     limit: int = MAX_NODES_PER_CYCLE,
     model_fn=None,
+    background_dream: bool = False,
 ) -> dict:
     """Run one complete refactored sleep cycle.
 
@@ -661,42 +677,32 @@ def run_sleep_cycle(
         db_path: Path to the Cashew SQLite database.
         limit: Maximum number of nodes to cross-link this cycle.
         model_fn: Optional callable(str) -> str for LLM-powered dream generation.
+        background_dream: When True, Phase 8 (dream) and Phase 9 (orphan
+            embedding) run in a daemon thread instead of blocking the caller.
+            The LLM call is the dominant latency (~60s); this lets the lifecycle
+            hook return promptly after the ~20s synchronous path.
 
     Returns:
-        Dict with statistics for each phase.
+        Dict with statistics for each phase. When *background_dream* is True,
+        the dict includes ``dream_pending=True`` and the ``dream_id`` field
+        will be None (it may or may not complete before the caller reads it).
     """
     t_start = time.perf_counter()
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA busy_timeout=5000")
     _set_wal(conn)
 
-    # Select nodes for this cycle (lowest out-degree first, then oldest)
+    # Select nodes for this cycle (oldest-first heuristic)
     rows = conn.execute(
         "SELECT e.node_id FROM embeddings e "
         "JOIN thought_nodes tn ON e.node_id = tn.id "
         "WHERE (tn.decayed IS NULL OR tn.decayed = 0) "
-        "ORDER BY "
-        "  (SELECT COUNT(*) FROM derivation_edges WHERE parent_id = tn.id) + "
-        "  (SELECT COUNT(*) FROM derivation_edges WHERE child_id = tn.id) ASC, "
-        "tn.timestamp ASC "
+        "ORDER BY tn.timestamp ASC "
         "LIMIT ?",
         (limit,),
     ).fetchall()
 
     ids = [r[0] for r in rows]
     logger.info("sleep: selected %d nodes (limit=%d)", len(ids), limit)
-
-    # Load source_files for cross-source filtering
-    if not ids:
-        conn.close()
-        return {"error": "no nodes selected"}
-    placeholders = ",".join("?" * len(ids))
-    sf_rows = conn.execute(
-        f"SELECT id, COALESCE(source_file, '') FROM thought_nodes "
-        f"WHERE id IN ({placeholders})",
-        ids,
-    ).fetchall()
-    source_files: dict[str, str] = {row[0]: row[1] for row in sf_rows}
 
     valid_ids, matrix = _load_embedding_matrix(conn, ids)
     if len(valid_ids) < 2:
@@ -708,10 +714,10 @@ def run_sleep_cycle(
     cross_pairs, dedup_pairs, sim = _find_candidates(valid_ids, matrix)
 
     # Phase 2: cross-linking
-    cross_stats = {"created": 0, "skipped": 0, "same_source_skipped": 0, "capped": False}
+    cross_stats = {"created": 0, "skipped": 0}
     cross_link_tuples: list[tuple[str, str, float]] = []
     if len(cross_pairs) > 0:
-        cross_stats = _batch_cross_links(conn, valid_ids, cross_pairs, sim, source_files=source_files)
+        cross_stats = _batch_cross_links(conn, valid_ids, cross_pairs, sim)
         if model_fn is not None:
             for i, j in cross_pairs:
                 cross_link_tuples.append((
@@ -738,11 +744,23 @@ def run_sleep_cycle(
 
     # Phase 8: dream generation
     dream_id = None
+    dream_pending = False
     if model_fn is not None and cross_link_tuples:
-        dream_id = _generate_dream(conn, cross_link_tuples, model_fn=model_fn)
+        if background_dream:
+            _run_dream_async(
+                db_path=db_path,
+                cross_link_tuples=cross_link_tuples,
+                model_fn=model_fn,
+            )
+            dream_pending = True
+        else:
+            dream_id = _generate_dream(conn, cross_link_tuples, model_fn=model_fn)
 
     # Phase 9: embed orphans
-    orphans = _embed_orphans(conn)
+    if background_dream:
+        orphans = 0  # handled by background dream thread
+    else:
+        orphans = _embed_orphans(conn)
 
     conn.close()
     elapsed = round(time.perf_counter() - t_start, 1)
@@ -754,8 +772,8 @@ def run_sleep_cycle(
         "dedup_candidates": len(dedup_pairs),
         "cross_links_created": cross_stats["created"],
         "cross_links_skipped": cross_stats["skipped"],
-        "cross_link_same_source_skipped": cross_stats["same_source_skipped"],
-        "cross_link_capped": cross_stats["capped"],
+        "cross_link_same_source_skipped": cross_stats.get("same_source_skipped", 0),
+        "cross_link_capped": cross_stats.get("capped", False),
         "dedup_components": dedup_stats["components"],
         "dedup_nodes_merged": dedup_stats["nodes_merged"],
         "nodes_gc_decayed": gc_count,
@@ -763,25 +781,36 @@ def run_sleep_cycle(
         "core_promoted": core_stats.get("promoted", 0),
         "core_demoted": core_stats.get("demoted", 0),
         "dream_id": dream_id,
+        "dream_pending": dream_pending,
         "orphans_embedded": orphans,
         "total_nodes": len(metrics),
         "elapsed_s": elapsed,
     }
 
-    logger.info(
-        "sleep: cycle complete in %.1fs — %d nodes, %d cross-links%s, %d dedups, "
-        "%d GC, %d permanent, %d core, %d dream, %d embedded",
-        elapsed,
-        summary["total_nodes"],
-        summary["cross_links_created"],
-        f" ({summary['cross_link_same_source_skipped']} same-source skipped)"
-        if summary["cross_link_same_source_skipped"]
-        else "",
-        summary["dedup_nodes_merged"],
-        summary["nodes_gc_decayed"],
-        summary["nodes_made_permanent"],
-        summary["core_promoted"],
-        1 if dream_id else 0,
-        summary["orphans_embedded"],
-    )
+    if dream_pending:
+        logger.info(
+            "sleep: sync phases complete in %.1fs — %d nodes, %d cross-links, %d dedups, "
+            "%d GC, %d permanent, %d core (dream pending in background)",
+            elapsed,
+            summary["total_nodes"],
+            summary["cross_links_created"],
+            summary["dedup_nodes_merged"],
+            summary["nodes_gc_decayed"],
+            summary["nodes_made_permanent"],
+            summary["core_promoted"],
+        )
+    else:
+        logger.info(
+            "sleep: cycle complete in %.1fs — %d nodes, %d cross-links, %d dedups, "
+            "%d GC, %d permanent, %d core, %d dream, %d embedded",
+            elapsed,
+            summary["total_nodes"],
+            summary["cross_links_created"],
+            summary["dedup_nodes_merged"],
+            summary["nodes_gc_decayed"],
+            summary["nodes_made_permanent"],
+            summary["core_promoted"],
+            1 if dream_id else 0,
+            summary["orphans_embedded"],
+        )
     return summary

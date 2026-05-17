@@ -797,7 +797,7 @@ def test_on_session_end_triggers_sleep_cycle(tmp_path, monkeypatch):
 
     # Mock run_sleep_cycle to verify it's called
     call_log = []
-    def fake_run_sleep(db_path, limit=2000, model_fn=None):
+    def fake_run_sleep(db_path, limit=2000, model_fn=None, **kwargs):
         call_log.append({"db_path": db_path, "limit": limit, "model_fn": model_fn})
         return {"total_nodes": 5, "elapsed_s": 0.1}
 

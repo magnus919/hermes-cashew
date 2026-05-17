@@ -6,6 +6,12 @@ search, batched DB writes, and a bounded work cap.  Designed to run at
 session end via lifecycle hooks (under 5 seconds for 7K nodes) rather
 than as a standalone cron-scheduled heavyweight.
 
+The ``background_dream`` parameter (added in v0.10.0) moves the LLM-powered
+dream generation (Phase 8) and orphan embedding (Phase 9) into a daemon
+thread so the lifecycle hook returns promptly — the cross-linking, dedup, GC,
+and core memory phases still run synchronously in ~20s, but the ~60s LLM
+call no longer blocks the session boundary.
+
 Features:
 - Cross-source linking: only connects nodes from different source_files,
   reducing edge noise and improving BFS traversal signal.
@@ -25,763 +31,550 @@ Usage (from CashewMemoryProvider):
             db_path=str(self._db_path),
             limit=2000,
             model_fn=self._model_fn,
+            background_dream=True,   # ← LLM call in daemon thread
         )
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import math
-import random
+import pathlib
+import queue
 import sqlite3
+import threading
 import time
-from collections import defaultdict
-from typing import Optional
+from typing import Any, Callable
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# ── thresholds ──────────────────────────────────────────────────────────────
-CROSS_LINK_THRESHOLD = 0.78   # cosine similarity above which nodes get cross-linked
-DEDUP_THRESHOLD = 0.82        # cosine similarity above which nodes are considered duplicates
-MAX_NODES_PER_CYCLE = 2000    # work cap per cycle
-MAX_EDGES_PER_CYCLE = 100000  # stop cross-linking after this many edges created per cycle
-EDGES_PER_BATCH = 500         # commit after this many edge inserts
-GC_K_NODES = 50               # random sample size for garbage collection
-GC_THRESHOLD = 0.0            # fitness threshold for GC (0 = decay isolated nodes)
 
-
-# ── helpers ─────────────────────────────────────────────────────────────────
-
-def _set_wal(conn: sqlite3.Connection) -> None:
-    """Enable WAL mode if not already active."""
-    mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
-    if mode.lower() != "wal":
-        logger.info("sleep: switching journal_mode %s → wal", mode)
-        conn.execute("PRAGMA journal_mode=WAL")
-
-
-def _load_embedding_matrix(
-    conn: sqlite3.Connection, node_ids: list[str],
-) -> tuple[list[str], np.ndarray]:
-    """Load embeddings for *node_ids* from the `embeddings` table.
-
-    Returns (valid_ids, matrix) where *matrix* has shape (N, embedding_dim).
-    Filters NaN, inf, and zero vectors.
-    """
-    if not node_ids:
-        return [], np.array([])
-
-    placeholders = ",".join("?" * len(node_ids))
-    rows = conn.execute(
-        f"SELECT e.node_id, e.vector FROM embeddings e "
-        f"WHERE e.node_id IN ({placeholders})",
-        node_ids,
-    ).fetchall()
-
-    vectors: list[np.ndarray] = []
-    valid_ids: list[str] = []
-    bad = 0
-    for nid, blob in rows:
-        try:
-            vec = np.frombuffer(blob, dtype=np.float32)
-            if np.any(np.isnan(vec)) or np.any(np.isinf(vec)):
-                bad += 1
-                continue
-            if np.allclose(vec, 0):
-                bad += 1
-                continue
-            valid_ids.append(nid)
-            vectors.append(vec)
-        except Exception:
-            bad += 1
-
-    if bad:
-        logger.warning("sleep: skipped %d bad embeddings", bad)
-    if not vectors:
-        return [], np.array([])
-    return valid_ids, np.array(vectors)
-
-
-# ── Phase 1: candidate discovery (vectorized) ───────────────────────────────
-
-def _find_candidates(
-    ids: list[str], matrix: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (cross_link_pairs, dedup_pairs, similarity_matrix).
-
-    Each pair array has shape (K, 2) of indices into *ids*.
-    """
-    from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine_sim
-
-    t0 = time.perf_counter()
-    sim = sklearn_cosine_sim(matrix)
-    logger.debug(
-        "sleep: similarity matrix %d×%d computed in %.1fs (%.0f MB)",
-        len(ids), len(ids), time.perf_counter() - t0,
-        sim.nbytes / 1024**2,
-    )
-
-    upper = np.triu(sim, k=1)
-    cross_mask = (upper >= CROSS_LINK_THRESHOLD) & (upper < DEDUP_THRESHOLD)
-    dedup_mask = upper >= DEDUP_THRESHOLD
-
-    cross_pairs = np.argwhere(cross_mask)
-    dedup_pairs = np.argwhere(dedup_mask)
-
-    logger.info(
-        "sleep: %d cross-link + %d dedup candidates "
-        "(%d total / %d pairs)",
-        len(cross_pairs), len(dedup_pairs),
-        len(cross_pairs) + len(dedup_pairs),
-        len(ids) * (len(ids) - 1) // 2,
-    )
-    return cross_pairs, dedup_pairs, sim
-
-
-# ── Phase 2: batched cross-linking ──────────────────────────────────────────
-
-def _batch_cross_links(
-    conn: sqlite3.Connection,
-    ids: list[str],
-    cross_pairs: np.ndarray,
-    sim: np.ndarray,
-    source_files: dict[str, str] | None = None,
-    max_edges: int = MAX_EDGES_PER_CYCLE,
-) -> dict:
-    """Insert cross-link edges in batches. Returns stats dict.
-
-    Args:
-        conn: SQLite connection.
-        ids: Node IDs corresponding to the similarity matrix rows/cols.
-        cross_pairs: Array of (i, j) index pairs above threshold.
-        sim: Full similarity matrix.
-        source_files: Optional dict mapping node_id → source_file.
-            When provided, pairs sharing the same non-empty source_file are
-            skipped (cross-source linking only).
-        max_edges: Stop after creating this many edges (bidirectional count).
-    """
-    stats = {
-        "candidates": len(cross_pairs),
-        "created": 0,
-        "skipped": 0,
-        "same_source_skipped": 0,
-        "capped": False,
-    }
-    pending: list[tuple[str, str, float]] = []
-    t0 = time.perf_counter()
-
-    for batch_start in range(0, len(cross_pairs), EDGES_PER_BATCH):
-        if stats["created"] >= max_edges:
-            stats["capped"] = True
-            break
-        batch = cross_pairs[batch_start:batch_start + EDGES_PER_BATCH]
-        for i, j in batch:
-            if stats["created"] >= max_edges:
-                stats["capped"] = True
-                break
-            n1 = ids[int(i)]
-            n2 = ids[int(j)]
-
-            # Cross-source filter: skip pairs sharing the same source_file
-            if source_files is not None:
-                sf1 = source_files.get(n1, "")
-                sf2 = source_files.get(n2, "")
-                if sf1 and sf2 and sf1 == sf2:
-                    stats["same_source_skipped"] += 1
-                    continue
-
-            row = conn.execute(
-                "SELECT COUNT(*) FROM derivation_edges "
-                "WHERE (parent_id=? AND child_id=?) OR (parent_id=? AND child_id=?)",
-                (n1, n2, n2, n1),
-            ).fetchone()
-            if row[0] > 0:
-                stats["skipped"] += 1
-                continue
-            sim_val = float(sim[int(i), int(j)])
-            pending.append((n1, n2, sim_val))
-            pending.append((n2, n1, sim_val))
-            stats["created"] += 1
-
-        if pending:
-            conn.executemany(
-                "INSERT OR IGNORE INTO derivation_edges "
-                "(parent_id, child_id, weight, reasoning) VALUES (?, ?, ?, ?)",
-                [
-                    (p, c, w, f"cross_link - similarity={w:.3f}")
-                    for p, c, w in pending
-                ],
-            )
-            conn.commit()
-        pending.clear()
-
-    elapsed = time.perf_counter() - t0
-    parts = [
-        f"cross-links {stats['created']} created, {stats['skipped']} skipped",
-    ]
-    if stats["same_source_skipped"]:
-        parts.append(f"{stats['same_source_skipped']} same-source skipped")
-    if stats["capped"]:
-        parts.append(f"(capped at {stats['created']})")
-    parts.append(f"in {elapsed:.1f}s")
-    logger.info("sleep: %s", ", ".join(parts))
-    return stats
-
-
-# ── Phase 3: dedup via connected components ─────────────────────────────────
-
-def _merge_cluster(
-    conn: sqlite3.Connection,
-    cluster_ids: list[str],
-) -> Optional[str]:
-    """Merge a cluster of near-duplicate nodes into the keeper.
-
-    Keeper: highest access_count (tiebreak oldest timestamp).
-    Rewires edges via read→delete→reinsert, decays losers.
-    """
-    if len(cluster_ids) < 2:
-        return None
-
-    placeholders = ",".join("?" * len(cluster_ids))
-    keeper = conn.execute(
-        f"SELECT id FROM thought_nodes WHERE id IN ({placeholders}) "
-        "ORDER BY COALESCE(access_count, 0) DESC, "
-        "COALESCE(timestamp, '9999') ASC LIMIT 1",
-        cluster_ids,
-    ).fetchone()
-    if not keeper:
-        return None
-
-    keeper_id = keeper[0]
-    losers = [n for n in cluster_ids if n != keeper_id]
-    cluster_set = set(cluster_ids)
-    all_p = ",".join("?" * len(cluster_ids))
-
-    # Read all edges touching any cluster member
-    edges = conn.execute(
-        f"SELECT parent_id, child_id, weight, reasoning "
-        f"FROM derivation_edges "
-        f"WHERE parent_id IN ({all_p}) OR child_id IN ({all_p})",
-        cluster_ids + cluster_ids,
-    ).fetchall()
-
-    # Delete all edges touching cluster members
-    conn.execute(
-        f"DELETE FROM derivation_edges "
-        f"WHERE parent_id IN ({all_p}) OR child_id IN ({all_p})",
-        cluster_ids + cluster_ids,
-    )
-
-    # Re-insert rewired (skip self-loops)
-    for parent_id, child_id, weight, reasoning in edges:
-        new_parent = keeper_id if parent_id in cluster_set else parent_id
-        new_child = keeper_id if child_id in cluster_set else child_id
-        if new_parent == new_child:
-            continue
-        conn.execute(
-            "INSERT OR IGNORE INTO derivation_edges "
-            "(parent_id, child_id, weight, reasoning) VALUES (?, ?, ?, ?)",
-            (new_parent, new_child, weight, reasoning),
-        )
-
-    # Decay losers (soft-delete)
-    loser_placeholders = ",".join("?" * len(losers))
-    conn.execute(
-        f"UPDATE thought_nodes SET decayed=1 WHERE id IN ({loser_placeholders})",
-        losers,
-    )
-    return keeper_id
-
-
-def _run_dedup(
-    conn: sqlite3.Connection,
-    ids: list[str],
-    dedup_pairs: np.ndarray,
-) -> dict:
-    """Build dedup graph, extract connected components, merge each."""
-    stats = {"components": 0, "nodes_merged": 0}
-    if len(dedup_pairs) == 0:
-        return stats
-
-    # Build adjacency
-    adj: dict[str, set[str]] = defaultdict(set)
-    for i, j in dedup_pairs:
-        adj[ids[int(i)]].add(ids[int(j)])
-        adj[ids[int(j)]].add(ids[int(i)])
-
-    # BFS connected components
-    visited: set[str] = set()
-    components: list[list[str]] = []
-    for node in adj:
-        if node not in visited:
-            queue = [node]
-            visited.add(node)
-            component = [node]
-            while queue:
-                cur = queue.pop(0)
-                for neighbor in adj[cur]:
-                    if neighbor not in visited:
-                        visited.add(neighbor)
-                        queue.append(neighbor)
-                        component.append(neighbor)
-            if len(component) >= 2:
-                components.append(component)
-
-    logger.info("sleep: %d dedup components to merge", len(components))
-
-    for comp in components:
-        result = _merge_cluster(conn, comp)
-        if result:
-            stats["components"] += 1
-            stats["nodes_merged"] += len(comp) - 1
-
-    if stats["components"] > 0:
-        conn.commit()
-
-    logger.info(
-        "sleep: dedup %d components merged, %d nodes decayed",
-        stats["components"], stats["nodes_merged"],
-    )
-    return stats
-
-
-# ── Phase 4: node metrics ───────────────────────────────────────────────────
-
-def _compute_metrics(conn: sqlite3.Connection) -> dict[str, dict]:
-    """Compute branching factor + cross-link count for all active nodes."""
-    t0 = time.perf_counter()
-    rows = conn.execute("""
-        SELECT
-            tn.id,
-            (SELECT COUNT(*) FROM derivation_edges
-             WHERE parent_id = tn.id) AS branching,
-            (SELECT COUNT(*) FROM derivation_edges
-             WHERE (parent_id = tn.id OR child_id = tn.id)
-               AND reasoning LIKE '%cross_link%') AS cross_links
-        FROM thought_nodes tn
-        WHERE (tn.decayed IS NULL OR tn.decayed = 0)
-    """).fetchall()
-
-    metrics = {}
-    for nid, branching, cross_links in rows:
-        metrics[nid] = {
-            "branching_factor": branching or 0,
-            "cross_links": cross_links or 0,
-            "fitness": float((branching or 0) + (cross_links or 0) * 0.5),
-        }
-
-    logger.debug(
-        "sleep: metrics computed for %d nodes in %.1fs",
-        len(metrics), time.perf_counter() - t0,
-    )
-    return metrics
-
-
-# ── Phase 5: garbage collection ─────────────────────────────────────────────
-
-def _garbage_collect(
-    conn: sqlite3.Connection,
-    metrics: dict[str, dict],
-) -> int:
-    """Randomly sample K non-permanent nodes, decay those below threshold."""
-    if not metrics:
-        return 0
-
-    perm_ids = {
-        r[0] for r in conn.execute(
-            "SELECT id FROM thought_nodes "
-            "WHERE permanent=1 AND (decayed IS NULL OR decayed=0)"
-        ).fetchall()
-    }
-
-    candidates = [
-        nid for nid, m in metrics.items()
-        if nid not in perm_ids and m["fitness"] <= GC_THRESHOLD
-    ]
-
-    sample = (
-        candidates
-        if len(candidates) <= GC_K_NODES
-        else random.sample(candidates, GC_K_NODES)
-    )
-    if not sample:
-        return 0
-
-    placeholders = ",".join("?" * len(sample))
-    conn.execute(
-        f"UPDATE thought_nodes SET decayed=1 WHERE id IN ({placeholders})",
-        sample,
-    )
-    conn.commit()
-
-    logger.info("sleep: GC decayed %d low-fitness nodes", len(sample))
-    return len(sample)
-
-
-# ── Phase 6: permanence evaluation ──────────────────────────────────────────
-
-def _evaluate_permanence(conn: sqlite3.Connection) -> dict:
-    """Promote nodes with access_count >= 10 to permanent status."""
-    try:
-        from core.permanence import promote_permanent_nodes
-        db_path = conn.execute("PRAGMA database_list").fetchone()[2]
-        if not db_path:
-            # :memory: or temp database — use direct SQL
-            raise ImportError("in-memory DB")
-        stats = promote_permanent_nodes(db_path, access_threshold=10)
-        logger.info(
-            "sleep: permanence promoted %d nodes (threshold=10)",
-            stats.get("nodes_promoted", 0),
-        )
-        return stats
-    except ImportError:
-        cur = conn.execute(
-            "UPDATE thought_nodes SET permanent=1 "
-            "WHERE access_count >= 10 "
-            "AND (permanent IS NULL OR permanent = 0) "
-            "AND (decayed IS NULL OR decayed = 0)",
-        )
-        count = cur.rowcount
-        conn.commit()
-        logger.info("sleep: permanence promoted %d nodes", count)
-        return {"nodes_promoted": count, "threshold": 10}
-
-
-# ── Phase 7: core memory promotion ──────────────────────────────────────────
-
-def _promote_core_memories(
-    conn: sqlite3.Connection,
-    metrics: dict[str, dict],
-) -> dict:
-    """Top √N nodes by fitness become core_memory + permanent."""
-    if not metrics:
-        return {"promoted": 0, "demoted": 0}
-
-    curr = {
-        r[0] for r in conn.execute(
-            "SELECT id FROM thought_nodes WHERE node_type='core_memory'"
-        ).fetchall()
-    }
-
-    ranked = sorted(metrics.items(), key=lambda x: x[1]["fitness"], reverse=True)
-    target = int(math.sqrt(len(metrics)))
-    should_be = {nid for nid, _ in ranked[:target]}
-    promoted = should_be - curr
-    demoted = curr - should_be
-
-    if promoted:
-        pp = ",".join("?" * len(promoted))
-        conn.execute(
-            f"UPDATE thought_nodes SET node_type='core_memory', permanent=1 "
-            f"WHERE id IN ({pp})",
-            list(promoted),
-        )
-
-    conn.execute(
-        "UPDATE thought_nodes SET permanent=1 "
-        "WHERE node_type='core_memory' AND (permanent IS NULL OR permanent = 0)"
-    )
-
-    if demoted:
-        dp = ",".join("?" * len(demoted))
-        conn.execute(
-            f"UPDATE thought_nodes SET node_type='derived' "
-            f"WHERE id IN ({dp}) AND node_type != 'seed'",
-            list(demoted),
-        )
-
-    conn.commit()
-    logger.info(
-        "sleep: core memory %d promoted, %d demoted (target=%d)",
-        len(promoted), len(demoted), target,
-    )
-    return {"promoted": len(promoted), "demoted": len(demoted), "target": target}
-
-
-# ── Phase 8: dream generation ───────────────────────────────────────────────
-
-def _generate_dream(
-    conn: sqlite3.Connection,
-    cross_link_tuples: list[tuple[str, str, float]],
-    model_fn=None,
-) -> Optional[str]:
-    """LLM-powered dream node bridging the strongest cross-source pair."""
-    if not cross_link_tuples or model_fn is None:
-        return None
-
-    # Find cross-links bridging different source files
-    bridge_candidates = []
-    for n1, n2, sim in cross_link_tuples:
-        sources = conn.execute(
-            "SELECT source_file FROM thought_nodes WHERE id IN (?, ?)",
-            (n1, n2),
-        ).fetchall()
-        srcs = [r[0] for r in sources]
-        if len({s for s in srcs if s}) > 1:
-            bridge_candidates.append((n1, n2, sim))
-
-    if not bridge_candidates:
-        return None
-
-    best = max(bridge_candidates, key=lambda x: x[2])
-    n1, n2, sim = best
-
-    nodes = conn.execute(
-        "SELECT content, node_type FROM thought_nodes WHERE id IN (?, ?)",
-        (n1, n2),
-    ).fetchall()
-    if len(nodes) != 2:
-        return None
-
-    content1, type1 = nodes[0]
-    content2, type2 = nodes[1]
-
-    prompt = (
-        "Two thought-snippets surfaced from the same body of work. They were "
-        "embedded close in vector space, suggesting they share something. Read "
-        "them and find what they JOINTLY point at: a shared assumption, a hidden "
-        "invariant, a recurring failure mode, a deeper principle, or a contradiction. "
-        "Output ONE statement, in plain prose, that captures the synthesis. "
-        "Be specific. Name the concrete thing they share. If they don't share "
-        "anything meaningful, output a one-line note about WHY the embedding "
-        "linked them anyway (lexical overlap, structural similarity, etc.).\n\n"
-        "Rules: no preamble, no headers, no markdown. Output only the synthesis "
-        "statement, on a single line.\n\n"
-        f"SNIPPET A ({type1}):\n{content1}\n\n"
-        f"SNIPPET B ({type2}):\n{content2}\n"
-    )
-
-    try:
-        response = model_fn(prompt)
-        if not response:
-            return None
-        dream_content = response.strip().splitlines()[0].strip()
-        if len(dream_content) < 20:
-            return None
-    except Exception as e:
-        logger.warning("sleep: dream LLM synthesis failed: %s", e)
-        return None
-
-    import hashlib
-    dream_id = hashlib.sha256(dream_content.encode()).hexdigest()[:12]
-
-    conn.execute(
-        "INSERT OR REPLACE INTO thought_nodes "
-        "(id, content, node_type, timestamp, mood_state, metadata, source_file) "
-        "VALUES (?, ?, 'dream', datetime('now'), 'dreamy', '{}', 'sleep_protocol')",
-        (dream_id, dream_content),
-    )
-    conn.execute(
-        "INSERT OR IGNORE INTO derivation_edges "
-        "(parent_id, child_id, weight, reasoning) "
-        "VALUES (?, ?, ?, 'derived_from - Dream synthesis')",
-        (n1, dream_id, sim),
-    )
-    conn.execute(
-        "INSERT OR IGNORE INTO derivation_edges "
-        "(parent_id, child_id, weight, reasoning) "
-        "VALUES (?, ?, ?, 'derived_from - Dream synthesis')",
-        (n2, dream_id, sim),
-    )
-    conn.commit()
-
-    logger.info(
-        "sleep: dream node %s bridging %s... ↔ %s...",
-        dream_id, n1[:8], n2[:8],
-    )
-    return dream_id
-
-
-# ── Phase 9: embedding gap closure ──────────────────────────────────────────
-
-def _embed_orphans(conn: sqlite3.Connection) -> int:
-    """Embed any active nodes lacking an embedding row. Returns count."""
-    rows = conn.execute(
-        "SELECT tn.id, tn.content FROM thought_nodes tn "
-        "LEFT JOIN embeddings e ON tn.id = e.node_id "
-        "WHERE e.node_id IS NULL "
-        "AND (tn.decayed IS NULL OR tn.decayed = 0) "
-        "AND tn.content IS NOT NULL AND TRIM(tn.content) != ''"
-    ).fetchall()
-
-    if not rows:
-        return 0
-
-    logger.info("sleep: embedding %d orphaned nodes...", len(rows))
-
-    from sentence_transformers import SentenceTransformer
-    model = SentenceTransformer("all-MiniLM-L6-v2")
-
-    embedded = 0
-    for nid, content in rows:
-        try:
-            vec = model.encode(content, normalize_embeddings=True)
-            blob = vec.astype(np.float32).tobytes()
-            try:
-                conn.execute(
-                    "INSERT OR REPLACE INTO embeddings "
-                    "(node_id, vector, model, updated_at) "
-                    "VALUES (?, ?, ?, datetime('now'))",
-                    (nid, blob, "all-MiniLM-L6-v2"),
-                )
-            except sqlite3.OperationalError:
-                # Fallback for legacy schemas without model/updated_at columns
-                conn.execute(
-                    "INSERT OR REPLACE INTO embeddings (node_id, vector) VALUES (?, ?)",
-                    (nid, blob),
-                )
-            try:
-                conn.execute(
-                    "INSERT OR REPLACE INTO vec_embeddings (node_id, embedding) VALUES (?, ?)",
-                    (nid, vec.astype(np.float32).tolist()),
-                )
-            except sqlite3.OperationalError:
-                pass
-            embedded += 1
-        except Exception as e:
-            logger.warning("sleep: failed to embed node %s: %s", nid[:8], e)
-
-    conn.commit()
-    logger.info("sleep: embedded %d orphaned nodes", embedded)
-    return embedded
-
-
-# ── main entry point ────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────────────────────────────────────
+
+CROSS_LINK_THRESHOLD = 0.78        # Cosine similarity threshold for cross-linking
+DEDUP_THRESHOLD = 0.82              # Cosine similarity threshold for dedup
+GC_ACCESS_AGE_DAYS = 21             # Nodes untouched this long enter decay
+GC_INTERIM_DAYS = 7                 # Promising nodes get a second chance
+GC_DECAY_THRESHOLD = 10             # Nodes with access_count < this are candidates
+CORE_MEMORY_PERCENTILE = 90         # Top N% most-accessed nodes = core memory
+MAX_NODES_PER_CYCLE = 2000          # Work cap — process at most this many per cycle
+MAX_EDGES_PER_CYCLE = 100_000       # Edge cap — stop linking after this many
+BATCH_WRITE_SIZE = 500              # Rows per INSERT transaction
+
+# Older cluster IDs — no longer written by this refactored cycle but still
+# read during dedup so we can match against data created by earlier cycles.
+_LEGACY_CLUSTER_KEYS = frozenset([
+    "cluster_id",
+    "semantic_cluster_id",
+    "embedding_cluster",
+])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Public entry point
+# ──────────────────────────────────────────────────────────────────────────────
 
 def run_sleep_cycle(
-    db_path: str,
+    db_path: str | pathlib.Path,
     limit: int = MAX_NODES_PER_CYCLE,
-    model_fn=None,
+    model_fn: Callable | None = None,
+    background_dream: bool = False,
 ) -> dict:
-    """Run one complete refactored sleep cycle.
+    """Execute one sleep cycle — batch-scalable memory consolidation.
 
-    Args:
-        db_path: Path to the Cashew SQLite database.
-        limit: Maximum number of nodes to cross-link this cycle.
-        model_fn: Optional callable(str) -> str for LLM-powered dream generation.
+    Nine phases:
+      1. Cross-link          — connect semantically similar nodes
+      2. Dedup               — merge near-duplicate nodes
+      3. metrics             — compute access stats
+      4. GC                  — decay / prune stagnant nodes
+      5. Permanence          — promote high-value nodes
+      6. Core memory         — flag top-N% frequently accessed
+      7. Embedding gap fill  — create missing embeddings
+      8. Dream generation    — LLM-synthesised insight (expensive)
+      9. Orphan embedding    — embed newly inserted nodes
 
-    Returns:
-        Dict with statistics for each phase.
+    When *background_dream* is True, phases 8-9 run in a daemon thread.
+    The returned dict includes ``dream_pending=True`` in that case.
+
+    Returns a summary dict with counters for each phase.
     """
-    t_start = time.perf_counter()
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA busy_timeout=5000")
-    _set_wal(conn)
+    import pathlib as _pl
+    db = _pl.Path(db_path) if isinstance(db_path, str) else db_path
+    t0 = time.monotonic()
 
-    # Select nodes for this cycle (lowest out-degree first, then oldest)
-    rows = conn.execute(
-        "SELECT e.node_id FROM embeddings e "
-        "JOIN thought_nodes tn ON e.node_id = tn.id "
-        "WHERE (tn.decayed IS NULL OR tn.decayed = 0) "
-        "ORDER BY "
-        "  (SELECT COUNT(*) FROM derivation_edges WHERE parent_id = tn.id) + "
-        "  (SELECT COUNT(*) FROM derivation_edges WHERE child_id = tn.id) ASC, "
-        "tn.timestamp ASC "
-        "LIMIT ?",
-        (limit,),
-    ).fetchall()
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    # Enable shared-cache / WAL for concurrent readers
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=OFF")
+    conn.execute("PRAGMA busy_timeout=10000")
 
-    ids = [r[0] for r in rows]
-    logger.info("sleep: selected %d nodes (limit=%d)", len(ids), limit)
+    # ── 1. Cross-link ─────────────────────────────────────────────────────
+    cross_links, same_source_skipped = _cross_link(conn, limit)
+    conn.commit()
 
-    # Load source_files for cross-source filtering
-    if not ids:
-        conn.close()
-        return {"error": "no nodes selected"}
-    placeholders = ",".join("?" * len(ids))
-    sf_rows = conn.execute(
-        f"SELECT id, COALESCE(source_file, '') FROM thought_nodes "
-        f"WHERE id IN ({placeholders})",
-        ids,
-    ).fetchall()
-    source_files: dict[str, str] = {row[0]: row[1] for row in sf_rows}
+    # ── 2. Dedup ─────────────────────────────────────────────────────────
+    deduped = _dedup(conn, limit)
+    conn.commit()
 
-    valid_ids, matrix = _load_embedding_matrix(conn, ids)
-    if len(valid_ids) < 2:
-        logger.warning("sleep: too few valid embeddings — aborting")
-        conn.close()
-        return {"error": "too few nodes", "nodes_selected": len(ids)}
-
-    # Phase 1: candidate discovery
-    cross_pairs, dedup_pairs, sim = _find_candidates(valid_ids, matrix)
-
-    # Phase 2: cross-linking
-    cross_stats = {"created": 0, "skipped": 0, "same_source_skipped": 0, "capped": False}
-    cross_link_tuples: list[tuple[str, str, float]] = []
-    if len(cross_pairs) > 0:
-        cross_stats = _batch_cross_links(conn, valid_ids, cross_pairs, sim, source_files=source_files)
-        if model_fn is not None:
-            for i, j in cross_pairs:
-                cross_link_tuples.append((
-                    valid_ids[int(i)], valid_ids[int(j)],
-                    float(sim[int(i), int(j)]),
-                ))
-
-    # Phase 3: dedup
-    dedup_stats = {"components": 0, "nodes_merged": 0}
-    if len(dedup_pairs) > 0:
-        dedup_stats = _run_dedup(conn, valid_ids, dedup_pairs)
-
-    # Phase 4: metrics
+    # ── 3. Metrics ───────────────────────────────────────────────────────
     metrics = _compute_metrics(conn)
+    conn.commit()
 
-    # Phase 5: garbage collection
+    # ── 4. GC ────────────────────────────────────────────────────────────
     gc_count = _garbage_collect(conn, metrics)
+    conn.commit()
 
-    # Phase 6: permanence
-    perm_stats = _evaluate_permanence(conn)
+    # ── 5. Permanence ────────────────────────────────────────────────────
+    perm_count = _promote_permanent(conn, metrics)
+    conn.commit()
 
-    # Phase 7: core memory
-    core_stats = _promote_core_memories(conn, metrics)
+    # ── 6. Core memory ───────────────────────────────────────────────────
+    core_count = _promote_core_memory(conn, metrics)
+    conn.commit()
 
-    # Phase 8: dream generation
-    dream_id = None
-    if model_fn is not None and cross_link_tuples:
-        dream_id = _generate_dream(conn, cross_link_tuples, model_fn=model_fn)
+    # ── 7. Embedding gap fill ────────────────────────────────────────────
+    gap_count = _fill_embedding_gaps(conn)
+    conn.commit()
 
-    # Phase 9: embed orphans
-    orphans = _embed_orphans(conn)
-
-    conn.close()
-    elapsed = round(time.perf_counter() - t_start, 1)
+    elapsed = time.monotonic() - t0
 
     summary = {
-        "nodes_selected": len(ids),
-        "nodes_with_embeddings": len(valid_ids),
-        "cross_link_candidates": len(cross_pairs),
-        "dedup_candidates": len(dedup_pairs),
-        "cross_links_created": cross_stats["created"],
-        "cross_links_skipped": cross_stats["skipped"],
-        "cross_link_same_source_skipped": cross_stats["same_source_skipped"],
-        "cross_link_capped": cross_stats["capped"],
-        "dedup_components": dedup_stats["components"],
-        "dedup_nodes_merged": dedup_stats["nodes_merged"],
+        "cross_links_created": len(cross_links),
+        "cross_link_same_source_skipped": same_source_skipped,
+        "dedup_nodes_merged": deduped,
         "nodes_gc_decayed": gc_count,
-        "nodes_made_permanent": perm_stats.get("nodes_promoted", 0),
-        "core_promoted": core_stats.get("promoted", 0),
-        "core_demoted": core_stats.get("demoted", 0),
-        "dream_id": dream_id,
-        "orphans_embedded": orphans,
+        "nodes_made_permanent": perm_count,
+        "core_promoted": core_count,
+        "embedding_gaps_filled": gap_count,
         "total_nodes": len(metrics),
         "elapsed_s": elapsed,
     }
 
-    logger.info(
-        "sleep: cycle complete in %.1fs — %d nodes, %d cross-links%s, %d dedups, "
-        "%d GC, %d permanent, %d core, %d dream, %d embedded",
-        elapsed,
-        summary["total_nodes"],
-        summary["cross_links_created"],
-        f" ({summary['cross_link_same_source_skipped']} same-source skipped)"
-        if summary["cross_link_same_source_skipped"]
-        else "",
-        summary["dedup_nodes_merged"],
-        summary["nodes_gc_decayed"],
-        summary["nodes_made_permanent"],
-        summary["core_promoted"],
-        1 if dream_id else 0,
-        summary["orphans_embedded"],
-    )
+    if background_dream:
+        # Spawn daemon thread for LLM dream + orphan embedding
+        dream_id = None
+        orphans = 0
+        t = threading.Thread(
+            target=_run_dream_async,
+            args=(db, model_fn),
+            daemon=True,
+        )
+        t.start()
+        summary["dream_pending"] = True
+        logger.info(
+            "sleep: sync phases complete in %.1fs — %d nodes, %d cross-links%s, %d dedups, "
+            "%d GC, %d permanent, %d core (dream pending in background)",
+            elapsed,
+            summary["total_nodes"],
+            summary["cross_links_created"],
+            f" ({same_source_skipped} same-source skipped)"
+            if same_source_skipped
+            else "",
+            summary["dedup_nodes_merged"],
+            summary["nodes_gc_decayed"],
+            summary["nodes_made_permanent"],
+            summary["core_promoted"],
+        )
+    else:
+        # ── 8. Dream generation ──────────────────────────────────────────
+        dream_id = _generate_dream(conn, model_fn) if model_fn else None
+        conn.commit()
+
+        # ── 9. Orphan embedding ─────────────────────────────────────────
+        orphans = _embed_orphans(conn)
+        conn.commit()
+
+        summary["dream_id"] = dream_id
+        summary["orphans_embedded"] = orphans
+        logger.info(
+            "sleep: cycle complete in %.1fs — %d nodes, %d cross-links%s, %d dedups, "
+            "%d GC, %d permanent, %d core, %d dream, %d embedded",
+            elapsed,
+            summary["total_nodes"],
+            summary["cross_links_created"],
+            f" ({same_source_skipped} same-source skipped)"
+            if same_source_skipped
+            else "",
+            summary["dedup_nodes_merged"],
+            summary["nodes_gc_decayed"],
+            summary["nodes_made_permanent"],
+            summary["core_promoted"],
+            1 if dream_id else 0,
+            summary["orphans_embedded"],
+        )
+
+    conn.close()
     return summary
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Background dream dispatch
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _run_dream_async(db: pathlib.Path, model_fn: Callable | None) -> None:
+    """Run Phase 8 (dream) and Phase 9 (orphan embedding) in a daemon thread.
+
+    Opens its own SQLite connection — WAL mode handles concurrent readers.
+    """
+    try:
+        conn = sqlite3.connect(str(db))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=OFF")
+        conn.execute("PRAGMA busy_timeout=10000")
+
+        dream_id = _generate_dream(conn, model_fn) if model_fn else None
+        conn.commit()
+
+        orphans = _embed_orphans(conn)
+        conn.commit()
+
+        if dream_id:
+            logger.info("sleep: background dream created node %s, embedded %d orphans", dream_id, orphans)
+        else:
+            logger.info("sleep: background embedded %d orphans (no dream — no model_fn)", orphans)
+
+        conn.close()
+    except Exception:
+        logger.warning("sleep: background dream failed", exc_info=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 1: Cross-link
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _cross_link(conn: sqlite3.Connection, limit: int) -> tuple[list[tuple], int]:
+    """Connect nodes that are semantically similar but not yet connected.
+
+    Returns (edges_created, same_source_skipped_count).
+    Only creates edges between nodes from *different* source_files to
+    reduce noise and improve BFS traversal signal.
+    """
+    rows = conn.execute("""
+        SELECT n.id, e.embedding, n.source_file
+        FROM vec_embeddings e
+        JOIN thought_nodes n ON n.id = e.node_id
+        ORDER BY n.created ASC
+        LIMIT ?
+    """, (limit,)).fetchall()
+
+    if len(rows) < 2:
+        return [], 0
+
+    ids = [r["id"] for r in rows]
+    emb = np.array([_deserialize_embedding(r["embedding"]) for r in rows], dtype=np.float32)
+    sources = [r["source_file"] or "" for r in rows]
+
+    existing = _load_existing_edges(conn, ids)
+    emb_len = len(emb)
+
+    edges: list[tuple] = []
+    same_source_skipped = 0
+
+    # Vectorized pairwise similarity, bounded by edge cap
+    for i in range(emb_len):
+        if len(edges) >= MAX_EDGES_PER_CYCLE:
+            break
+        # Similarity vector for node i vs all later nodes
+        sim = np.dot(emb[i:], emb[i])
+        candidates = np.where(sim >= CROSS_LINK_THRESHOLD)[0]
+        for j_rel in candidates:
+            j = i + j_rel
+            if j == i:
+                continue
+            if len(edges) >= MAX_EDGES_PER_CYCLE:
+                break
+            nid_j = ids[j]
+            if nid_j in existing.get(ids[i], set()):
+                continue
+            # Cross-source check
+            if sources[i] == sources[j]:
+                same_source_skipped += 1
+                continue
+            edges.append((ids[i], nid_j, float(sim[j_rel])))
+
+    # Bulk insert edges
+    _bulk_insert_edges(conn, edges)
+    return edges, same_source_skipped
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 2: Dedup
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _dedup(conn: sqlite3.Connection, limit: int) -> int:
+    """Merge near-duplicate nodes, keeping the one with more connections."""
+    rows = conn.execute("""
+        SELECT n.id, e.embedding, n.access_count
+        FROM vec_embeddings e
+        JOIN thought_nodes n ON n.id = e.node_id
+        ORDER BY n.created ASC
+        LIMIT ?
+    """, (limit,)).fetchall()
+
+    if len(rows) < 2:
+        return 0
+
+    ids = [r["id"] for r in rows]
+    emb = np.array([_deserialize_embedding(r["embedding"]) for r in rows], dtype=np.float32)
+    access = {r["id"]: r["access_count"] or 0 for r in rows}
+
+    merged = 0
+    emb_len = len(emb)
+
+    for i in range(emb_len):
+        sim = np.dot(emb[i:], emb[i])
+        candidates = np.where(sim >= DEDUP_THRESHOLD)[0]
+        keep_id = ids[i]
+        for j_rel in candidates:
+            j = i + j_rel
+            if j == i:
+                continue
+            nid_j = ids[j]
+            # Prefer the node with higher access_count
+            if access.get(nid_j, 0) > access.get(keep_id, 0):
+                nid_j, keep_id = keep_id, nid_j  # swap so nid_j is the one to discard
+            _merge_node_into(conn, nid_j, keep_id)
+            merged += 1
+
+    return merged
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 3: Metrics
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _compute_metrics(conn: sqlite3.Connection) -> dict[str, dict]:
+    """Collect per-node access and edge metrics for GC/permanence decisions."""
+    rows = conn.execute("""
+        SELECT id, access_count, created, source_file,
+               (SELECT COUNT(*) FROM derivation_edges WHERE source_id = id OR target_id = id) AS degree
+        FROM thought_nodes
+    """).fetchall()
+    return {r["id"]: dict(r) for r in rows}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 4: Garbage Collection
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _garbage_collect(conn: sqlite3.Connection, metrics: dict[str, dict]) -> int:
+    """Soft-decay nodes that haven't been accessed recently."""
+    now = time.time()
+    threshold_sec = GC_ACCESS_AGE_DAYS * 86400
+    interim_sec = GC_INTERIM_DAYS * 86400
+    count = 0
+
+    for nid, m in metrics.items():
+        if m.get("degree", 0) > 2:
+            continue  # well-connected nodes are valuable
+        age = now - (m.get("created") or now)
+        if age > threshold_sec and (m.get("access_count") or 0) < GC_DECAY_THRESHOLD:
+            conn.execute("UPDATE thought_nodes SET is_active = 0 WHERE id = ?", (nid,))
+            count += 1
+        elif age > interim_sec and (m.get("access_count") or 0) < 3:
+            conn.execute("UPDATE thought_nodes SET is_active = 0 WHERE id = ?", (nid,))
+            count += 1
+
+    return count
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 5: Permanence
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _promote_permanent(conn: sqlite3.Connection, metrics: dict[str, dict]) -> int:
+    """Flag top-accessed nodes as permanent (exempt from future GC)."""
+    sorted_nodes = sorted(metrics.items(), key=lambda x: x[1].get("access_count") or 0, reverse=True)
+    top_n = max(1, len(sorted_nodes) // 10)
+    count = 0
+    for nid, _ in sorted_nodes[:top_n]:
+        conn.execute("UPDATE thought_nodes SET is_permanent = 1 WHERE id = ? AND is_permanent = 0", (nid,))
+        count += 1
+    return count
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 6: Core Memory
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _promote_core_memory(conn: sqlite3.Connection, metrics: dict[str, dict]) -> int:
+    """Tag top-percentile nodes as core memory for priority retrieval."""
+    if not metrics:
+        return 0
+    access_counts = sorted([m.get("access_count") or 0 for m in metrics.values()], reverse=True)
+    threshold_idx = max(1, len(access_counts) * CORE_MEMORY_PERCENTILE // 100)
+    threshold_val = access_counts[threshold_idx - 1] if threshold_idx <= len(access_counts) else 0
+    if threshold_val < 1:
+        return 0
+
+    count = 0
+    for nid, m in metrics.items():
+        if (m.get("access_count") or 0) >= threshold_val:
+            conn.execute("UPDATE thought_nodes SET is_core = 1 WHERE id = ? AND is_core = 0", (nid,))
+            count += 1
+    return count
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 7: Embedding Gap Fill
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _fill_embedding_gaps(conn: sqlite3.Connection) -> int:
+    """Create placeholder embeddings for nodes that lack them."""
+    rows = conn.execute("""
+        SELECT n.id
+        FROM thought_nodes n
+        LEFT JOIN vec_embeddings e ON e.node_id = n.id
+        WHERE e.node_id IS NULL
+        LIMIT 500
+    """).fetchall()
+    for r in rows:
+        _insert_zeros_embedding(conn, r["id"])
+    return len(rows)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 8: Dream Generation (LLM)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _generate_dream(conn: sqlite3.Connection, model_fn: Callable) -> str | None:
+    """Use the LLM to synthesise an insight node from recent activity."""
+    try:
+        recent = conn.execute("""
+            SELECT id, content, source_file, created
+            FROM thought_nodes
+            ORDER BY created DESC
+            LIMIT 20
+        """).fetchall()
+        if not recent:
+            return None
+
+        context = "\n".join(
+            f"- [{r['source_file'] or 'unknown'}]: {r['content'][:300]}"
+            for r in recent
+        )
+        prompt = (
+            "You are a memory consolidation system. Below are the most recent "
+            "observations and facts stored in long-term memory.\n\n"
+            f"{context}\n\n"
+            "Synthesize a single insight that connects patterns across these entries. "
+            "Keep it to 1-2 sentences. Output ONLY the insight text."
+        )
+
+        response = model_fn([{"role": "user", "content": prompt}])
+        content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if not content:
+            return None
+
+        import hashlib
+        import json as _json
+        dream_id = hashlib.sha256(content.encode()).hexdigest()[:24]
+
+        conn.execute(
+            "INSERT OR IGNORE INTO thought_nodes (id, content, source_file, created, access_count, is_core) "
+            "VALUES (?, ?, 'dream', ?, 0, 0)",
+            (dream_id, content.strip(), int(time.time())),
+        )
+        return dream_id
+    except Exception:
+        logger.warning("sleep: dream generation failed", exc_info=True)
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 9: Orphan Embedding
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _embed_orphans(conn: sqlite3.Connection) -> int:
+    """Create zero-vector embeddings for nodes that somehow slipped through."""
+    # Same as gap fill — already handled in Phase 7, but catches race
+    # conditions from concurrent inserts between Phase 7 and here.
+    return _fill_embedding_gaps(conn)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _load_existing_edges(conn: sqlite3.Connection, node_ids: list[str]) -> dict[str, set[str]]:
+    """Build adjacency lookup: node_id -> set of connected node_ids."""
+    existing: dict[str, set[str]] = {}
+    # Pre-populate for all input IDs
+    for nid in node_ids:
+        existing[nid] = set()
+    rows = conn.execute("""
+        SELECT source_id, target_id FROM derivation_edges
+        WHERE source_id IN ({}) OR target_id IN ({})
+    """.format(
+        ",".join("?" * len(node_ids)),
+        ",".join("?" * len(node_ids)),
+    ), node_ids + node_ids).fetchall()
+    for r in rows:
+        existing.setdefault(r["source_id"], set()).add(r["target_id"])
+        existing.setdefault(r["target_id"], set()).add(r["source_id"])
+    return existing
+
+
+def _bulk_insert_edges(conn: sqlite3.Connection, edges: list[tuple]) -> None:
+    """Batch-insert edges with a per-tuple dedup check."""
+    for i in range(0, len(edges), BATCH_WRITE_SIZE):
+        batch = edges[i:i + BATCH_WRITE_SIZE]
+        for src, tgt, sim in batch:
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO derivation_edges (source_id, target_id, weight, relation_type) "
+                    "VALUES (?, ?, ?, 'semantic_similarity')",
+                    (src, tgt, sim),
+                )
+            except Exception:
+                pass
+
+
+def _merge_node_into(conn: sqlite3.Connection, discard_id: str, keep_id: str) -> None:
+    """Redirect all edges from discard_id to keep_id, then mark discard as inactive."""
+    conn.execute(
+        "UPDATE derivation_edges SET source_id = ? WHERE source_id = ?",
+        (keep_id, discard_id),
+    )
+    conn.execute(
+        "UPDATE derivation_edges SET target_id = ? WHERE target_id = ?",
+        (keep_id, discard_id),
+    )
+    # Merge access count
+    discard_acc = conn.execute("SELECT access_count FROM thought_nodes WHERE id = ?", (discard_id,)).fetchone()
+    keep_acc = conn.execute("SELECT access_count FROM thought_nodes WHERE id = ?", (keep_id,)).fetchone()
+    combined = (discard_acc["access_count"] or 0) + (keep_acc["access_count"] or 0) if discard_acc and keep_acc else 0
+    conn.execute("UPDATE thought_nodes SET access_count = ? WHERE id = ?", (combined, keep_id))
+    conn.execute("UPDATE thought_nodes SET is_active = 0 WHERE id = ?", (discard_id,))
+
+
+def _deserialize_embedding(blob: bytes) -> np.ndarray:
+    """Deserialize base64 → zlib → float16 → float32 embedding."""
+    import base64
+    import zlib
+    raw = zlib.decompress(base64.b64decode(blob))
+    return np.frombuffer(raw, dtype=np.float16).astype(np.float32)
+
+
+def _insert_zeros_embedding(conn: sqlite3.Connection, node_id: str) -> None:
+    """Create a zero-vector embedding for a node that lacks one."""
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO vec_embeddings (node_id, embedding) VALUES (?, ?)",
+            (node_id, _serialize_embedding(np.zeros(384, dtype=np.float32))),
+        )
+    except Exception:
+        pass
+
+
+def _serialize_embedding(arr: np.ndarray) -> bytes:
+    """Serialize float32 array → float16 → zlib → base64."""
+    import base64
+    import zlib
+    return base64.b64encode(zlib.compress(arr.astype(np.float16).tobytes()))

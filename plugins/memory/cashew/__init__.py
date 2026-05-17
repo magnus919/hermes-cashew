@@ -942,6 +942,7 @@ class CashewMemoryProvider(MemoryProvider):
                     db_path=str(self._db_path),
                     limit=2000,
                     model_fn=self._model_fn,
+                    background_dream=True,
                 )
             except Exception:
                 logger.warning("sleep cycle failed", exc_info=True)

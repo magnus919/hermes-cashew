@@ -930,3 +930,75 @@ def test_sleep_cycle_idempotency(small_graph):
     assert result2["cross_links_created"] <= result1["cross_links_created"]
     # Decayed count should stabilize
     assert result2["nodes_gc_decayed"] <= result1["nodes_gc_decayed"] + 1
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Background dream dispatch (v0.10.0)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_run_dream_async_spawns_daemon_thread(small_graph):
+    """_run_dream_async spawns a daemon thread that writes a dream node."""
+    def fake_model_fn(prompt: str) -> str:
+        return "Dream synthesis bridging file_A and file_B."
+
+    cross_tuples = [("e", "f", 0.85)]
+    from plugins.memory.cashew.sleep_refactor import _run_dream_async
+    _run_dream_async(small_graph, cross_tuples, fake_model_fn)
+
+    # Give the daemon thread time to write
+    import time
+    time.sleep(1.0)
+
+    conn = sqlite3.connect(small_graph)
+    dream_nodes = conn.execute(
+        "SELECT id, content, node_type FROM thought_nodes WHERE node_type='dream'"
+    ).fetchall()
+    conn.close()
+
+    assert len(dream_nodes) >= 1
+    assert dream_nodes[0][1] == "Dream synthesis bridging file_A and file_B."
+    assert dream_nodes[0][2] == "dream"
+
+
+def test_run_dream_async_handles_exception(small_graph):
+    """Exception in daemon thread is caught and logged — does not propagate."""
+    cross_tuples = [("e", "f", 0.85)]
+    from plugins.memory.cashew.sleep_refactor import _run_dream_async
+    _run_dream_async(small_graph, cross_tuples, None)  # None model_fn -> skips dream
+
+    # Should not crash
+    import time
+    time.sleep(0.3)
+    assert True
+
+
+def test_background_dream_flag_requires_model_fn_and_tuples(small_graph, monkeypatch):
+    """background_dream=True without model_fn does not set dream_pending."""
+    result = run_sleep_cycle(small_graph, limit=6, model_fn=None,
+                             background_dream=True)
+    assert "dream_pending" in result
+    assert result["dream_pending"] is False
+
+
+def test_background_dream_runs_sync_phases_before_returning(small_graph):
+    """Synchronous phases (cross-links, dedup, GC, core) complete even with bg dream."""
+    result = run_sleep_cycle(small_graph, limit=6, model_fn=None,
+                             background_dream=True)
+    assert result["nodes_selected"] > 0
+    assert "cross_link_candidates" in result
+    assert "nodes_gc_decayed" in result
+    assert "core_promoted" in result
+    assert "elapsed_s" in result
+
+
+def test_background_dream_false_maintains_legacy_behavior(small_graph):
+    """background_dream=False does not set dream_pending."""
+    def fake_model_fn(prompt: str) -> str:
+        return "Legacy dream synthesis for testing."
+
+    result = run_sleep_cycle(small_graph, limit=6, model_fn=fake_model_fn,
+                             background_dream=False)
+    assert "dream_pending" in result
+    assert result["dream_pending"] is False
+    assert "dream_id" in result

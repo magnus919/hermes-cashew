@@ -617,6 +617,7 @@ def run_sleep_cycle(
     """
     t_start = time.perf_counter()
     conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA busy_timeout=5000")
     _set_wal(conn)
 
     # Select nodes for this cycle (oldest-first heuristic)

@@ -217,6 +217,18 @@ class CashewMemoryProvider(MemoryProvider):
         # matches the WARNING-log count. See B-02 revision in
         # PHASE_DESIGN_NOTES (2026-04-20).
         self._model_fn: Callable[[str], str] | None = None
+        # Prefetch warm cache: cue → formatted context string.
+        # Populated by queue_prefetch(), consumed by prefetch(), cleared in
+        # shutdown(). Ephemeral per-turn state — never persisted.
+        self._warm_cache: dict[str, str] = {}
+        # Staging slot for background prefetch results. The queue_prefetch
+        # background thread writes here; prefetch() atomically swaps it into
+        # _warm_cache at the start of its call. This avoids concurrent access
+        # between the daemon thread and the main agent loop.
+        self._prefetch_pending: str | None = None
+        # Last assistant response, buffered from sync_turn for use by
+        # queue_prefetch's LLM cue extraction.
+        self._last_assistant: str = ""
 
     @property
     def name(self) -> str:
@@ -448,6 +460,11 @@ class CashewMemoryProvider(MemoryProvider):
 
         Half-state (_sync_queue is None) is a silent no-op.
         """
+        # Buffer assistant content for queue_prefetch cue extraction.
+        # Must happen BEFORE the half-state guard so the most recent turn's
+        # assistant content is always available, even if the queue is not.
+        if assistant_content:
+            self._last_assistant = assistant_content
         if self._sync_queue is None:
             return  # not initialized or silent-degraded; no worker to feed
         turn = (user_content, assistant_content, session_id)
@@ -654,15 +671,33 @@ class CashewMemoryProvider(MemoryProvider):
         the LLM callable and can perform LLM extraction, think cycles, and sleep
         synthesis. When None, Cashew's built-in heuristic extractor is used
         (04-RESEARCH.md §§1, 6.2 — no LLM round-trip).
-        """
+
+        Retries up to 3 times on SQLITE_BUSY with exponential backoff before
+        dropping the turn (SYNC-05)."""
         from core.session import end_session  # lazy import (see 04-RESEARCH.md §9 + test strategy §11)
         user, assistant, session_id = turn
-        end_session(
-            db_path=str(self._db_path),
-            session_id=session_id or self._session_id,
-            conversation_text=f"User: {user}\nAssistant: {assistant}",
-            model_fn=self._model_fn,
-        )
+
+        import sqlite3
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                end_session(
+                    db_path=str(self._db_path),
+                    session_id=session_id or self._session_id,
+                    conversation_text=f"User: {user}\nAssistant: {assistant}",
+                    model_fn=self._model_fn,
+                )
+                break  # success
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    wait = 0.5 * (2 ** attempt)
+                    logger.info(
+                        "cashew sync: database locked, retrying in %.1fs (attempt %d/%d)",
+                        wait, attempt + 1, max_retries,
+                    )
+                    time.sleep(wait)
+                else:
+                    raise  # give up — let the outer except in _worker_loop handle it
         # Run think cycle periodically if LLM is wired
         if self._model_fn is not None and self._config and self._config.think_interval > 0:
             counter = self._load_think_counter() + 1
@@ -943,11 +978,19 @@ class CashewMemoryProvider(MemoryProvider):
         self._config = None
         self._db_path = None
         self._retriever = None
+        self._warm_cache.clear()
+        self._prefetch_pending = None
+        self._last_assistant = ""
         logger.debug("cashew provider shutdown complete (Phase 4 — worker drained)")
 
     def prefetch(self, query: str, domain: str | None = None, tag: str | None = None,
-                 exclude_tags: list[str] | None = None) -> str:
+                 exclude_tags: list[str] | None = None, **kwargs: Any) -> str:
         """Return recalled-context string from Cashew (RECALL-01).
+
+        Checks the warm cache (populated by queue_prefetch) first. On a cache
+        hit, returns the cached context immediately without hitting storage.
+        On a cache miss, delegates to upstream cashew-brain's
+        retrieve_recursive_bfs for full three-tier retrieval.
 
         Delegates to upstream cashew-brain's retrieve_recursive_bfs which handles
         the full three-tier retrieval (sqlite-vec semantic search → graph BFS →
@@ -964,6 +1007,32 @@ class CashewMemoryProvider(MemoryProvider):
         """
         if self._config is None:
             return ""
+        # Atomically swap in any background-prefetched results
+        pending = self._prefetch_pending
+        if pending is not None:
+            self._prefetch_pending = None
+            # Store under the raw query so the matching logic below can find it
+            self._warm_cache[query] = pending
+        # Warm cache fast path: check if a cached cue matches the query.
+        if self._warm_cache:
+            query_lower = query.lower()
+            for cue, ctx in self._warm_cache.items():
+                if not cue:
+                    continue
+                cue_lower = cue.lower()
+                if cue_lower in query_lower or query_lower in cue_lower:
+                    logger.info("prefetch warm cache HIT: cue=%r query=%r", cue, query)
+                    self._warm_cache.clear()
+                    return ctx
+                cue_words = set(w for w in cue_lower.split() if len(w) > 3)
+                query_words = set(w for w in query_lower.split() if len(w) > 3)
+                if len(cue_words & query_words) >= 2:
+                    logger.info("prefetch warm cache HIT: cue=%r query=%r (word overlap)", cue, query)
+                    self._warm_cache.clear()
+                    return ctx
+            # No match — clear stale cache and fall through to cold retrieval.
+            logger.info("prefetch warm cache MISS (%d cue(s) in cache) — falling through to cold retrieval", len(self._warm_cache))
+            self._warm_cache.clear()
         max_nodes = self._config.recall_k
         try:
             from core.retrieval import retrieve_recursive_bfs
@@ -990,6 +1059,120 @@ class CashewMemoryProvider(MemoryProvider):
         except Exception:
             logger.warning("cashew recall failed for query=%r", query, exc_info=True)
         return ""
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        """Warm cashew memory for the next turn (ABC optional hook).
+
+        Dispatches a background thread so this returns immediately and never
+        blocks the user's turn. The thread runs vector search (and optionally
+        LLM cue extraction) and populates _warm_cache when done.
+
+        If the background thread hasn't finished before the next prefetch(),
+        prefetch falls through to cold storage transparently. Results are
+        stored in a staging slot (_prefetch_pending) and swapped atomically
+        into _warm_cache at the start of the next prefetch to avoid
+        concurrent access between thread and main loop.
+
+        Contract:
+        - Half-state guard: if _config is None, return silently.
+        - Never blocks — returns in <1ms.
+        - Never raises into Hermes (caught in background thread).
+        """
+        if self._config is None:
+            return
+        self._prefetch_pending = None  # clear any stale results
+        if not query:
+            logger.debug("queue_prefetch: empty query, no warmup")
+            return
+
+        # Capture the state the thread needs — these are stable after initialize()
+        db_path = str(self._db_path)
+        top_k = self._config.prefetch_k
+        use_llm = self._model_fn is not None and self._config.prefetch_cues > 0
+
+        def _warmup_worker() -> None:
+            """Background thread: retrieve + optionally refine with LLM."""
+            try:
+                # If LLM is available, extract cues for better retrieval
+                if use_llm:
+                    try:
+                        cues = self._extract_prefetch_cues(query)
+                        logger.info(
+                            "queue_prefetch: extracted %d LLM cue(s)",
+                            len(cues),
+                        )
+                    except Exception:
+                        logger.debug("queue_prefetch: LLM cue extraction failed, using raw query")
+                        cues = [query] if query else []
+                else:
+                    cues = [query] if query else []
+
+                if not cues:
+                    return
+
+                from core.retrieval import retrieve_recursive_bfs
+                seen_ids: set[str] = set()
+                all_nodes: list[dict] = []
+                for cue in cues:
+                    results = retrieve_recursive_bfs(
+                        db_path=db_path, query=cue, top_k=top_k,
+                    )
+                    if results:
+                        node_ids = [r.node_id for r in results]
+                        nodes = self._enrich_results(node_ids)
+                        for n in nodes:
+                            nid = n.get("id", "")
+                            if nid not in seen_ids:
+                                seen_ids.add(nid)
+                                all_nodes.append(n)
+
+                if all_nodes:
+                    ctx = self._format_context(all_nodes)
+                    # Stage results for the next prefetch to pick up
+                    self._prefetch_pending = ctx
+                    logger.info(
+                        "queue_prefetch: cached %d result(s) from %d cue(s) for next turn",
+                        len(all_nodes), len(cues),
+                    )
+            except Exception:
+                logger.debug("queue_prefetch background worker failed (non-fatal)", exc_info=True)
+
+        t = threading.Thread(target=_warmup_worker, daemon=True,
+                             name=f"cashew-prefetch-{self._session_id}")
+        t.start()
+
+    def _extract_prefetch_cues(self, query: str) -> list[str]:
+        """Use the auxiliary LLM to extract concrete search cues from the turn.
+
+        Transforms the conversational turn into 2-3 concrete noun phrases
+        suitable for semantic search. Uses both the user message (query) and
+        the buffered assistant response (_last_assistant) for context.
+
+        Returns:
+            List of search cue strings (may be empty).
+
+        Raises:
+            Exception: forwarded to caller for logging.
+        """
+        if not self._model_fn:
+            return [query] if query else []
+        assistant = self._last_assistant or ""
+        n = max(1, self._config.prefetch_cues) if self._config else 3
+        prompt = (
+            "Extract up to {} concrete search queries from this conversation "
+            "turn that would find relevant semantic memory for what is likely "
+            "to come next. Each search query must be a short noun phrase (not "
+            "a question).\n\n"
+            "User: {}\n"
+            "Assistant: {}\n\n"
+            "Respond with one search query per line. No numbering, no prefixes."
+        ).format(n, query, assistant)
+        raw = self._model_fn(prompt)
+        cues = [
+            line.strip() for line in raw.strip().split("\n")
+            if line.strip() and not line.strip().startswith(("```", "Here", "Sure"))
+        ]
+        return cues[:n] if cues else [query] if query else []
 
     def _keyword_search(
         self, query: str, max_nodes: int,

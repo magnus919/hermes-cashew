@@ -1,8 +1,8 @@
 """Pure config + path-resolution helpers for the Cashew memory provider.
 
-This module has zero coupling to the Hermes ABC, the CashewMemoryProvider class,
-or the Cashew runtime. It owns:
-  - the expanded config schema (~31 flat JSON keys aligned with upstream Cashew)
+|This module has zero coupling to the Hermes ABC, the CashewMemoryProvider class,
+|or the Cashew runtime. It owns:
+|  - the expanded config schema (~33 flat JSON keys aligned with upstream Cashew)
   - the on-disk JSON layout under hermes_home (CONF-02, CONF-03)
   - the rule that every path derives from hermes_home (CONF-04)
 
@@ -64,6 +64,9 @@ DEFAULTS: dict[str, Any] = {
     # auto-populates auxiliary.memory from the main model config if absent.
     "llm_aux_role": "memory",
     "think_interval": 10,
+    # Prefetch warmup
+    "prefetch_k": 3,
+    "prefetch_cues": 3,
 }
 
 
@@ -112,6 +115,9 @@ class CashewConfig:
     # LLM integration
     llm_aux_role: str = DEFAULTS["llm_aux_role"]
     think_interval: int = DEFAULTS["think_interval"]
+    # Prefetch warmup
+    prefetch_k: int = DEFAULTS["prefetch_k"]
+    prefetch_cues: int = DEFAULTS["prefetch_cues"]
 
 
 def _env_var_name(key: str) -> str:
@@ -354,6 +360,26 @@ def get_config_schema() -> list[dict[str, Any]]:
             ),
             "default": DEFAULTS["think_interval"],
             "env_var": _env_var_name("think_interval"),
+        },
+        {
+            "key": "prefetch_k",
+            "description": (
+                "Number of results to retrieve per cue during background "
+                "prefetch warmup. Higher values warm more context but cost "
+                "more vector searches."
+            ),
+            "default": DEFAULTS["prefetch_k"],
+            "env_var": _env_var_name("prefetch_k"),
+        },
+        {
+            "key": "prefetch_cues",
+            "description": (
+                "Number of LLM-extracted search cues for prefetch warmup "
+                "(0 to disable LLM cues, using raw query only). Only applies "
+                "when llm_aux_role is configured."
+            ),
+            "default": DEFAULTS["prefetch_cues"],
+            "env_var": _env_var_name("prefetch_cues"),
         },
     ]
     return schema

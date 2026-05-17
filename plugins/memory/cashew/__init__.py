@@ -513,6 +513,12 @@ class CashewMemoryProvider(MemoryProvider):
         import sqlite3
         conn = sqlite3.connect(str(db_path))
         try:
+            conn.enable_load_extension(True)
+            try:
+                import sqlite_vec
+                sqlite_vec.load(conn)
+            except (ImportError, AttributeError):
+                conn.load_extension("vec0")
             self._migrate_vec_embeddings(conn)
             self._create_vec_embeddings(conn)
             # Hermes provider metadata store (persistent counters, flags)

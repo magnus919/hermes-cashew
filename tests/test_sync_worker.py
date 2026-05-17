@@ -242,7 +242,12 @@ def test_shutdown_hung_worker_logs_warning_no_raise(tmp_path, monkeypatch, caplo
         )
 
 
-def test_on_session_end_polls_and_returns(tmp_path, monkeypatch):
+def test_on_session_end_returns_without_draining_queue(tmp_path, monkeypatch):
+    """on_session_end returns promptly without draining the sync queue.
+
+    The sync worker is non-daemon and keeps running across session boundaries.
+    Data-loss protection is handled by dispose(), not on_session_end.
+    """
     monkeypatch.setattr(
         "core.session.end_session", fake_end_session_slow(0.1), raising=False
     )
@@ -253,15 +258,23 @@ def test_on_session_end_polls_and_returns(tmp_path, monkeypatch):
         start = time.monotonic()
         p.on_session_end([])
         elapsed = time.monotonic() - start
-        assert elapsed < 1.3, f"on_session_end took too long: {elapsed}s"
-        assert p._sync_queue.unfinished_tasks == 0
+        # Should return instantly — no drain loop anymore
+        assert elapsed < 0.3, f"on_session_end took too long: {elapsed}s"
+        # Items remain in queue (worker will process them asynchronously)
+        assert p._sync_queue.unfinished_tasks > 0
         # Worker still alive — on_session_end does not stop it
         assert p._sync_worker.is_alive()
     finally:
         p.shutdown()
 
 
-def test_on_session_end_bounded_by_sync_queue_timeout(tmp_path, monkeypatch, caplog):
+def test_on_session_end_returns_instantly_regardless_of_queue(tmp_path, monkeypatch):
+    """on_session_end returns instantly even when the sync queue has items.
+
+    The drain loop was removed — on_session_end no longer waits for the
+    queue to empty. sync_queue_timeout config is now advisory for dispose()
+    only.
+    """
     monkeypatch.setattr(
         "core.session.end_session", fake_end_session_slow(2.0), raising=False
     )
@@ -274,18 +287,10 @@ def test_on_session_end_bounded_by_sync_queue_timeout(tmp_path, monkeypatch, cap
         start = time.monotonic()
         p.on_session_end([])
         elapsed = time.monotonic() - start
-        assert elapsed >= 0.25, f"poll exited too early: {elapsed}s"
-        assert elapsed < 0.7, f"poll exceeded bound: {elapsed}s"
+        # Returns instantly — no drain loop
+        assert elapsed < 0.2, f"on_session_end blocked: {elapsed}s"
         assert p._sync_worker.is_alive()
-        # Clear caplog BEFORE shutdown so the expected "did not exit"
-        # WARNING from shutdown's bounded join (the in-flight 2.0s slow
-        # call will not complete within shutdown's 0.3s timeout) does
-        # not bleed into any caller-side assertions about on_session_end.
-        caplog.clear()
     finally:
-        # Swap fake for fast so shutdown doesn't hang on the hung turn
-        # (the in-flight slow call will block shutdown's bounded join — 0.3s —
-        # but we set the timeout low to keep the test fast)
         monkeypatch.setattr(
             "core.session.end_session", fake_end_session_ok([]), raising=False
         )

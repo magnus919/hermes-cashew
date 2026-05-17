@@ -30,7 +30,7 @@ from plugins.memory.cashew.config import (
 )
 
 
-EXPECTED_KEY_COUNT = 32
+EXPECTED_KEY_COUNT = 34
 
 
 def test_defaults_contains_exactly_32_keys_with_documented_values():

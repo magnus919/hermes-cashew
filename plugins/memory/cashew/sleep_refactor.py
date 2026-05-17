@@ -74,6 +74,32 @@ _LEGACY_CLUSTER_KEYS = frozenset([
     "embedding_cluster",
 ])
 
+from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine_sim
+
+
+def _find_candidates(
+    ids: list[str], matrix: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (cross_link_pairs, dedup_pairs, similarity_matrix).
+
+    Each pair array has shape (K, 2) of indices into *ids*.
+    """
+    t0 = time.perf_counter()
+    sim = sklearn_cosine_sim(matrix)
+    logger.debug(
+        "sleep: similarity matrix %d×%d computed in %.1fs (%.0f MB)",
+        len(ids), len(ids), time.perf_counter() - t0,
+        sim.nbytes / 1024**2,
+    )
+
+    upper = np.triu(sim, k=1)
+    cross_mask = (upper >= CROSS_LINK_THRESHOLD) & (upper < DEDUP_THRESHOLD)
+    dedup_mask = upper >= DEDUP_THRESHOLD
+
+    cross_pairs = np.argwhere(cross_mask)
+    dedup_pairs = np.argwhere(dedup_mask)
+    return cross_pairs, dedup_pairs, sim
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Public entry point

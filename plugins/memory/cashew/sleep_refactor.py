@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 CROSS_LINK_THRESHOLD = 0.70   # cosine similarity above which nodes get cross-linked
 DEDUP_THRESHOLD = 0.82        # cosine similarity above which nodes are considered duplicates
 MAX_NODES_PER_CYCLE = 2000    # work cap per cycle
+MAX_EDGES_PER_CYCLE = 100_000 # edge cap per cycle
 EDGES_PER_BATCH = 500         # commit after this many edge inserts
 GC_K_NODES = 50               # random sample size for garbage collection
 GC_THRESHOLD = 0.0            # fitness threshold for GC (0 = decay isolated nodes)

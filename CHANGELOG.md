@@ -1,8 +1,28 @@
 # Changelog
 
-## v0.10.0 (2026-05-17) — Background Dream Dispatch & Faster Session Ends
+## v0.10.0 (2026-05-17) — Cross-Source Linking, Queue Prefetch, Background Dream Dispatch & Faster Session Ends
 
 ### Added
+
+- **Cross-source linking in sleep cycle** — When cross-linking nodes, pairs
+  sharing the same `source_file` are now skipped, reducing edge noise in the
+  BFS traversal graph. Counted as `same_source_skipped` in the summary.
+  ([#59](https://github.com/magnus919/hermes-cashew/pull/59))
+
+- **Edge cap (`MAX_EDGES_PER_CYCLE`)** — Prevents runaway cross-linking on
+  dense node batches by stopping after 100K edges per cycle. Counted as
+  `capped` in the sleep summary. ([#59](https://github.com/magnus919/hermes-cashew/pull/59))
+
+- **Out-degree selection** — Sleep cycle prioritizes nodes with the fewest
+  existing edges for cross-linking, naturally rebalancing the graph over time
+  instead of densifying already-well-connected nodes.
+  ([#59](https://github.com/magnus919/hermes-cashew/pull/59))
+
+- **`queue_prefetch` for anticipatory memory warmup** — A background daemon
+  thread ingests the current turn's assistant response before the next turn,
+  extracts cue terms via LLM, and pre-warms the Cashew context so the user's
+  next message already sees relevant memory. Controlled by `prefetch_cues`
+  config key (default: 0). ([#55](https://github.com/magnus919/hermes-cashew/pull/55))
 
 - **`background_dream` parameter on `run_sleep_cycle()`** — When `True`,
   Phase 8 (LLM-powered dream generation) and Phase 9 (orphan embedding) run

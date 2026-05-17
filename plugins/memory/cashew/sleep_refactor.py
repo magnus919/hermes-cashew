@@ -772,6 +772,8 @@ def run_sleep_cycle(
         "dedup_candidates": len(dedup_pairs),
         "cross_links_created": cross_stats["created"],
         "cross_links_skipped": cross_stats["skipped"],
+        "cross_link_same_source_skipped": cross_stats.get("same_source_skipped", 0),
+        "cross_link_capped": cross_stats.get("capped", False),
         "dedup_components": dedup_stats["components"],
         "dedup_nodes_merged": dedup_stats["nodes_merged"],
         "nodes_gc_decayed": gc_count,

@@ -41,7 +41,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # ── thresholds ──────────────────────────────────────────────────────────────
-CROSS_LINK_THRESHOLD = 0.70   # cosine similarity above which nodes get cross-linked
+CROSS_LINK_THRESHOLD = 0.78   # cosine similarity above which nodes get cross-linked
 DEDUP_THRESHOLD = 0.82        # cosine similarity above which nodes are considered duplicates
 MAX_NODES_PER_CYCLE = 2000    # work cap per cycle
 MAX_EDGES_PER_CYCLE = 100_000 # edge cap per cycle

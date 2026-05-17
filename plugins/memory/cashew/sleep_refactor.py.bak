@@ -144,40 +144,17 @@ def _batch_cross_links(
     ids: list[str],
     cross_pairs: np.ndarray,
     sim: np.ndarray,
-    source_files: dict[str, str] | None = None,
-    max_edges: int | None = None,
 ) -> dict:
-    """Insert cross-link edges in batches. Returns stats dict.
-
-    When *source_files* is provided, pairs whose nodes share the same
-    source_file are skipped (counted in ``same_source_skipped``).
-    When *max_edges* is set, stops creating edges after reaching the cap.
-    """
-    stats = {
-        "candidates": len(cross_pairs),
-        "created": 0,
-        "skipped": 0,
-        "same_source_skipped": 0,
-        "capped": False,
-    }
+    """Insert cross-link edges in batches. Returns stats dict."""
+    stats = {"candidates": len(cross_pairs), "created": 0, "skipped": 0}
     pending: list[tuple[str, str, float]] = []
     t0 = time.perf_counter()
 
     for batch_start in range(0, len(cross_pairs), EDGES_PER_BATCH):
         batch = cross_pairs[batch_start:batch_start + EDGES_PER_BATCH]
         for i, j in batch:
-            if max_edges is not None and stats["created"] >= max_edges:
-                stats["capped"] = True
-                break
             n1 = ids[int(i)]
             n2 = ids[int(j)]
-            # Same-source check
-            if source_files is not None:
-                sf1 = source_files.get(n1, "")
-                sf2 = source_files.get(n2, "")
-                if sf1 and sf2 and sf1 == sf2:
-                    stats["same_source_skipped"] += 1
-                    continue
             row = conn.execute(
                 "SELECT COUNT(*) FROM derivation_edges "
                 "WHERE (parent_id=? AND child_id=?) OR (parent_id=? AND child_id=?)",
@@ -190,10 +167,6 @@ def _batch_cross_links(
             pending.append((n1, n2, sim_val))
             pending.append((n2, n1, sim_val))
             stats["created"] += 1
-
-        if max_edges is not None and stats["created"] >= max_edges:
-            stats["capped"] = True
-            break
 
         if pending:
             conn.executemany(

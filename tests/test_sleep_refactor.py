@@ -26,10 +26,15 @@ from plugins.memory.cashew.sleep_refactor import (
     MAX_EDGES_PER_CYCLE,
     run_sleep_cycle,
     _find_candidates,
+    _batch_cross_links,
+    _run_dedup,
     _compute_metrics,
     _garbage_collect,
+    _evaluate_permanence,
+    _promote_core_memories,
     _generate_dream,
     _embed_orphans,
+    _merge_cluster,
 )
 
 # ──────────────────────────────────────────────────────────────────────────────

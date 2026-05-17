@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.10.0 (2026-05-18) — Background Dream Dispatch & Faster Session Ends
+## v0.10.0 (2026-05-17) — Background Dream Dispatch & Faster Session Ends
 
 ### Added
 

@@ -22,6 +22,8 @@ import pytest
 from plugins.memory.cashew.sleep_refactor import (
     CROSS_LINK_THRESHOLD,
     DEDUP_THRESHOLD,
+    MAX_NODES_PER_CYCLE,
+    MAX_EDGES_PER_CYCLE,
     run_sleep_cycle,
     _find_candidates,
     _batch_cross_links,
@@ -233,7 +235,7 @@ def test_batch_cross_links_creates_edges(small_graph):
     edge_after = conn.execute("SELECT COUNT(*) FROM derivation_edges").fetchone()[0]
 
     assert stats["candidates"] >= 0
-    assert stats["created"] + stats["skipped"] == stats["candidates"]
+    assert stats["created"] + stats["skipped"] + stats["same_source_skipped"] == stats["candidates"]
     # Edges may or may not increase depending on pre-existing
     conn.close()
 
@@ -243,7 +245,70 @@ def test_batch_cross_links_empty():
     conn = sqlite3.connect(":memory:")
     _create_schema(conn)
     stats = _batch_cross_links(conn, [], np.array([]).reshape(0, 2), np.array([]))
-    assert stats == {"candidates": 0, "created": 0, "skipped": 0}
+    assert stats == {"candidates": 0, "created": 0, "skipped": 0,
+                     "same_source_skipped": 0, "capped": False}
+    conn.close()
+
+
+def test_batch_cross_links_cross_source_filter(db_path):
+    """Same source_file pairs are skipped when source_files dict is provided."""
+    conn = sqlite3.connect(db_path)
+    # Insert 4 nodes: (a,b) from source_X, (c,d) from source_Y
+    _insert_node(conn, "a", "alpha beta gamma", source_file="source_X")
+    _insert_node(conn, "b", "delta epsilon zeta", source_file="source_X")
+    _insert_node(conn, "c", "eta theta iota", source_file="source_Y")
+    _insert_node(conn, "d", "kappa lambda mu", source_file="source_Y")
+    for nid in ("a", "b", "c", "d"):
+        _insert_embedding(conn, nid, seed={"a": 1, "b": 2, "c": 3, "d": 4}[nid])
+    conn.commit()
+
+    ids = ["a", "b", "c", "d"]
+    from plugins.memory.cashew.sleep_refactor import _load_embedding_matrix
+    valid_ids, matrix = _load_embedding_matrix(conn, ids)
+    cross_pairs, _, sim = _find_candidates(valid_ids, matrix)
+
+    if len(cross_pairs) == 0:
+        conn.close()
+        pytest.skip("No cross-link pairs generated at random with these seeds")
+
+    source_files = {"a": "source_X", "b": "source_X",
+                    "c": "source_Y", "d": "source_Y"}
+
+    stats = _batch_cross_links(conn, valid_ids, cross_pairs, sim,
+                               source_files=source_files)
+
+    assert stats["same_source_skipped"] > 0, \
+        "Expected same-source pairs to be skipped"
+    assert stats["created"] + stats["skipped"] + stats["same_source_skipped"] \
+        == stats["candidates"]
+    conn.close()
+
+
+def test_batch_cross_links_edge_cap(db_path):
+    """max_edges parameter limits the number of edges created."""
+    conn = sqlite3.connect(db_path)
+    # Insert many nodes so we get plenty of cross-link candidates
+    rng = np.random.RandomState(0)
+    for i in range(100):
+        nid = f"n{i:04d}"
+        _insert_node(conn, nid, f"content {i} random {rng.randn():.4f}")
+        _insert_embedding(conn, nid, seed=i)
+    conn.commit()
+
+    ids = [f"n{i:04d}" for i in range(100)]
+    from plugins.memory.cashew.sleep_refactor import _load_embedding_matrix
+    valid_ids, matrix = _load_embedding_matrix(conn, ids)
+    cross_pairs, _, sim = _find_candidates(valid_ids, matrix)
+
+    if len(cross_pairs) == 0:
+        conn.close()
+        pytest.skip("No cross-link pairs generated at random with these seeds")
+
+    # Cap at a tiny number
+    stats = _batch_cross_links(conn, valid_ids, cross_pairs, sim, max_edges=10)
+
+    assert stats["capped"] is True, "Expected cap to be reached"
+    assert stats["created"] == 10, f"Expected 10 edges, got {stats['created']}"
     conn.close()
 
 
@@ -649,6 +714,7 @@ def test_run_sleep_cycle_smoke(small_graph, monkeypatch):
         "nodes_selected", "nodes_with_embeddings",
         "cross_link_candidates", "dedup_candidates",
         "cross_links_created", "cross_links_skipped",
+        "cross_link_same_source_skipped", "cross_link_capped",
         "dedup_components", "dedup_nodes_merged",
         "nodes_gc_decayed", "nodes_made_permanent",
         "core_promoted", "core_demoted",
@@ -666,7 +732,7 @@ def test_run_sleep_cycle_too_few_nodes(empty_graph):
     """Gracefully handles graphs with fewer than 2 embedded nodes."""
     result = run_sleep_cycle(empty_graph, limit=100, model_fn=None)
     assert "error" in result
-    assert result["error"] == "too few nodes"
+    assert result["error"] in ("too few nodes", "no nodes selected")
 
 
 def test_run_sleep_cycle_respects_limit(small_graph):

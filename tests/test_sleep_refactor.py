@@ -900,6 +900,62 @@ def test_on_session_end_sleep_cycle_failure_does_not_raise(tmp_path, monkeypatch
     provider.shutdown()
 
 
+def test_on_session_end_does_not_drain_sync_queue(tmp_path, monkeypatch):
+    """on_session_end returns promptly even when the sync queue has pending items."""
+    import json
+    from plugins.memory.cashew import CashewMemoryProvider
+
+    hermes_home = tmp_path / "hermes_test4"
+    hermes_home.mkdir()
+    cashew_cfg = hermes_home / "cashew.json"
+    cashew_cfg.write_text(json.dumps({
+        "sleep_cycles": True,
+        "think_cycles": False,
+        "sync_queue_timeout": 30.0,
+    }))
+
+    config_yaml = hermes_home / "config.yaml"
+    config_yaml.write_text("auxiliary:\n  memory:\n    provider: test\n    model: test\n    api_key: fake\n")
+
+    db_dir = hermes_home / "cashew"
+    db_dir.mkdir(parents=True)
+    conn = sqlite3.connect(str(db_dir / "brain.db"))
+    _create_schema(conn)
+    for i, nid in enumerate(["n1", "n2", "n3"]):
+        _insert_node(conn, nid, f"content {i}")
+        _insert_embedding(conn, nid, seed=i)
+    conn.commit()
+    conn.close()
+
+    provider = CashewMemoryProvider()
+    provider.initialize(session_id="test-session", hermes_home=str(hermes_home))
+
+    # Let the initial drain settle
+    import time
+    time.sleep(0.3)
+
+    # Simulate a pending queue by adding turns that the worker will process
+    # The worker will pick these up asynchronously
+    for i in range(3):
+        provider.sync_turn(f"user turn {i}", f"assistant reply {i}")
+
+    # Even with items in the queue, on_session_end should return quickly
+    monkeypatch.setattr(
+        "plugins.memory.cashew.sleep_refactor.run_sleep_cycle",
+        lambda *a, **kw: {"total_nodes": 3, "elapsed_s": 0.1},
+    )
+
+    import time as _time
+    t0 = _time.monotonic()
+    provider.on_session_end([])
+    elapsed = _time.monotonic() - t0
+
+    # Should return in well under 1s — there's no drain loop anymore
+    assert elapsed < 1.0, f"on_session_end took {elapsed:.2f}s (should be instant)"
+
+    provider.shutdown()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Edge cases
 # ──────────────────────────────────────────────────────────────────────────────

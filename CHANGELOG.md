@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.10.0 (2026-05-18) — Background Dream Dispatch
+## v0.10.0 (2026-05-18) — Background Dream Dispatch & Faster Session Ends
 
 ### Added
 
@@ -22,6 +22,13 @@
 
 ### Changed
 
+- **`on_session_end()` no longer drains the sync queue** — Removed the 30s
+  busy-wait loop that polled `unfinished_tasks` before the sleep cycle. The
+  sync worker is non-daemon and keeps running across session boundaries; WAL
+  mode handles concurrent DB writes. Data-loss protection is already handled
+  by `shutdown()`. `/new` latency drops from ~51s to ~20s.
+  ([#62](https://github.com/magnus919/hermes-cashew/issues/62))
+
 - **`CashewMemoryProvider.on_session_end()` now passes `background_dream=True`**
   to `run_sleep_cycle()`. The session lifecycle hook returns after the
   synchronous phases (~20s) instead of waiting for the full cycle (~84s).
@@ -30,8 +37,7 @@
 
 | Metric | Before | After |
 |--------|--------|-------|
-| `/new` session latency | ~118s (31s drain + 87s sleep) | ~51s (31s drain + 20s sync phases) |
-| Dream still completes | Always (blocking) | Best-effort (daemon thread) |
+| `/new` session latency | ~118s (31s drain + 87s sleep) | ~20s (sync phases only) |
 
 ## v0.9.0 (2026-05-15) — First-Load Bootstrap & Forest-Level Insight Extraction
 

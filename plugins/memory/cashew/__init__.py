@@ -7,7 +7,6 @@ import os
 import pathlib
 import queue
 import threading  # Phase 4: non-daemon worker for sync_turn drain
-import time       # Phase 4: monotonic-clock polling in on_session_end
 from typing import Any, Callable, Dict, List
 
 try:
@@ -917,20 +916,19 @@ class CashewMemoryProvider(MemoryProvider):
         return count
 
     def on_session_end(self, messages: list) -> None:
-        """Best-effort bounded drain + optional sleep cycle (ABC-06).
+        """Best-effort sleep cycle (ABC-06).
 
-        Polls unfinished_tasks with the same sync_queue_timeout that shutdown()
-        uses. Worker stays alive for subsequent sessions. After drain, runs
-        the refactored sleep cycle if configured (sleep_cycles=true, model_fn
-        wired). No WARNING on timeout — this method is advisory; shutdown() is
-        authoritative.
+        Does NOT drain the sync queue — the background worker is non-daemon and
+        keeps running across session boundaries. WAL mode handles concurrent DB
+        writes between the sleep cycle and the worker. Data-loss protection is
+        handled by dispose(), which posts a sentinel and bounded-joins the
+        worker. This method is advisory; dispose() is authoritative.
+
+        Runs the refactored sleep cycle if configured (sleep_cycles=true, model_fn
+        wired).
         """
         if self._sync_queue is None:
             return  # not initialized or silent-degraded
-        timeout = self._config.sync_queue_timeout if self._config is not None else 30.0
-        deadline = time.monotonic() + timeout
-        while self._sync_queue.unfinished_tasks > 0 and time.monotonic() < deadline:
-            time.sleep(0.05)
 
         # Refactored sleep cycle (v0.8.0): runs in ~4s at 7K nodes.
         # Safe to call from lifecycle hooks — bounded by MAX_NODES_PER_CYCLE.

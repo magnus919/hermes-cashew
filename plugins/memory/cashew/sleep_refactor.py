@@ -48,6 +48,7 @@ MAX_EDGES_PER_CYCLE = 100_000 # edge cap per cycle
 EDGES_PER_BATCH = 500         # commit after this many edge inserts
 GC_K_NODES = 50               # random sample size for garbage collection
 GC_THRESHOLD = 0.0            # fitness threshold for GC (0 = decay isolated nodes)
+GC_GRACE_DAYS = 7             # min node age (days) before GC can decay it
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
@@ -386,6 +387,21 @@ def _garbage_collect(
         nid for nid, m in metrics.items()
         if nid not in perm_ids and m["fitness"] <= GC_THRESHOLD
     ]
+
+    # Age gate: exclude nodes created within the grace period
+    if candidates and GC_GRACE_DAYS > 0:
+        import datetime
+        cutoff = (
+            datetime.datetime.utcnow() - datetime.timedelta(days=GC_GRACE_DAYS)
+        ).isoformat()
+        ph = ",".join("?" * len(candidates))
+        young = {
+            r[0] for r in conn.execute(
+                f"SELECT id FROM thought_nodes WHERE id IN ({ph}) AND timestamp >= ?",
+                [*candidates, cutoff],
+            ).fetchall()
+        }
+        candidates = [nid for nid in candidates if nid not in young]
 
     sample = (
         candidates

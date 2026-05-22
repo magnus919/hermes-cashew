@@ -1190,7 +1190,7 @@ class CashewMemoryProvider(MemoryProvider):
         import sqlite3
         conn = sqlite3.connect(str(self._db_path))
         try:
-            where_clauses: list[str] = []
+            where_clauses: list[str] = ["(decayed IS NULL OR decayed = 0)"]
             params: list = []
             words = [w for w in query.split() if w]
             if words:

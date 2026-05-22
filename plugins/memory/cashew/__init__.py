@@ -203,6 +203,14 @@ _UPSTREAM_KNOWN_DIMS: dict[str, int] = {
     "BAAI/bge-small-en-v1.5": 384,
 }
 
+# Try to patch upstream embedding model at import time, before any session
+# initializes. The per-session call in initialize() is the primary path;
+# this import-time attempt covers gateway sessions where the provider may
+# already be initialized by the time a new session starts.
+_IMPORT_TIME_EMBEDDING_MODEL = os.environ.get(
+    "CASHEW_EMBEDDING_MODEL", "thenlper/gte-large"
+)
+
 
 def _patch_upstream_embedding(model_name: str) -> None:
     """Patch cashew-brain's module-level constants so the right model is used.
@@ -247,10 +255,34 @@ def _patch_upstream_embedding(model_name: str) -> None:
     # Reset the singleton so next get_default_service() call creates one
     # with our patched constants and defaults.
     core.embedding_service.reset_default_service()
+
+    # Patch hardcoded model label in core.embeddings.embed_nodes SQL INSERT.
+    # PyPI v1.1.0 writes "all-MiniLM-L6-v2" as the model tag regardless of
+    # which model was actually used. Patching the function's co_consts tuple
+    # replaces the baked-in string literal.
+    try:
+        import core.embeddings
+        emb_fn = core.embeddings.embed_nodes
+        code = emb_fn.__code__
+        new_consts = tuple(
+            model_name if c == "all-MiniLM-L6-v2" else c
+            for c in code.co_consts
+        )
+        if new_consts != code.co_consts:
+            emb_fn.__code__ = code.replace(co_consts=new_consts)
+    except (ImportError, AttributeError, ValueError):
+        logger.warning("could not patch core.embeddings model label", exc_info=True)
+
     logger.info(
         "patched upstream embedding: model=%s dim=%d",
         model_name, dim,
     )
+
+
+# Apply the patch at import time — before any session initializes.
+# This covers gateway scenarios where the provider may already be
+# constructed by the time initialize() is called.
+_patch_upstream_embedding(_IMPORT_TIME_EMBEDDING_MODEL)
 
 
 # ── on_pre_compress prompt template ──────────────────────────────────

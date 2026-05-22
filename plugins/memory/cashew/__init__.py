@@ -189,6 +189,57 @@ def _ensure_auxiliary_memory(hermes_home: pathlib.Path) -> None:
         )
 
 
+# ── Upstream embedding model patching ──────────────────────────────────
+
+_UPSTREAM_KNOWN_DIMS: dict[str, int] = {
+    "all-MiniLM-L6-v2": 384,
+    "sentence-transformers/all-MiniLM-L6-v2": 384,
+    "thenlper/gte-large": 1024,
+    "thenlper/gte-base": 768,
+    "thenlper/gte-small": 384,
+    "all-mpnet-base-v2": 768,
+    "BAAI/bge-large-en-v1.5": 1024,
+    "BAAI/bge-base-en-v1.5": 768,
+    "BAAI/bge-small-en-v1.5": 384,
+}
+
+
+def _patch_upstream_embedding(model_name: str) -> None:
+    """Patch cashew-brain's module-level constants so the right model is used.
+
+    PyPI cashew-brain v1.1.0 hardcodes ``DEFAULT_MODEL = "all-MiniLM-L6-v2"``
+    and ``EMBEDDING_DIM = 384`` in ``core.embedding_service``. The upstream
+    ``get_default_service()`` creates a **module-level singleton** with those
+    values, so setting env vars or calling with different arguments has no
+    effect — the singleton is already baked.
+
+    This function patches the constants **before** the singleton is created,
+    so all subsequent ``embed_nodes()`` / ``end_session()`` calls produce
+    embeddings at the correct dimension.
+
+    Safe to call multiple times — resets the singleton on each call so a
+    config change mid-lifecycle takes effect.
+    """
+    try:
+        import core.embedding_service
+    except ImportError:
+        logger.warning(
+            "cashew-brain not installed; cannot patch embedding model"
+        )
+        return
+
+    dim = _UPSTREAM_KNOWN_DIMS.get(model_name, 1024)
+    core.embedding_service.DEFAULT_MODEL = model_name
+    core.embedding_service.EMBEDDING_DIM = dim
+    # Reset the singleton so next get_default_service() call creates one
+    # with our patched constants.
+    core.embedding_service.reset_default_service()
+    logger.info(
+        "patched upstream embedding: model=%s dim=%d",
+        model_name, dim,
+    )
+
+
 # ── on_pre_compress prompt template ──────────────────────────────────
 class CashewMemoryProvider(MemoryProvider):
     """Cashew thought-graph memory provider for Hermes Agent."""
@@ -299,10 +350,13 @@ class CashewMemoryProvider(MemoryProvider):
         self._sync_queue = queue.Queue(maxsize=16)
         try:
             self._config = load_config(self._hermes_home)
-            # Propagate embedding model to upstream cashew-brain via env var.
-            # The upstream config reads CASHEW_EMBEDDING_MODEL with priority over
-            # its own YAML config, ensuring end_session() uses the right model.
-            os.environ["CASHEW_EMBEDDING_MODEL"] = self._config.embedding_model
+            # Propagate embedding model to upstream cashew-brain.
+            # PyPI v1.1.0 hardcodes DEFAULT_MODEL = "all-MiniLM-L6-v2" and
+            # EMBEDDING_DIM = 384; the embedded get_default_service() singleton
+            # is created with those values. We patch the module-level constants
+            # before any end_session() / embed_nodes() call so the upstream
+            # creates 1024-dim embeddings matching our config.
+            _patch_upstream_embedding(self._config.embedding_model)
             # First-load bootstrap: generate default cashew.json and
             # auto-populate auxiliary.memory if absent. Safe to call
             # on every initialize() — no-op after the first run.

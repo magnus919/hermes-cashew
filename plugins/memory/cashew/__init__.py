@@ -299,6 +299,10 @@ class CashewMemoryProvider(MemoryProvider):
         self._sync_queue = queue.Queue(maxsize=16)
         try:
             self._config = load_config(self._hermes_home)
+            # Propagate embedding model to upstream cashew-brain via env var.
+            # The upstream config reads CASHEW_EMBEDDING_MODEL with priority over
+            # its own YAML config, ensuring end_session() uses the right model.
+            os.environ["CASHEW_EMBEDDING_MODEL"] = self._config.embedding_model
             # First-load bootstrap: generate default cashew.json and
             # auto-populate auxiliary.memory if absent. Safe to call
             # on every initialize() — no-op after the first run.
@@ -944,6 +948,7 @@ class CashewMemoryProvider(MemoryProvider):
                     limit=2000,
                     model_fn=self._model_fn,
                     background_dream=True,
+                    embedding_model=self._config.embedding_model,
                 )
             except Exception:
                 logger.warning("sleep cycle failed", exc_info=True)

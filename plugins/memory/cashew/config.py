@@ -26,7 +26,7 @@ CONFIG_FILENAME: str = "cashew.json"
 DEFAULTS: dict[str, Any] = {
     # Core paths and models (4 existing)
     "cashew_db_path": "cashew/brain.db",
-    "embedding_model": "all-MiniLM-L6-v2",
+    "embedding_model": "thenlper/gte-large",
     "recall_k": 5,
     "sync_queue_timeout": 30.0,
     # Domains (6)

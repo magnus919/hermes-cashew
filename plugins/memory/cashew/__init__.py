@@ -258,18 +258,34 @@ def _patch_upstream_embedding(model_name: str) -> None:
 
     # Patch hardcoded model label in core.embeddings.embed_nodes SQL INSERT.
     # PyPI v1.1.0 writes "all-MiniLM-L6-v2" as the model tag regardless of
-    # which model was actually used. Patching the function's co_consts tuple
-    # replaces the baked-in string literal.
+    # which model was actually used. We replace the function with a wrapper
+    # that swaps the label — more robust than patching co_consts.
     try:
         import core.embeddings
-        emb_fn = core.embeddings.embed_nodes
-        code = emb_fn.__code__
-        new_consts = tuple(
-            model_name if c == "all-MiniLM-L6-v2" else c
-            for c in code.co_consts
-        )
-        if new_consts != code.co_consts:
-            emb_fn.__code__ = code.replace(co_consts=new_consts)
+        _orig_embed_nodes = core.embeddings.embed_nodes
+
+        def _patched_embed_nodes(db_path: str, batch_size: int = 100) -> dict:
+            """Wrap embed_nodes, then fix model labels in the DB."""
+            result = _orig_embed_nodes(db_path, batch_size)
+            # If the upstream wrote MiniML-labeled nodes, fix them to our model.
+            embedded = result.get("embedded", 0)
+            if embedded > 0:
+                try:
+                    import sqlite3
+                    conn = sqlite3.connect(db_path)
+                    conn.execute("PRAGMA busy_timeout=5000")
+                    conn.execute(
+                        "UPDATE embeddings SET model=? WHERE model='all-MiniLM-L6-v2' AND updated_at>=datetime('now', '-1 minute')",
+                        (model_name,),
+                    )
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    logger.warning("could not fix model labels after embed", exc_info=True)
+            return result
+
+        core.embeddings.embed_nodes = _patched_embed_nodes
+        logger.info("patched embed_nodes model label: %s", model_name)
     except (ImportError, AttributeError, ValueError):
         logger.warning("could not patch core.embeddings model label", exc_info=True)
 

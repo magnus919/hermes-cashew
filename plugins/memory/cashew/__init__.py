@@ -213,9 +213,11 @@ def _patch_upstream_embedding(model_name: str) -> None:
     values, so setting env vars or calling with different arguments has no
     effect — the singleton is already baked.
 
-    This function patches the constants **before** the singleton is created,
-    so all subsequent ``embed_nodes()`` / ``end_session()`` calls produce
-    embeddings at the correct dimension.
+    This function patches the constants **and** the ``__defaults__`` tuple of
+    ``EmbeddingService.__init__`` (Python evaluates default arguments at
+    function definition time, so changing the module constant alone doesn't
+    work) before the singleton is created, so all subsequent ``embed_nodes()``
+    / ``end_session()`` calls produce embeddings at the correct dimension.
 
     Safe to call multiple times — resets the singleton on each call so a
     config change mid-lifecycle takes effect.
@@ -229,10 +231,21 @@ def _patch_upstream_embedding(model_name: str) -> None:
         return
 
     dim = _UPSTREAM_KNOWN_DIMS.get(model_name, 1024)
+
+    # Patch module-level constants
     core.embedding_service.DEFAULT_MODEL = model_name
     core.embedding_service.EMBEDDING_DIM = dim
+
+    # Patch __defaults__ — Python evalutes default arguments at function
+    # definition time, so changing DEFAULT_MODEL alone doesn't affect
+    # EmbeddingService() calls that omit the model parameter.
+    func = core.embedding_service.EmbeddingService.__init__
+    defaults = list(func.__defaults__)
+    defaults[0] = model_name
+    func.__defaults__ = tuple(defaults)
+
     # Reset the singleton so next get_default_service() call creates one
-    # with our patched constants.
+    # with our patched constants and defaults.
     core.embedding_service.reset_default_service()
     logger.info(
         "patched upstream embedding: model=%s dim=%d",

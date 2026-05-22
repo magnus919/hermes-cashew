@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.10.1 (2026-05-22) — GC Grace Period, Keyword Decay Filter & Threshold Tuning
+
+### Added
+
+- **GC grace period (`GC_GRACE_DAYS = 7`)** — Garbage collection now skips
+  nodes created within the last 7 days, preventing recently-created isolated
+  nodes from being immediately decayed. Fixes systematic memory loss for
+  single-reference knowledge.
+  ([#68](https://github.com/magnus919/hermes-cashew/issues/68) —
+  report by [@boriken72](https://github.com/boriken72))
+  ([#69](https://github.com/magnus919/hermes-cashew/pull/69))
+
+- **Decayed-node filter in `_keyword_search()`** — The keyword fallback
+  retrieval path now excludes decayed nodes, closing a hole where decayed
+  content could leak through.
+  ([#68](https://github.com/magnus919/hermes-cashew/issues/68) —
+  report by [@boriken72](https://github.com/boriken72))
+  ([#69](https://github.com/magnus919/hermes-cashew/pull/69))
+
+### Changed
+
+- **Default `CROSS_LINK_THRESHOLD` raised from 0.70 → 0.78** — Reduces
+  low-value cross-link candidates in the sleep cycle, steering edges toward
+  genuinely similar content clusters.
+  ([#67](https://github.com/magnus919/hermes-cashew/pull/67))
+
+### Acknowledgements
+
+Thanks to [@boriken72](https://github.com/boriken72) for the detailed
+investigation in issue #68 that identified the GC grace-period gap and the
+keyword-search decay filter miss.
+
 ## v0.10.0 (2026-05-17) — Cross-Source Linking, Queue Prefetch, Background Dream Dispatch & Faster Session Ends
 
 ### Added

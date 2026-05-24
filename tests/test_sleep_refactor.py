@@ -669,7 +669,7 @@ def test_embed_orphans_regression_not_null_schema(db_path):
         "SELECT node_id, model, updated_at FROM embeddings WHERE node_id='orphan1'"
     ).fetchone()
     assert row is not None, "embedding row should exist"
-    assert row[1] == "all-MiniLM-L6-v2", f"expected model='all-MiniLM-L6-v2', got {row[1]!r}"
+    assert row[1] == "thenlper/gte-large", f"expected model='thenlper/gte-large', got {row[1]!r}"
     assert row[2] is not None and len(str(row[2])) > 0, "updated_at should be set"
 
     conn.close()

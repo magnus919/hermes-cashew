@@ -755,51 +755,40 @@ def test_run_sleep_cycle_with_model_fn(small_graph):
 # Integration: on_session_end triggers sleep
 # ──────────────────────────────────────────────────────────────────────────────
 
-def test_on_session_end_triggers_sleep_cycle(tmp_path, monkeypatch):
-    """When sleep_cycles=true, on_session_end calls run_sleep_cycle."""
+def test_on_session_end_does_not_call_sleep_cycle(tmp_path, monkeypatch):
+    """on_session_end no longer calls run_sleep_cycle — migrated to cron (v0.11.0)."""
     import json
     from plugins.memory.cashew import CashewMemoryProvider
 
-    # Set up a fake hermes home with a cashew.json that enables sleep
-    hermes_home = tmp_path / "hermes_test"
+    hermes_home = tmp_path / "hermes_test1"
     hermes_home.mkdir()
     cashew_cfg = hermes_home / "cashew.json"
     cashew_cfg.write_text(json.dumps({
         "sleep_cycles": True,
-        "think_cycles": True,
-        "llm_aux_role": "memory",
+        "sleep_schedule": "every 12h",
+        "think_cycles": False,
         "cashew_db_path": "cashew/brain.db",
     }))
 
-    # Create a fake config.yaml so model_fn building doesn't crash
     config_yaml = hermes_home / "config.yaml"
-    config_yaml.write_text("auxiliary:\n  memory:\n    provider: test\n    model: test\n    api_key: fake\n")
+    config_yaml.write_text("model:\n  provider: test\n  default: test\n")
 
-    # Create the DB
     db_dir = hermes_home / "cashew"
     db_dir.mkdir(parents=True)
-    db_path = db_dir / "brain.db"
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_dir / "brain.db"))
     _create_schema(conn)
-    # Add some nodes with embeddings
-    for i, nid in enumerate(["n1", "n2", "n3", "n4", "n5"]):
-        _insert_node(conn, nid, f"test content {i}")
-        _insert_embedding(conn, nid, seed=i)
-    conn.commit()
     conn.close()
 
     provider = CashewMemoryProvider()
     provider.initialize(session_id="test-session", hermes_home=str(hermes_home))
 
-    # Wait for the sync worker to drain so the queue is empty
     import time
-    time.sleep(0.5)  # Let worker drain any initial state
+    time.sleep(0.3)
 
-    # Mock run_sleep_cycle to verify it's called
     call_log = []
-    def fake_run_sleep(db_path, limit=2000, model_fn=None, **kwargs):
-        call_log.append({"db_path": db_path, "limit": limit, "model_fn": model_fn})
-        return {"total_nodes": 5, "elapsed_s": 0.1}
+    def fake_run_sleep(*args, **kwargs):
+        call_log.append(1)
+        return {}
 
     monkeypatch.setattr(
         "plugins.memory.cashew.sleep_refactor.run_sleep_cycle",
@@ -808,10 +797,7 @@ def test_on_session_end_triggers_sleep_cycle(tmp_path, monkeypatch):
 
     provider.on_session_end([])
 
-    assert len(call_log) == 1
-    assert call_log[0]["limit"] == 2000
-    assert str(db_path) in str(call_log[0]["db_path"])
-
+    assert len(call_log) == 0, "on_session_end should NOT call run_sleep_cycle"
     provider.shutdown()
 
 
@@ -854,8 +840,8 @@ def test_on_session_end_skips_when_disabled(tmp_path, monkeypatch):
     provider.shutdown()
 
 
-def test_on_session_end_sleep_cycle_failure_does_not_raise(tmp_path, monkeypatch):
-    """If sleep cycle raises, on_session_end catches and logs — never propagates."""
+def test_on_session_end_does_not_raise(tmp_path):
+    """on_session_end is a safe no-op — sleep cycle was migrated to cron (v0.11.0)."""
     import json
     from plugins.memory.cashew import CashewMemoryProvider
 
@@ -867,17 +853,10 @@ def test_on_session_end_sleep_cycle_failure_does_not_raise(tmp_path, monkeypatch
         "think_cycles": False,
     }))
 
-    config_yaml = hermes_home / "config.yaml"
-    config_yaml.write_text("auxiliary:\n  memory:\n    provider: test\n    model: test\n    api_key: fake\n")
-
     db_dir = hermes_home / "cashew"
     db_dir.mkdir(parents=True)
     conn = sqlite3.connect(str(db_dir / "brain.db"))
     _create_schema(conn)
-    for i, nid in enumerate(["x1", "x2", "x3"]):
-        _insert_node(conn, nid, f"content {i}")
-        _insert_embedding(conn, nid, seed=i)
-    conn.commit()
     conn.close()
 
     provider = CashewMemoryProvider()
@@ -886,17 +865,8 @@ def test_on_session_end_sleep_cycle_failure_does_not_raise(tmp_path, monkeypatch
     import time
     time.sleep(0.3)
 
-    def exploding_sleep(*args, **kwargs):
-        raise RuntimeError("simulated sleep crash")
-
-    monkeypatch.setattr(
-        "plugins.memory.cashew.sleep_refactor.run_sleep_cycle",
-        exploding_sleep,
-    )
-
-    # Should not raise
+    # Should not raise even though sleep cycle was previously called here
     provider.on_session_end([])
-
     provider.shutdown()
 
 

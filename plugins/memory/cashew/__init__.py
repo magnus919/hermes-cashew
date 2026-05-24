@@ -189,6 +189,29 @@ def _ensure_auxiliary_memory(hermes_home: pathlib.Path) -> None:
         )
 
 
+def _remove_existing_sleep_job(hermes_home: pathlib.Path | None) -> None:
+    """Remove any existing 'cashew-sleep-cycle' cron job to prevent duplicates.
+
+    Hermes cron jobs persist across restarts in ``$HERMES_HOME/cron/jobs.json``.
+    Without dedup, each provider initialize() would add another job, causing
+    N sleep cycles per tick after N restarts.  This helper scans by name and
+    removes any previous instance before registering a fresh one.
+    """
+    if hermes_home is None:
+        return
+    try:
+        from cron.jobs import list_jobs, remove_job  # type: ignore[import-untyped]
+
+        for job in list_jobs():
+            if job.get("name") == "cashew-sleep-cycle":
+                remove_job(job["id"])
+                logger.info("sleep: removed duplicate cron job %s", job["id"])
+    except ImportError:
+        logger.debug("sleep: cron module not available — skipping dedup")
+    except Exception:
+        logger.warning("sleep: failed to dedup cron jobs", exc_info=True)
+
+
 # ── on_pre_compress prompt template ──────────────────────────────────
 class CashewMemoryProvider(MemoryProvider):
     """Cashew thought-graph memory provider for Hermes Agent."""
@@ -228,6 +251,10 @@ class CashewMemoryProvider(MemoryProvider):
         # Last assistant response, buffered from sync_turn for use by
         # queue_prefetch's LLM cue extraction.
         self._last_assistant: str = ""
+        # Cron job ID for the sleep cycle scheduler. Set in
+        # _register_sleep_cron(), cleared in shutdown(). None when
+        # sleep scheduling is disabled or registration failed.
+        self._sleep_cron_job_id: str | None = None
 
     @property
     def name(self) -> str:
@@ -321,6 +348,11 @@ class CashewMemoryProvider(MemoryProvider):
             # Phase 4: start the sync worker AFTER all worker-read state
             # is populated (db_path, session_id, sync_queue). Pitfall 4.
             self._start_sync_worker()
+            # Phase 4b: register the sleep cycle cron job if configured.
+            # Runs AFTER the sync worker so the provider is fully initialized
+            # before any background work begins.
+            if self._config.sleep_cycles and self._config.sleep_schedule:
+                self._register_sleep_cron()
         except Exception:
             logger.warning(
                 "cashew initialize failed at %s; provider will report unavailable until fixed",
@@ -344,6 +376,88 @@ class CashewMemoryProvider(MemoryProvider):
             daemon=True,
         )
         self._sync_worker.start()
+
+    # ── Sleep cycle cron scheduling ──────────────────────────────────────
+
+    def _register_sleep_cron(self) -> None:
+        """Install the cron script and register a no_agent cron job.
+
+        Called from initialize() only on the happy path.  Safe to call
+        multiple times — if a job is already registered for this provider
+        instance, the call is a no-op.
+        """
+        if self._sleep_cron_job_id is not None:
+            return  # already registered
+
+        try:
+            # Read the cron script source from disk and install it.
+            script_source = (pathlib.Path(__file__).parent / "sleep_cron_script.py").read_text()
+
+            # Install the script to $HERMES_HOME/scripts/
+            script_dest = self._hermes_home / "scripts" / "cashew-sleep-cycle.py"
+            script_dest.parent.mkdir(parents=True, exist_ok=True)
+            if not script_dest.exists():
+                script_dest.write_text(script_source)
+                script_dest.chmod(0o755)
+                logger.info("sleep: installed cron script to %s", script_dest)
+            else:
+                logger.debug("sleep: cron script already exists at %s", script_dest)
+
+            # De-duplicate: check for an existing sleep cron job by name so
+            # we don't pile up duplicates across restarts.
+            _remove_existing_sleep_job(self._hermes_home)
+
+            # Register via the Hermes cron API.
+            from cron.jobs import create_job  # type: ignore[import-untyped]
+
+            job = create_job(
+                prompt="hermes-cashew sleep cycle",
+                schedule=self._config.sleep_schedule,
+                name="cashew-sleep-cycle",
+                script="cashew-sleep-cycle.py",
+                no_agent=True,
+                repeat=None,  # forever
+            )
+            self._sleep_cron_job_id = job["id"]
+            logger.info(
+                "sleep: registered cron job %s (schedule=%s)",
+                job["id"],
+                self._config.sleep_schedule,
+            )
+        except ImportError:
+            logger.warning(
+                "sleep: cannot register cron job — Hermes cron module not available "
+                "(schedule=%s); sleep cycles will not run automatically",
+                self._config.sleep_schedule,
+            )
+        except Exception:
+            logger.warning(
+                "sleep: failed to register cron job (schedule=%s)",
+                self._config.sleep_schedule,
+                exc_info=True,
+            )
+            self._sleep_cron_job_id = None
+
+    def _remove_sleep_cron(self) -> None:
+        """Deregister the sleep cycle cron job.
+
+        Called from shutdown().  Safe to call even when no job was registered.
+        """
+        if self._sleep_cron_job_id is None:
+            return
+        try:
+            from cron.jobs import remove_job  # type: ignore[import-untyped]
+
+            remove_job(self._sleep_cron_job_id)
+            logger.info("sleep: removed cron job %s", self._sleep_cron_job_id)
+        except Exception:
+            logger.warning(
+                "sleep: failed to remove cron job %s",
+                self._sleep_cron_job_id,
+                exc_info=True,
+            )
+        finally:
+            self._sleep_cron_job_id = None
 
     # LLM integration via auxiliary.memory convention
     # ------------------------------------------------------------------
@@ -916,37 +1030,18 @@ class CashewMemoryProvider(MemoryProvider):
         return count
 
     def on_session_end(self, messages: list) -> None:
-        """Best-effort sleep cycle (ABC-06).
+        """Session boundary notification (ABC-06).
 
         Does NOT drain the sync queue — the background worker is non-daemon and
-        keeps running across session boundaries. WAL mode handles concurrent DB
-        writes between the sleep cycle and the worker. Data-loss protection is
-        handled by dispose(), which posts a sentinel and bounded-joins the
-        worker. This method is advisory; dispose() is authoritative.
+        keeps running across session boundaries. Data-loss protection is handled
+        by dispose(), which posts a sentinel and bounded-joins the worker.
 
-        Runs the refactored sleep cycle if configured (sleep_cycles=true, model_fn
-        wired).
+        Sleep cycle processing has been migrated to a Hermes cron job (v0.11.0).
+        See ``sleep_schedule`` in cashew.json. This method no longer blocks
+        session boundaries with synchronous graph maintenance.
         """
         if self._sync_queue is None:
             return  # not initialized or silent-degraded
-
-        # Refactored sleep cycle (v0.8.0): runs in ~4s at 7K nodes.
-        # Safe to call from lifecycle hooks — bounded by MAX_NODES_PER_CYCLE.
-        if (
-            self._config is not None
-            and self._config.sleep_cycles
-            and self._db_path is not None
-        ):
-            try:
-                from .sleep_refactor import run_sleep_cycle
-                run_sleep_cycle(
-                    db_path=str(self._db_path),
-                    limit=2000,
-                    model_fn=self._model_fn,
-                    background_dream=True,
-                )
-            except Exception:
-                logger.warning("sleep cycle failed", exc_info=True)
 
     def shutdown(self) -> None:
         """Post sentinel, bounded-join worker, clear references (ABC-05 + SYNC-05).
@@ -980,6 +1075,9 @@ class CashewMemoryProvider(MemoryProvider):
                     "cashew sync worker did not exit within %ss; abandoning",
                     timeout,
                 )
+        # Remove the sleep cycle cron job before clearing config state.
+        # Must run BEFORE _config is set to None since it reads config keys.
+        self._remove_sleep_cron()
         # Clear state. _hermes_home persists (see Phase 2 Plan 02-02 rationale).
         self._sync_queue = None
         self._sync_worker = None

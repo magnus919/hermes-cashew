@@ -17,11 +17,24 @@ from pathlib import Path
 
 
 def _find_hermes_home() -> Path:
-    """Locate the Hermes home directory from env or default path."""
+    """Locate the Hermes home directory from the environment.
+
+    Returns:
+        Path to the Hermes home directory.
+
+    Raises:
+        RuntimeError: If ``$HERMES_HOME`` is not set. This should never
+            occur when running under the Hermes cron scheduler — the gateway
+            always passes ``HERMES_HOME`` to subprocesses.
+    """
     env_val = os.environ.get("HERMES_HOME")
     if env_val:
         return Path(env_val)
-    return Path.home() / ".hermes"
+    raise RuntimeError(
+        "$HERMES_HOME is not set. This script runs under the Hermes cron "
+        "scheduler which always provides HERMES_HOME. For manual debugging, "
+        "set the environment variable: HERMES_HOME=~/.hermes python3 ..."
+    )
 
 
 def _read_config(hermes_home: Path) -> dict:

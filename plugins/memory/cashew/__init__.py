@@ -60,6 +60,18 @@ legitimate test-code payloads and with Python 3.13's queue.Queue.shutdown()
 signal path. See 04-RESEARCH.md §6.4 for rationale.
 """
 
+# Probe for the Hermes cron module. In a full Hermes Agent environment the
+# cron.jobs package is importable (the agent root is on sys.path). In CI and
+# standalone test environments it is not — the sleep cycle cron job cannot be
+# registered. This constant is checked at cron-registration time (Phase 4b)
+# so the provider silently skips cron setup rather than logging WARNINGs.
+_HAS_HERMES_CRON: bool = False
+try:
+    from cron.jobs import create_job, remove_job, list_jobs  # noqa: F401
+    _HAS_HERMES_CRON = True
+except ImportError:
+    pass
+
 # ── on_pre_compress prompt template ──────────────────────────────────────────
 # Dedicated prompt for forest-level conversation-arc extraction.
 # Not a reuse of end_session's prompt — asks about meta-patterns, not content.
@@ -198,6 +210,8 @@ def _remove_existing_sleep_job(hermes_home: pathlib.Path | None) -> None:
     removes any previous instance before registering a fresh one.
     """
     if hermes_home is None:
+        return
+    if not _HAS_HERMES_CRON:
         return
     try:
         from cron.jobs import list_jobs, remove_job  # type: ignore[import-untyped]
@@ -350,8 +364,10 @@ class CashewMemoryProvider(MemoryProvider):
             self._start_sync_worker()
             # Phase 4b: register the sleep cycle cron job if configured.
             # Runs AFTER the sync worker so the provider is fully initialized
-            # before any background work begins.
-            if self._config.sleep_cycles and self._config.sleep_schedule:
+            # before any background work begins. Silently skips when the
+            # Hermes cron module is not available (e.g. CI, standalone tests).
+            if (self._config.sleep_cycles and self._config.sleep_schedule
+                    and _HAS_HERMES_CRON):
                 self._register_sleep_cron()
         except Exception:
             logger.warning(

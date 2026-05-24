@@ -88,6 +88,8 @@ EOF
 | `max_depth` | `3` | Max BFS traversal depth |
 | `similarity_threshold` | `0.7` | Minimum similarity score |
 | `max_nodes_per_query` | `20` | Maximum nodes per query |
+| `sleep_schedule` | `"every 12h"` | Cron schedule for sleep cycle (see [Sleep Cycle Cron Scheduling](#sleep-cycle-cron-scheduling)) |
+| `sleep_max_nodes` | `2000` | Max nodes per sleep cycle tick |
 
 Environment variables override config values: prefix any key with `CASHEW_`
 (e.g. `CASHEW_RECALL_K=10`).
@@ -161,12 +163,14 @@ Or remove the section entirely — the default will regenerate it on next start.
 - **Think cycles** — cross-domain synthesis, generates `insight` nodes
   from clusters of related knowledge. Runs every `think_interval` sync
   turns (default 10). Set `think_interval` to 0 to disable.
-- **Sleep synthesis** — Runs at session end via `on_session_end()` when
-  `sleep_cycles: true`. Nine-phase consolidation pipeline: cross-linking,
-  dedup, garbage collection, permanence evaluation, core memory promotion,
-  and LLM-powered dream generation. Processes 7K nodes in ~4 seconds
-  (vs hours in the upstream O(N²) implementation). Work-capped at 2,000
-  nodes per cycle — converges gradually over multiple sessions.
+- **Sleep synthesis** — Graph consolidation pipeline: cross-linking, dedup,
+  garbage collection, permanence evaluation, core memory promotion, and
+  LLM-powered dream generation. Runs as a **Hermes cron job** on a configurable
+  schedule (default: every 12 hours), not at session boundaries. The cron script
+  reads `cashew.json` at runtime and operates without an LLM — if LLM-powered
+  dream synthesis is desired, it requires additional configuration (see
+  [Sleep Cycle Cron Scheduling](#sleep-cycle-cron-scheduling) below).
+  Processes up to `sleep_max_nodes` per cycle (default 2,000).
 - **Pre-compress insight extraction** — Before context compression discards
   old messages, extracts conversation-arc patterns (topic shifts, framing
   changes, implicit decisions) using a dedicated LLM prompt. Creates
@@ -180,6 +184,62 @@ API calls, no LLM cost, zero-config.
 Any memory provider plugin can declare `llm_aux_role` and reference the
 same `auxiliary.memory` section, making this a standard pattern across
 the Hermes plugin ecosystem.
+
+## Sleep Cycle Cron Scheduling
+
+hermes-cashew runs its graph consolidation pipeline (cross-linking, dedup,
+garbage collection, permanence evaluation, core memory promotion) as a
+**Hermes ``no_agent`` cron job**, not at session boundaries. This means
+``/new`` returns instantly — no synchronous sleep cycle work blocks the
+start of a new session.
+
+### When the cron job is registered
+
+The cron job is created during plugin initialization (``initialize()``) only
+when **all** of the following are true:
+
+| Condition | Config Key | Default | Behavior if false |
+|-----------|-----------|---------|-------------------|
+| Sleep cycles enabled | ``sleep_cycles`` | ``true`` | Cron not registered |
+| Schedule non-empty | ``sleep_schedule`` | ``\"every 12h\"`` | Cron not registered; set to ``\"\"`` to disable |
+| Provider init succeeds | — | — | Exception caught, ``_config`` set to ``None``, cron never reached |
+| Hermes cron module available | — | — | ``ImportError`` caught, WARNING logged |
+| ``create_job()`` succeeds | — | — | Exception caught, WARNING logged |
+| No job already registered for this provider instance | — | — | No-op dedup guard |
+
+The cron job is **removed** on plugin shutdown (``shutdown()``). A dedup
+helper scans for existing ``cashew-sleep-cycle`` jobs by name on each
+registration to prevent N jobs accumulating across N restarts.
+
+### When the cron job runs
+
+On the configured schedule (default ``every 12h``), the Hermes scheduler
+executes ``$HERMES_HOME/scripts/cashew-sleep-cycle.py`` with **no LLM** —
+it is a ``no_agent`` script, meaning zero LLM overhead per tick. The script
+reads ``cashew.json`` at runtime to discover its database path and
+``sleep_max_nodes`` setting.
+
+### What happens during a cron tick
+
+1. Reads ``cashew.json`` to get ``cashew_db_path`` and ``sleep_max_nodes``
+2. Selects up to ``sleep_max_nodes`` (default 2,000) oldest-unprocessed nodes
+3. Computes pairwise cosine similarity (vectorized numpy)
+4. Creates cross-links between similar node pairs (threshold: 0.78)
+5. Deduplicates near-identical nodes (threshold: 0.82) via BFS clustering
+6. Runs garbage collection on low-fitness isolated nodes
+7. Promotes frequently-accessed nodes to permanent / core memory status
+8. Prints a JSON summary (captured by the cron scheduler's output log)
+
+**No LLM-powered dream generation** occurs in cron mode — the script passes
+``model_fn=None``. Cross-linking, dedup, and GC are the 80% benefit without
+the API key dependency in a subprocess.
+
+### Config reference
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| ``sleep_schedule`` | ``\"every 12h\"`` | Cron expression or interval string. Set to ``\"\"`` to disable cron-based scheduling entirely. Examples: ``\"every 30m\"``, ``\"0 */2 * * *\"``, ``\"0 3 * * *\"`` (daily at 3am). |
+| ``sleep_max_nodes`` | ``2000`` | Maximum number of nodes to cross-link in a single sleep cycle. Higher values converge faster but take longer per tick. |
 
 ## Semantic Search (Optional)
 

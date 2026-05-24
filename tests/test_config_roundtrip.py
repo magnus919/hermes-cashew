@@ -37,7 +37,7 @@ def test_defaults_contains_exactly_32_keys_with_documented_values():
     """CONF-01: schema declares all ~32 keys."""
     assert len(DEFAULTS) == EXPECTED_KEY_COUNT
     assert DEFAULTS["cashew_db_path"] == "cashew/brain.db"
-    assert DEFAULTS["embedding_model"] == "all-MiniLM-L6-v2"
+    assert DEFAULTS["embedding_model"] == "thenlper/gte-large"
     assert DEFAULTS["recall_k"] == 5
     assert DEFAULTS["sync_queue_timeout"] == 30.0
     assert DEFAULTS["user_domain"] == "user"

@@ -6,16 +6,22 @@ cron job. These tests verify that:
 2. ``initialize()`` skips cron registration when sleeping is disabled
 3. ``shutdown()`` removes the cron job
 4. The cron script is installed correctly
+
+All tests in this file require the Hermes ``cron`` module, which is only
+available in a full Hermes Agent environment — not in CI or standalone
+test runs. The module-level skip handles this automatically.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
-import threading
 import time
 from pathlib import Path
-from unittest.mock import ANY
+
+import pytest
+
+pytest.importorskip("cron.jobs", reason="Hermes Agent cron module not available")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

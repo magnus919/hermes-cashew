@@ -67,6 +67,9 @@ DEFAULTS: dict[str, Any] = {
     # Prefetch warmup
     "prefetch_k": 3,
     "prefetch_cues": 3,
+    # Sleep cycle cron scheduling (2)
+    "sleep_schedule": "every 12h",
+    "sleep_max_nodes": 2000,
 }
 
 
@@ -118,6 +121,9 @@ class CashewConfig:
     # Prefetch warmup
     prefetch_k: int = DEFAULTS["prefetch_k"]
     prefetch_cues: int = DEFAULTS["prefetch_cues"]
+    # Sleep cycle cron scheduling
+    sleep_schedule: str = DEFAULTS["sleep_schedule"]
+    sleep_max_nodes: int = DEFAULTS["sleep_max_nodes"]
 
 
 def _env_var_name(key: str) -> str:
@@ -380,6 +386,27 @@ def get_config_schema() -> list[dict[str, Any]]:
             ),
             "default": DEFAULTS["prefetch_cues"],
             "env_var": _env_var_name("prefetch_cues"),
+        },
+        {
+            "key": "sleep_schedule",
+            "description": (
+                "Cron schedule expression or interval string for the sleep cycle. "
+                "Set to empty string to disable cron-based scheduling entirely. "
+                "Examples: 'every 30m', '0 */2 * * *', 'every 1h'. "
+                "The sleep cycle runs as a no_agent cron script — no LLM overhead per tick."
+            ),
+            "default": DEFAULTS["sleep_schedule"],
+            "env_var": _env_var_name("sleep_schedule"),
+        },
+        {
+            "key": "sleep_max_nodes",
+            "description": (
+                "Maximum number of nodes to cross-link in a single sleep cycle. "
+                "Higher values converge faster but take longer per tick. "
+                "Previously hardcoded at 2000."
+            ),
+            "default": DEFAULTS["sleep_max_nodes"],
+            "env_var": _env_var_name("sleep_max_nodes"),
         },
     ]
     return schema

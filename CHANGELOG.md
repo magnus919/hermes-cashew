@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.11.0 (Unreleased) — Sleep Cycle Migrated to Hermes Cron
+
+### Changed
+
+- **Sleep cycle moved from `on_session_end()` to Hermes cron job.** The sleep
+  cycle no longer blocks session boundaries (`/new` returns instantly). The
+  plugin registers a `no_agent` cron job at `initialize()` time that runs on a
+  configurable schedule (default: every 12 hours). The cron script reads
+  `cashew.json` at runtime — no baked-in paths.
+  ([#76](https://github.com/magnus919/hermes-cashew/issues/76))
+
+- **`test_on_session_end_triggers_sleep_cycle` updated** to verify that
+  `on_session_end()` does NOT call `run_sleep_cycle()` (behavior inversion).
+  The test previously asserted the opposite.
+
+### Added
+
+- New config key: `sleep_schedule` (default `"every 12h"`) — cron expression or
+  interval string for sleep cycle scheduling. Set to `""` to disable cron-based
+  sleep entirely.
+- New config key: `sleep_max_nodes` (default `2000`) — max nodes per sleep cycle
+  (was previously hardcoded).
+- New module: `plugins/memory/cashew/sleep_cron_script.py` — standalone Python
+  script installed to `$HERMES_HOME/scripts/cashew-sleep-cycle.py`. Runs as a
+  `no_agent` cron job, discovers config from `cashew.json` at runtime.
+- New module-level helper: `_remove_existing_sleep_job()` — deduplicates cron
+  jobs by name across restarts to prevent N jobs per tick after N restarts.
+- New method: `_register_sleep_cron()` — installs the script and calls
+  `cron.jobs.create_job()`.
+- New method: `_remove_sleep_cron()` — calls `cron.jobs.remove_job()` on
+  shutdown.
+- New test file: `tests/test_sleep_cron_lifecycle.py` — 5 tests covering cron
+  registration, deregistration, and script installation.
+
 ## v0.10.1 (2026-05-22) — GC Grace Period, Keyword Decay Filter & Threshold Tuning
 
 ### Added

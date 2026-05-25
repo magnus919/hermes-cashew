@@ -598,7 +598,7 @@ def _generate_dream(
 
 # ── Phase 9: embedding gap closure ──────────────────────────────────────────
 
-def _embed_orphans(conn: sqlite3.Connection) -> int:
+def _embed_orphans(conn: sqlite3.Connection, embedding_model: str = "thenlper/gte-large") -> int:
     """Embed any active nodes lacking an embedding row. Returns count."""
     rows = conn.execute(
         "SELECT tn.id, tn.content FROM thought_nodes tn "
@@ -611,10 +611,10 @@ def _embed_orphans(conn: sqlite3.Connection) -> int:
     if not rows:
         return 0
 
-    logger.info("sleep: embedding %d orphaned nodes...", len(rows))
+    logger.info("sleep: embedding %d orphaned nodes with %s...", len(rows), embedding_model)
 
     from sentence_transformers import SentenceTransformer
-    model = SentenceTransformer("all-MiniLM-L6-v2")
+    model = SentenceTransformer(embedding_model)
 
     embedded = 0
     for nid, content in rows:
@@ -626,7 +626,7 @@ def _embed_orphans(conn: sqlite3.Connection) -> int:
                     "INSERT OR REPLACE INTO embeddings "
                     "(node_id, vector, model, updated_at) "
                     "VALUES (?, ?, ?, datetime('now'))",
-                    (nid, blob, "all-MiniLM-L6-v2"),
+                    (nid, blob, embedding_model),
                 )
             except sqlite3.OperationalError:
                 # Fallback for legacy schemas without model/updated_at columns
@@ -656,6 +656,7 @@ def _run_dream_async(
     db_path: str,
     cross_link_tuples: list[tuple[str, str, float]],
     model_fn,
+    embedding_model: str = "thenlper/gte-large",
 ) -> None:
     """Run Phase 8 (dream) + Phase 9 (orphan embedding) in a daemon thread.
 
@@ -667,7 +668,7 @@ def _run_dream_async(
             conn = sqlite3.connect(db_path)
             _set_wal(conn)
             dream_id = _generate_dream(conn, cross_link_tuples, model_fn=model_fn)
-            orphans = _embed_orphans(conn)
+            orphans = _embed_orphans(conn, embedding_model=embedding_model)
             conn.close()
             logger.info(
                 "sleep: background dream complete (id=%s, orphans=%d)",
@@ -686,6 +687,7 @@ def run_sleep_cycle(
     limit: int = MAX_NODES_PER_CYCLE,
     model_fn=None,
     background_dream: bool = False,
+    embedding_model: str = "thenlper/gte-large",
 ) -> dict:
     """Run one complete refactored sleep cycle.
 
@@ -767,6 +769,7 @@ def run_sleep_cycle(
                 db_path=db_path,
                 cross_link_tuples=cross_link_tuples,
                 model_fn=model_fn,
+                embedding_model=embedding_model,
             )
             dream_pending = True
         else:
@@ -776,7 +779,7 @@ def run_sleep_cycle(
     if background_dream:
         orphans = 0  # handled by background dream thread
     else:
-        orphans = _embed_orphans(conn)
+        orphans = _embed_orphans(conn, embedding_model=embedding_model)
 
     conn.close()
     elapsed = round(time.perf_counter() - t_start, 1)

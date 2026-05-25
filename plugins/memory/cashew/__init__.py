@@ -201,6 +201,117 @@ def _ensure_auxiliary_memory(hermes_home: pathlib.Path) -> None:
         )
 
 
+# ── Upstream embedding model patching ──────────────────────────────────
+
+_UPSTREAM_KNOWN_DIMS: dict[str, int] = {
+    "all-MiniLM-L6-v2": 384,
+    "sentence-transformers/all-MiniLM-L6-v2": 384,
+    "thenlper/gte-large": 1024,
+    "thenlper/gte-base": 768,
+    "thenlper/gte-small": 384,
+    "all-mpnet-base-v2": 768,
+    "BAAI/bge-large-en-v1.5": 1024,
+    "BAAI/bge-base-en-v1.5": 768,
+    "BAAI/bge-small-en-v1.5": 384,
+}
+
+# Try to patch upstream embedding model at import time, before any session
+# initializes. The per-session call in initialize() is the primary path;
+# this import-time attempt covers gateway sessions where the provider may
+# already be initialized by the time a new session starts.
+_IMPORT_TIME_EMBEDDING_MODEL = os.environ.get(
+    "CASHEW_EMBEDDING_MODEL", "thenlper/gte-large"
+)
+
+
+def _patch_upstream_embedding(model_name: str) -> None:
+    """Patch cashew-brain's module-level constants so the right model is used.
+
+    PyPI cashew-brain v1.1.0 hardcodes ``DEFAULT_MODEL = "all-MiniLM-L6-v2"``
+    and ``EMBEDDING_DIM = 384`` in ``core.embedding_service``. The upstream
+    ``get_default_service()`` creates a **module-level singleton** with those
+    values, so setting env vars or calling with different arguments has no
+    effect — the singleton is already baked.
+
+    This function patches the constants **and** the ``__defaults__`` tuple of
+    ``EmbeddingService.__init__`` (Python evaluates default arguments at
+    function definition time, so changing the module constant alone doesn't
+    work) before the singleton is created, so all subsequent ``embed_nodes()``
+    / ``end_session()`` calls produce embeddings at the correct dimension.
+
+    Safe to call multiple times — resets the singleton on each call so a
+    config change mid-lifecycle takes effect.
+    """
+    try:
+        import core.embedding_service
+    except ImportError:
+        logger.warning(
+            "cashew-brain not installed; cannot patch embedding model"
+        )
+        return
+
+    dim = _UPSTREAM_KNOWN_DIMS.get(model_name, 1024)
+
+    # Patch module-level constants
+    core.embedding_service.DEFAULT_MODEL = model_name
+    core.embedding_service.EMBEDDING_DIM = dim
+
+    # Patch __defaults__ — Python evalutes default arguments at function
+    # definition time, so changing DEFAULT_MODEL alone doesn't affect
+    # EmbeddingService() calls that omit the model parameter.
+    func = core.embedding_service.EmbeddingService.__init__
+    defaults = list(func.__defaults__)
+    defaults[0] = model_name
+    func.__defaults__ = tuple(defaults)
+
+    # Reset the singleton so next get_default_service() call creates one
+    # with our patched constants and defaults.
+    core.embedding_service.reset_default_service()
+
+    # Patch hardcoded model label in core.embeddings.embed_nodes SQL INSERT.
+    # PyPI v1.1.0 writes "all-MiniLM-L6-v2" as the model tag regardless of
+    # which model was actually used. We replace the function with a wrapper
+    # that swaps the label — more robust than patching co_consts.
+    try:
+        import core.embeddings
+        _orig_embed_nodes = core.embeddings.embed_nodes
+
+        def _patched_embed_nodes(db_path: str, batch_size: int = 100) -> dict:
+            """Wrap embed_nodes, then fix model labels in the DB."""
+            result = _orig_embed_nodes(db_path, batch_size)
+            embedded = result.get("embedded", 0)
+            if embedded > 0:
+                try:
+                    import sqlite3
+                    conn = sqlite3.connect(db_path)
+                    conn.execute("PRAGMA busy_timeout=5000")
+                    conn.execute(
+                        "UPDATE embeddings SET model=? WHERE model='all-MiniLM-L6-v2' AND updated_at>=datetime('now', '-1 minute')",
+                        (model_name,),
+                    )
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    logger.warning("could not fix model labels after embed", exc_info=True)
+            return result
+
+        core.embeddings.embed_nodes = _patched_embed_nodes
+        logger.info("patched embed_nodes model label: %s", model_name)
+    except (ImportError, AttributeError, ValueError):
+        logger.warning("could not patch core.embeddings model label", exc_info=True)
+
+    logger.info(
+        "patched upstream embedding: model=%s dim=%d",
+        model_name, dim,
+    )
+
+
+# Apply the patch at import time — before any session initializes.
+# This covers gateway scenarios where the provider may already be
+# constructed by the time initialize() is called.
+_patch_upstream_embedding(_IMPORT_TIME_EMBEDDING_MODEL)
+
+
 def _remove_existing_sleep_job(hermes_home: pathlib.Path | None) -> None:
     """Remove any existing 'cashew-sleep-cycle' cron job to prevent duplicates.
 
@@ -340,6 +451,13 @@ class CashewMemoryProvider(MemoryProvider):
         self._sync_queue = queue.Queue(maxsize=16)
         try:
             self._config = load_config(self._hermes_home)
+            # Propagate embedding model to upstream cashew-brain.
+            # PyPI v1.1.0 hardcodes DEFAULT_MODEL = "all-MiniLM-L6-v2" and
+            # EMBEDDING_DIM = 384; the embedded get_default_service() singleton
+            # is created with those values. We patch the module-level constants
+            # before any end_session() / embed_nodes() call so the upstream
+            # creates 1024-dim embeddings matching our config.
+            _patch_upstream_embedding(self._config.embedding_model)
             # First-load bootstrap: generate default cashew.json and
             # auto-populate auxiliary.memory if absent. Safe to call
             # on every initialize() — no-op after the first run.
@@ -1053,8 +1171,7 @@ class CashewMemoryProvider(MemoryProvider):
         by dispose(), which posts a sentinel and bounded-joins the worker.
 
         Sleep cycle processing has been migrated to a Hermes cron job (v0.11.0).
-        See ``sleep_schedule`` in cashew.json. This method no longer blocks
-        session boundaries with synchronous graph maintenance.
+        See ``sleep_schedule`` in cashew.json.
         """
         if self._sync_queue is None:
             return  # not initialized or silent-degraded

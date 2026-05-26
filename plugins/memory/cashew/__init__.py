@@ -388,28 +388,16 @@ class CashewMemoryProvider(MemoryProvider):
     def is_available(self) -> bool:
         """Return True iff the provider can be initialized.
 
-        Two-path check:
-        1. Config file exists under hermes_home (legacy fast path)
-        2. Plugin dependencies are importable (first-load path) — if cashew-brain
-           was installed successfully, ContextRetriever was set at module import
-           time, and initialize() will generate defaults on first run.
-
-        The second path ensures a fresh install shows green in `hermes memory
-        status` without requiring manual cashew.json creation.
+        Contract (strict):
+        - When ``_hermes_home`` is known, check whether the config file exists there.
+        - When ``_hermes_home`` is unknown, do NOT probe the real Hermes home.
+          In that state the provider should answer based only on whether the
+          plugin dependencies are importable.
         """
-        # Fast path: config file exists
         if self._hermes_home is not None:
-            if resolve_config_path(self._hermes_home).exists():
-                return True
-        else:
-            try:
-                from hermes_constants import get_hermes_home  # type: ignore[import-untyped]
-                if resolve_config_path(get_hermes_home()).exists():
-                    return True
-            except Exception:
-                pass
+            return resolve_config_path(self._hermes_home).exists()
 
-        # Fallback: deps are importable — initialize() will generate defaults
+        # When the home is unknown, fall back to dependency availability only.
         return ContextRetriever is not None
 
     def get_config_schema(self) -> Dict[str, Any]:

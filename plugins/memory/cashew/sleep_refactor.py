@@ -666,6 +666,7 @@ def _run_dream_async(
     def _task():
         try:
             conn = sqlite3.connect(db_path)
+            conn.execute("PRAGMA busy_timeout=5000")
             _set_wal(conn)
             dream_id = _generate_dream(conn, cross_link_tuples, model_fn=model_fn)
             orphans = _embed_orphans(conn, embedding_model=embedding_model)
@@ -707,6 +708,7 @@ def run_sleep_cycle(
     """
     t_start = time.perf_counter()
     conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA busy_timeout=5000")
     _set_wal(conn)
 
     # Select nodes for this cycle (oldest-first heuristic)

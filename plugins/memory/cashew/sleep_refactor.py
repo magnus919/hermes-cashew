@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import logging
 import math
 import random
@@ -666,6 +667,7 @@ def _run_dream_async(
     def _task():
         try:
             conn = sqlite3.connect(db_path)
+            conn.execute("PRAGMA busy_timeout=5000")
             _set_wal(conn)
             dream_id = _generate_dream(conn, cross_link_tuples, model_fn=model_fn)
             orphans = _embed_orphans(conn, embedding_model=embedding_model)
@@ -705,8 +707,19 @@ def run_sleep_cycle(
         the dict includes ``dream_pending=True`` and the ``dream_id`` field
         will be None (it may or may not complete before the caller reads it).
     """
+    # Acquire advisory lock to prevent concurrent sleep cycles across sessions.
+    # Non-blocking: if another process holds the lock, skip this cycle.
+    lock_path = db_path + ".sleep.lock"
+    try:
+        lock_fd = open(lock_path, "w")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        logger.info("sleep: another cycle is already running — skipping")
+        return {}
+
     t_start = time.perf_counter()
     conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA busy_timeout=5000")
     _set_wal(conn)
 
     # Select nodes for this cycle (oldest-first heuristic)

@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import logging
 import math
 import random
@@ -706,6 +707,16 @@ def run_sleep_cycle(
         the dict includes ``dream_pending=True`` and the ``dream_id`` field
         will be None (it may or may not complete before the caller reads it).
     """
+    # Acquire advisory lock to prevent concurrent sleep cycles across sessions.
+    # Non-blocking: if another process holds the lock, skip this cycle.
+    lock_path = db_path + ".sleep.lock"
+    try:
+        lock_fd = open(lock_path, "w")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        logger.info("sleep: another cycle is already running — skipping")
+        return {}
+
     t_start = time.perf_counter()
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA busy_timeout=5000")

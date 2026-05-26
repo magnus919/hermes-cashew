@@ -22,7 +22,9 @@ def test_fresh_provider_is_not_available_without_deps(monkeypatch):
     # Simulate no-cashew-brain scenario by nulling ContextRetriever
     # (as happens at module import when cashew-brain is not installed).
     import plugins.memory.cashew as cashew_mod
-    monkeypatch.setattr(cashew_mod, "ContextRetriever", None)
+    import sys as _sys
+    _cashew_impl = _sys.modules.get("plugins.memory.cashew") or cashew_mod
+    monkeypatch.setattr(_cashew_impl, "ContextRetriever", None)
     p = CashewMemoryProvider()
     # Without deps AND without config file, is_available must be False
     assert p.is_available() is False

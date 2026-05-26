@@ -842,11 +842,20 @@ class CashewMemoryProvider(MemoryProvider):
                 sqlite_vec.load(conn)
             except (ImportError, AttributeError):
                 conn.load_extension("vec0")
-            conn.execute("""
+            # Resolve the configured embedding model's dimension at runtime
+            # instead of hardcoding float[384] — supports gte-large (1024),
+            # gte-base (768), MiniLM (384), etc. Without this, vec_embeddings
+            # silently refuses dual-writes from any model with a different dim.
+            try:
+                from core.embedding_service import resolve_embedding_dim
+                dim = resolve_embedding_dim()
+            except Exception:
+                dim = 384  # fallback for test environments without models
+            conn.execute(f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings
-                USING vec0(node_id TEXT primary key, embedding float[384] distance_metric=cosine)
+                USING vec0(node_id TEXT primary key, embedding float[{dim}] distance_metric=cosine)
             """)
-            logger.debug("vec_embeddings virtual table ready")
+            logger.debug(f"vec_embeddings virtual table ready (dim={dim})")
         except Exception:
             logger.info("sqlite-vec not available; semantic search will use fallback")
 

@@ -69,27 +69,71 @@ EOF
 
 ### Full Config Reference
 
+#### Core
+
 | Key | Default | Description |
 |-----|---------|-------------|
 | `cashew_db_path` | `cashew/brain.db` | Path to SQLite DB, relative to `hermes_home` |
-| `embedding_model` | `sentence-transformers/all-MiniLM-L6-v2` | Embedding model for retrieval |
-| `recall_k` | `5` | Max nodes returned per recall query |
-| `sync_queue_timeout` | `30` | Seconds to wait for sync worker drain on shutdown |
-| `user_domain` | `cli/user` | Domain label for user messages |
-| `ai_domain` | `cli/ai` | Domain label for AI messages |
-| `vec_dimension` | `384` | Embedding dimension (fixed for v0.2.0) |
-| `gc_interval_turns` | `100` | GC run frequency |
-| `gc_delete_probability` | `0.01` | Node deletion probability per GC |
-| `enable_query_decomposition` | `true` | Enable query decomposition |
-| `max_tokens_per_node` | `512` | Token limit per context node |
-| `feature_bfs_retrieval` | `true` | Enable BFS graph traversal |
-| `feature_semantic_search` | `true` | Enable sqlite-vec semantic search |
-| `feature_context_summarization` | `false` | Enable context summarization |
-| `max_depth` | `3` | Max BFS traversal depth |
-| `similarity_threshold` | `0.7` | Minimum similarity score |
-| `max_nodes_per_query` | `20` | Maximum nodes per query |
-| `sleep_schedule` | `"every 12h"` | Cron schedule for sleep cycle (see [Sleep Cycle Cron Scheduling](#sleep-cycle-cron-scheduling)) |
+| `embedding_model` | `thenlper/gte-large` | Sentence-transformers model for embeddings (1024-dim) |
+| `llm_aux_role` | `memory` | Hermes auxiliary role for LLM-powered extraction; requires `auxiliary.memory` in `config.yaml` |
+| `auto_extraction` | `true` | Auto-extract knowledge from conversation turns |
+| `sync_queue_timeout` | `30.0` | Seconds to wait for sync worker drain on shutdown |
+
+#### Retrieval
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `recall_k` | `5` | Context fragments returned per query |
+| `similarity_threshold` | `0.3` | Minimum similarity for BFS graph walk |
+| `walk_depth` | `2` | Graph BFS traversal depth |
+| `token_budget` | `2000` | Max tokens per context injection |
+| `prefetch_k` | `3` | Nodes to pre-warm into context on each turn |
+| `prefetch_cues` | `3` | Cue phrases to send to LLM for prefetch generation |
+
+#### Domains & Classification
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `user_domain` | `user` | Domain label for user messages |
+| `ai_domain` | `ai` | Domain label for AI messages |
+| `default_domain` | `general` | Fallback domain for unclassified content |
+| `auto_classify` | `true` | Auto-classify nodes into domains |
+| `domain_classifications` | `["personal", "work", "projects", "learning", "system"]` | Available domain labels |
+| `domain_separation_enabled` | `true` | Enforce domain boundaries in retrieval |
+
+#### Sleep Cycle
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `sleep_cycles` | `true` | Enable the refactored sleep cycle (cross-linking, dedup, GC, dreams) |
+| `sleep_schedule` | `"every 12h"` | Cron schedule for sleep cycle |
 | `sleep_max_nodes` | `2000` | Max nodes per sleep cycle tick |
+| `think_cycles` | `true` | Enable periodic insight generation (think cycle) |
+| `think_interval` | `10` | Turns between think cycle runs (0 = disable) |
+| `think_cycle_nodes` | `5` | Node clusters per think cycle |
+| `max_think_iterations` | `3` | Max iterative refinements per think cycle |
+| `novelty_threshold` | `0.82` | Minimum novelty score to surface an insight |
+
+#### Garbage Collection
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `gc_mode` | `soft` | `"soft"` or `"hard"` decay |
+| `gc_threshold` | `0.05` | Minimum importance score before decay |
+| `gc_grace_days` | `7` | Days before a node can be decayed |
+| `gc_protect_types` | `["seed", "core_memory"]` | Node types exempt from decay |
+| `gc_think_cycle_penalty` | `1.5` | Importance penalty multiplier for think-cycle nodes |
+| `decay_pruning` | `true` | Prune low-value nodes over time |
+| `pattern_detection` | `true` | Detect recurring patterns in extracted knowledge |
+
+#### Tuning
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `access_weight` | `0.2` | Weight of access count in importance scoring |
+| `temporal_weight` | `0.1` | Weight of recency in importance scoring |
+| `clustering_eps` | `0.35` | DBSCAN epsilon for think-cycle clustering |
+| `clustering_min_samples` | `3` | Minimum samples per cluster in think cycle |
 
 Environment variables override config values: prefix any key with `CASHEW_`
 (e.g. `CASHEW_RECALL_K=10`).

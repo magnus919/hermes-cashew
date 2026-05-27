@@ -210,6 +210,7 @@ def home_snapshot():
             p.relative_to(home_hermes).as_posix()
             for p in home_hermes.rglob("*")
             if p.is_file()
+            and not p.name.endswith((".db-wal", ".db-shm"))
         )
         return {"exists": True, "files": files}
 

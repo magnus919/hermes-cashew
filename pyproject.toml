@@ -23,6 +23,9 @@ dev = [
     "PyYAML>=6.0",
     "build>=1.0",
 ]
+vec = [
+    "sqlite-vec",
+]
 
 [project.entry-points."hermes_agent.plugins"]
 cashew = "plugins.memory.cashew"

@@ -97,6 +97,7 @@ done
 - **No `~/.hermes` writes.** All paths scope under `hermes_home`. Tests use `tmp_path` fixture.
 - **`sync_turn` must return <10 ms.** Bounded queue + non-daemon worker.
 - **Cashew dependency**: `cashew-brain>=1.1.0,<2.0.0` on PyPI.
+- **sqlite-vec** is an optional extra (`pip install hermes-cashew[vec]`). The plugin degrades gracefully without it (semantic search falls back to keyword + BFS), but the `vec_embeddings` virtual table migration is skipped. Install it for full semantic search capability.
 - **`HF_HUB_OFFLINE=1`** set in `conftest.py` before any Cashew import. Embedding model must be mocked in tests.
 - **`CASHEW_*` env vars stripped** in `conftest.py` to prevent Hermes session leak into tests.
 - **Silent degrade** on all Cashew failures — log WARNING, return empty, never raise into Hermes.
@@ -105,6 +106,7 @@ done
 
 ```bash
 pip install -e ".[dev]"                # install with dev deps
+pip install -e ".[dev,vec]"            # install with dev deps + sqlite-vec
 pytest                                 # full suite
 pytest tests/test_name.py -xvs          # single file
 python3 -m pytest                       # macOS fallback
@@ -115,7 +117,7 @@ python3 -m pytest                       # macOS fallback
 Hermes runs from `~/.hermes/hermes-agent/venv/`. For dev installs in that venv, a symlink is needed:
 
 ```bash
-~/.hermes/hermes-agent/venv/bin/python3 -m pip install -e ".[dev]"
+~/.hermes/hermes-agent/venv/bin/python3 -m pip install -e ".[dev,vec]"
 ln -sf "$PWD/plugins/memory/cashew" ~/.hermes/hermes-agent/plugins/memory/cashew
 ```
 

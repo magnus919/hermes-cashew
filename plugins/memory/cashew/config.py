@@ -16,7 +16,7 @@ import json
 import logging
 import os
 import pathlib
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -410,6 +410,143 @@ def get_config_schema() -> list[dict[str, Any]]:
         },
     ]
     return schema
+
+
+_PROVIDER_ENV_MAP: dict[str, str] = {
+    "openai": "OPENAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "opencode-go": "OPENCODE_GO_API_KEY",
+    "opencode-zen": "OPENCODE_ZEN_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "xai": "XAI_API_KEY",
+    "github": "COPILOT_GITHUB_TOKEN",
+    "huggingface": "HF_TOKEN",
+}
+
+
+def _read_cashew_config(hermes_home: pathlib.Path) -> CashewConfig | None:
+    """Read cashew.json and return a CashewConfig, or None if absent/unparseable."""
+    cashew_path = resolve_config_path(hermes_home)
+    if not cashew_path.exists():
+        logger.debug("cashew.json not found at %s; cannot resolve model_fn", cashew_path)
+        return None
+    try:
+        return load_config(hermes_home)
+    except Exception:
+        logger.warning(
+            "Failed to load cashew.json from %s; cannot resolve model_fn",
+            cashew_path, exc_info=True,
+        )
+        return None
+
+
+def resolve_model_fn(
+    hermes_home: pathlib.Path,
+    config: CashewConfig | None = None,
+) -> Callable[[str], str] | None:
+    """Resolve an OpenAI-compatible LLM callable from Hermes auxiliary config.
+
+    Reads ``llm_aux_role`` from ``cashew.json`` (or the provided
+    *config*), then ``auxiliary.<role>`` from ``config.yaml``, resolves
+    the API key from config or well-known env vars, and returns an
+    ``httpx``-based callable suitable for dream generation and text
+    extraction.
+
+    Returns ``None`` when:
+    - No ``llm_aux_role`` is configured
+    - ``config.yaml`` is absent or unparseable
+    - The auxiliary section or API key cannot be found (logs warning)
+
+    Designed for use by both ``CashewMemoryProvider`` (which passes its
+    already-loaded ``CashewConfig``) and the sleep cron script (which
+    passes ``None`` and lets the function load ``cashew.json`` itself).
+    """
+    # Resolve llm_aux_role from config
+    if config is None:
+        config = _read_cashew_config(hermes_home)
+    if config is None:
+        return None
+
+    role = config.llm_aux_role
+    if not role:
+        logger.debug("llm_aux_role not set; heuristic-only mode — no model_fn")
+        return None
+
+    # Read auxiliary config from config.yaml
+    config_yaml_path = hermes_home / "config.yaml"
+    if not config_yaml_path.exists():
+        logger.info(
+            "llm_aux_role=%r but %s not found; falling back to heuristic extraction",
+            role, config_yaml_path,
+        )
+        return None
+
+    try:
+        import yaml
+        raw = yaml.safe_load(config_yaml_path.read_text(encoding="utf-8"))
+        aux_config = (raw or {}).get("auxiliary", {}).get(role, {})
+    except Exception:
+        logger.warning(
+            "llm_aux_role=%r: failed to parse %s; falling back to heuristic extraction",
+            role, config_yaml_path, exc_info=True,
+        )
+        return None
+
+    model = aux_config.get("model")
+    if not model:
+        logger.warning(
+            "llm_aux_role=%r: no model in auxiliary.%s config; "
+            "falling back to heuristic extraction", role, role,
+        )
+        return None
+
+    provider = aux_config.get("provider", "openai")
+    base_url = aux_config.get("base_url", "https://api.openai.com/v1").rstrip("/")
+
+    # Resolve API key: explicit config > env var by provider convention
+    api_key = aux_config.get("api_key")
+    if not api_key:
+        env_var = _PROVIDER_ENV_MAP.get(provider)
+        if env_var:
+            api_key = os.environ.get(env_var)
+
+    if not api_key:
+        logger.warning(
+            "llm_aux_role=%r: no API key for provider=%r; "
+            "falling back to heuristic extraction", role, provider,
+        )
+        return None
+
+    logger.info(
+        "llm_aux_role=%r: using %s %s via %s",
+        role, provider, model, base_url,
+    )
+
+    def _model_fn(prompt: str) -> str:
+        """OpenAI-compatible chat completion callable."""
+        try:
+            import httpx
+            resp = httpx.post(
+                f"{base_url}/chat/completions",
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+        except Exception:
+            logger.warning(
+                "LLM call failed for role=%r (model=%s)",
+                role, model, exc_info=True,
+            )
+            return ""
+
+    return _model_fn
 
 
 def resolve_config_path(hermes_home: str | os.PathLike[str]) -> pathlib.Path:

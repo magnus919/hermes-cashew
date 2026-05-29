@@ -776,6 +776,7 @@ def run_sleep_cycle(
     # Phase 8: dream generation
     dream_id = None
     dream_pending = False
+    dream_status = "skipped"  # default when model_fn is None or no cross-source pairs
     if model_fn is not None and cross_link_tuples:
         if background_dream:
             _run_dream_async(
@@ -785,8 +786,12 @@ def run_sleep_cycle(
                 embedding_model=embedding_model,
             )
             dream_pending = True
+            dream_status = "pending"
         else:
             dream_id = _generate_dream(conn, cross_link_tuples, model_fn=model_fn)
+            dream_status = "ran" if dream_id else "failed"
+    elif model_fn is not None and not cross_link_tuples:
+        dream_status = "skipped"  # model available but no pairs
 
     # Phase 9: embed orphans
     if background_dream:
@@ -814,6 +819,7 @@ def run_sleep_cycle(
         "core_demoted": core_stats.get("demoted", 0),
         "dream_id": dream_id,
         "dream_pending": dream_pending,
+        "dream_generation": dream_status,
         "orphans_embedded": orphans,
         "total_nodes": len(metrics),
         "elapsed_s": elapsed,
@@ -834,7 +840,7 @@ def run_sleep_cycle(
     else:
         logger.info(
             "sleep: cycle complete in %.1fs — %d nodes, %d cross-links, %d dedups, "
-            "%d GC, %d permanent, %d core, %d dream, %d embedded",
+            "%d GC, %d permanent, %d core, dream=%s, %d embedded",
             elapsed,
             summary["total_nodes"],
             summary["cross_links_created"],
@@ -842,7 +848,7 @@ def run_sleep_cycle(
             summary["nodes_gc_decayed"],
             summary["nodes_made_permanent"],
             summary["core_promoted"],
-            1 if dream_id else 0,
+            dream_status,
             summary["orphans_embedded"],
         )
     return summary

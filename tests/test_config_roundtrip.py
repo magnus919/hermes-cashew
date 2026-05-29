@@ -20,12 +20,14 @@ from plugins.memory.cashew.config import (
     DEFAULTS,
     ENV_VAR_MAP,
     _env_var_name,
+    _PROVIDER_ENV_MAP,
     get_ai_domain,
     get_config_schema,
     get_user_domain,
     load_config,
     resolve_config_path,
     resolve_db_path,
+    resolve_model_fn,
     save_config,
 )
 
@@ -347,3 +349,167 @@ def test_load_config_v0_1_0_four_key_file_gets_defaults_for_new_keys(tmp_path):
     assert cfg.auto_extraction == DEFAULTS["auto_extraction"]
     assert cfg.domain_classifications == list(DEFAULTS["domain_classifications"])
     assert cfg.gc_protect_types == list(DEFAULTS["gc_protect_types"])
+
+
+# ── resolve_model_fn tests ───────────────────────────────────────────────────
+
+
+def test_provider_env_map_has_all_entries():
+    """_PROVIDER_ENV_MAP covers all well-known providers."""
+    assert len(_PROVIDER_ENV_MAP) == 10
+    assert _PROVIDER_ENV_MAP["deepseek"] == "DEEPSEEK_API_KEY"
+    assert _PROVIDER_ENV_MAP["openai"] == "OPENAI_API_KEY"
+
+
+def test_resolve_model_fn_returns_none_when_no_cashew_json(tmp_path):
+    """No cashew.json → resolve_model_fn returns None."""
+    result = resolve_model_fn(tmp_path)
+    assert result is None
+
+
+def test_resolve_model_fn_returns_none_when_llm_role_empty(tmp_path):
+    """cashew.json exists but llm_aux_role is empty → None."""
+    hermes_home = tmp_path / "h1"
+    hermes_home.mkdir()
+    (hermes_home / "cashew.json").write_text(json.dumps({"llm_aux_role": ""}))
+    result = resolve_model_fn(hermes_home)
+    assert result is None
+
+
+def test_resolve_model_fn_returns_none_when_config_yaml_missing(tmp_path):
+    """cashew.json with llm_aux_role set, but no config.yaml → None."""
+    hermes_home = tmp_path / "h2"
+    hermes_home.mkdir()
+    (hermes_home / "cashew.json").write_text(
+        json.dumps({"llm_aux_role": "memory"})
+    )
+    result = resolve_model_fn(hermes_home)
+    assert result is None
+
+
+def test_resolve_model_fn_returns_none_when_aux_section_missing(tmp_path):
+    """config.yaml exists but has no auxiliary.memory section → None."""
+    hermes_home = tmp_path / "h3"
+    hermes_home.mkdir()
+    (hermes_home / "cashew.json").write_text(
+        json.dumps({"llm_aux_role": "memory"})
+    )
+    (hermes_home / "config.yaml").write_text("model:\n  provider: test\n")
+    result = resolve_model_fn(hermes_home)
+    assert result is None
+
+
+def test_resolve_model_fn_returns_none_when_no_model(tmp_path):
+    """auxiliary.memory exists but has no 'model' key → None."""
+    hermes_home = tmp_path / "h4"
+    hermes_home.mkdir()
+    (hermes_home / "cashew.json").write_text(
+        json.dumps({"llm_aux_role": "memory"})
+    )
+    (hermes_home / "config.yaml").write_text(
+        "auxiliary:\n  memory:\n    provider: deepseek\n"
+    )
+    result = resolve_model_fn(hermes_home)
+    assert result is None
+
+
+def test_resolve_model_fn_returns_none_when_no_api_key(tmp_path, monkeypatch):
+    """auxiliary.memory fully configured but no API key → None."""
+    hermes_home = tmp_path / "h5"
+    hermes_home.mkdir()
+    (hermes_home / "cashew.json").write_text(
+        json.dumps({"llm_aux_role": "memory"})
+    )
+    (hermes_home / "config.yaml").write_text(
+        "auxiliary:\n  memory:\n"
+        "    provider: deepseek\n"
+        "    model: deepseek-v4-flash\n"
+    )
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    result = resolve_model_fn(hermes_home)
+    assert result is None
+
+
+def test_resolve_model_fn_returns_callable_with_env_var(tmp_path, monkeypatch):
+    """Valid config + DEEPSEEK_API_KEY → returns callable."""
+    hermes_home = tmp_path / "h6"
+    hermes_home.mkdir()
+    (hermes_home / "cashew.json").write_text(
+        json.dumps({"llm_aux_role": "memory"})
+    )
+    (hermes_home / "config.yaml").write_text(
+        "auxiliary:\n  memory:\n"
+        "    provider: deepseek\n"
+        "    model: deepseek-v4-flash\n"
+        "    base_url: https://api.deepseek.com/v1\n"
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key-123")
+    result = resolve_model_fn(hermes_home)
+    assert result is not None
+    assert callable(result)
+
+
+def test_resolve_model_fn_returns_callable_with_explicit_api_key(tmp_path):
+    """API key in config.yaml (not env var) → returns callable."""
+    hermes_home = tmp_path / "h7"
+    hermes_home.mkdir()
+    (hermes_home / "cashew.json").write_text(
+        json.dumps({"llm_aux_role": "memory"})
+    )
+    (hermes_home / "config.yaml").write_text(
+        "auxiliary:\n  memory:\n"
+        "    provider: deepseek\n"
+        "    model: deepseek-v4-flash\n"
+        "    base_url: https://api.deepseek.com/v1\n"
+        "    api_key: inline-key-456\n"
+    )
+    result = resolve_model_fn(hermes_home)
+    assert result is not None
+    assert callable(result)
+
+
+def test_resolve_model_fn_accepts_passed_config(tmp_path, monkeypatch):
+    """Passing a CashewConfig avoids re-reading cashew.json."""
+    hermes_home = tmp_path / "h8"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "auxiliary:\n  memory:\n"
+        "    provider: deepseek\n"
+        "    model: deepseek-v4-flash\n"
+        "    base_url: https://api.deepseek.com/v1\n"
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key-789")
+    cfg = CashewConfig(llm_aux_role="memory")
+    result = resolve_model_fn(hermes_home, config=cfg)
+    assert result is not None
+    assert callable(result)
+
+
+def test_resolve_model_fn_graceful_on_corrupt_config_yaml(tmp_path):
+    """Corrupt config.yaml → returns None, does not raise."""
+    hermes_home = tmp_path / "h9"
+    hermes_home.mkdir()
+    (hermes_home / "cashew.json").write_text(
+        json.dumps({"llm_aux_role": "memory"})
+    )
+    (hermes_home / "config.yaml").write_text("::: not yaml :::")
+    result = resolve_model_fn(hermes_home)
+    assert result is None
+
+
+def test_resolve_model_fn_uses_default_base_url(tmp_path):
+    """No base_url in config → defaults to https://api.openai.com/v1."""
+    hermes_home = tmp_path / "h10"
+    hermes_home.mkdir()
+    (hermes_home / "cashew.json").write_text(
+        json.dumps({"llm_aux_role": "memory"})
+    )
+    (hermes_home / "config.yaml").write_text(
+        "auxiliary:\n  memory:\n"
+        "    provider: openai\n"
+        "    model: gpt-4\n"
+        "    api_key: sk-test\n"
+    )
+    result = resolve_model_fn(hermes_home)
+    assert result is not None
+    assert callable(result)

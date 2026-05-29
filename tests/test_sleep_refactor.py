@@ -718,7 +718,8 @@ def test_run_sleep_cycle_smoke(small_graph, monkeypatch):
         "dedup_components", "dedup_nodes_merged",
         "nodes_gc_decayed", "nodes_made_permanent",
         "core_promoted", "core_demoted",
-        "dream_id", "orphans_embedded",
+        "dream_id", "dream_pending", "dream_generation",
+        "orphans_embedded",
         "total_nodes", "elapsed_s",
     }
     for key in expected_keys:
@@ -1000,11 +1001,12 @@ def test_run_dream_async_handles_exception(small_graph):
 
 
 def test_background_dream_flag_requires_model_fn_and_tuples(small_graph, monkeypatch):
-    """background_dream=True without model_fn does not set dream_pending."""
+    """background_dream=True without model_fn sets dream_generation='skipped'."""
     result = run_sleep_cycle(small_graph, limit=6, model_fn=None,
                              background_dream=True)
     assert "dream_pending" in result
     assert result["dream_pending"] is False
+    assert result["dream_generation"] == "skipped"
 
 
 def test_background_dream_runs_sync_phases_before_returning(small_graph):
@@ -1019,7 +1021,7 @@ def test_background_dream_runs_sync_phases_before_returning(small_graph):
 
 
 def test_background_dream_false_maintains_legacy_behavior(small_graph):
-    """background_dream=False does not set dream_pending."""
+    """background_dream=False with model_fn runs dream synchronously."""
     def fake_model_fn(prompt: str) -> str:
         return "Legacy dream synthesis for testing."
 
@@ -1028,3 +1030,5 @@ def test_background_dream_false_maintains_legacy_behavior(small_graph):
     assert "dream_pending" in result
     assert result["dream_pending"] is False
     assert "dream_id" in result
+    assert "dream_generation" in result
+    assert result["dream_generation"] in ("ran", "skipped", "failed")

@@ -22,6 +22,7 @@ from .config import (
     load_config,
     resolve_config_path,
     resolve_db_path,
+    resolve_model_fn,
     save_config as _config_save_config,
 )
 
@@ -584,106 +585,23 @@ class CashewMemoryProvider(MemoryProvider):
     # LLM integration via auxiliary.memory convention
     # ------------------------------------------------------------------
 
-    # Well-known provider-to-env-var mappings for API key resolution.
-    # Used when the auxiliary config does not explicitly provide an api_key.
-    _PROVIDER_ENV_MAP: dict[str, str] = {
-        "openai": "OPENAI_API_KEY",
-        "openrouter": "OPENROUTER_API_KEY",
-        "anthropic": "ANTHROPIC_API_KEY",
-        "opencode-go": "OPENCODE_GO_API_KEY",
-        "opencode-zen": "OPENCODE_ZEN_API_KEY",
-        "deepseek": "DEEPSEEK_API_KEY",
-        "google": "GOOGLE_API_KEY",
-        "xai": "XAI_API_KEY",
-        "github": "COPILOT_GITHUB_TOKEN",
-        "huggingface": "HF_TOKEN",
-    }
-
     def _build_model_fn(self) -> Callable[[str], str] | None:
         """Construct an LLM callable from the configured auxiliary.memory role.
 
-        Reads Hermes' own config.yaml to find the auxiliary.<role> section,
-        resolves the API key from config or well-known env vars, and returns
-        an OpenAI-compatible callable. Returns None when:
+        Delegates to ``config.resolve_model_fn()`` which reads Hermes'
+        ``config.yaml`` and resolves the API key from config or well-known
+        env vars. Returns None when:
         - No llm_aux_role is configured (heuristic-only mode)
         - The auxiliary section or API key cannot be found (logs warning)
         """
-        role = self._config.llm_aux_role if self._config else None
-        if not role:
+        if not self._config or not self._config.llm_aux_role:
             return None
-
-        config_path = self._hermes_home / "config.yaml" if self._hermes_home else pathlib.Path()
-        if not config_path or not config_path.exists():
-            logger.info(
-                "llm_aux_role=%r but %s not found; falling back to heuristic extraction",
-                role, config_path,
-            )
+        if self._hermes_home is None:
             return None
-
-        try:
-            import yaml
-            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-            aux_config = (raw or {}).get("auxiliary", {}).get(role, {})
-        except Exception:
-            logger.warning(
-                "llm_aux_role=%r: failed to parse %s; falling back to heuristic extraction",
-                role, config_path, exc_info=True,
-            )
-            return None
-
-        model = aux_config.get("model")
-        if not model:
-            logger.warning(
-                "llm_aux_role=%r: no model in auxiliary.%r config; "
-                "falling back to heuristic extraction", role, role,
-            )
-            return None
-
-        provider = aux_config.get("provider", "openai")
-        base_url = aux_config.get("base_url", "https://api.openai.com/v1").rstrip("/")
-
-        # Resolve API key: explicit config > env var by provider convention
-        api_key = aux_config.get("api_key")
-        if not api_key:
-            env_var = self._PROVIDER_ENV_MAP.get(provider)
-            if env_var:
-                api_key = os.environ.get(env_var)
-
-        if not api_key:
-            logger.warning(
-                "llm_aux_role=%r: no API key for provider=%r; "
-                "falling back to heuristic extraction", role, provider,
-            )
-            return None
-
-        logger.info(
-            "llm_aux_role=%r: using %s %s via %s",
-            role, provider, model, base_url,
+        return resolve_model_fn(
+            hermes_home=self._hermes_home,
+            config=self._config,
         )
-
-        def _model_fn(prompt: str) -> str:
-            """OpenAI-compatible chat completion callable for upstream cashew-brain."""
-            try:
-                import httpx
-                resp = httpx.post(
-                    f"{base_url}/chat/completions",
-                    json={
-                        "model": model,
-                        "messages": [{"role": "user", "content": prompt}],
-                    },
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    timeout=120,
-                )
-                resp.raise_for_status()
-                return resp.json()["choices"][0]["message"]["content"]
-            except Exception:
-                logger.warning(
-                    "LLM call failed for llm_aux_role=%r (model=%s)",
-                    role, model, exc_info=True,
-                )
-                return ""
-
-        return _model_fn
 
     def sync_turn(self, user_content: str, assistant_content: str, session_id: str = "") -> None:
         """Hot-path enqueue of a completed turn (SYNC-01).

@@ -278,3 +278,36 @@ def test_cron_script_is_installed(tmp_path, monkeypatch):
     assert "plugins.memory.cashew.sleep_refactor" in content
 
     provider.shutdown()
+
+
+def test_cron_script_imports_resolve_model_fn(tmp_path):
+    """The cron script imports resolve_model_fn and passes it to run_sleep_cycle."""
+    hermes_home = tmp_path / "h6"
+    hermes_home.mkdir()
+    cfg = hermes_home / "cashew.json"
+    config_yaml = hermes_home / "config.yaml"
+    config_yaml.write_text("model:\n  provider: test\n  default: test\n")
+    cfg.write_text(json.dumps(_make_config(hermes_home)))
+
+    (hermes_home / "cashew").mkdir(parents=True)
+    conn = sqlite3.connect(str(hermes_home / "cashew" / "brain.db"))
+    _ensure_schema(conn)
+    conn.close()
+
+    # Install the cron script
+    script_path = hermes_home / "scripts" / "cashew-sleep-cycle.py"
+    script_path.parent.mkdir(parents=True)
+    script_source = (Path(__file__).parent.parent / "plugins" / "memory"
+                     / "cashew" / "sleep_cron_script.py").read_text()
+    script_path.write_text(script_source)
+    script_path.chmod(0o755)
+
+    # Verify the script contains the resolve_model_fn import
+    assert "resolve_model_fn" in script_source
+    assert "model_fn = _resolve_model_fn" in script_source or \
+           "resolve_model_fn(hermes_home" in script_source
+    assert "model_fn=model_fn" in script_source
+    # No longer hardcoded None
+    assert "model_fn=None" not in script_source.replace(
+        "# model_fn=None (fallback)", ""
+    )

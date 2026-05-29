@@ -84,10 +84,14 @@ def main() -> None:
         # Fallback: try the installed package (PyPI install path)
         from cashew_sleep_refactor import run_sleep_cycle  # type: ignore[import-not-found]
 
+    # Resolve the LLM callable from auxiliary config for dream generation (Phase 8).
+    from plugins.memory.cashew.config import resolve_model_fn as _resolve_model_fn
+    model_fn = _resolve_model_fn(hermes_home=hermes_home)
+
     result = run_sleep_cycle(
         db_path=db_path,
         limit=limit,
-        model_fn=None,
+        model_fn=model_fn,
         background_dream=True,
         embedding_model=embedding_model,
     )

@@ -722,12 +722,15 @@ def run_sleep_cycle(
     conn.execute("PRAGMA busy_timeout=5000")
     _set_wal(conn)
 
-    # Select nodes for this cycle (oldest-first heuristic)
+    # Select nodes for this cycle (lowest-degree-first heuristic)
     rows = conn.execute(
         "SELECT e.node_id FROM embeddings e "
         "JOIN thought_nodes tn ON e.node_id = tn.id "
         "WHERE (tn.decayed IS NULL OR tn.decayed = 0) "
-        "ORDER BY tn.timestamp ASC "
+        "ORDER BY ("
+        "  SELECT COUNT(*) FROM derivation_edges "
+        "  WHERE parent_id = e.node_id OR child_id = e.node_id"
+        ") ASC, tn.timestamp ASC "
         "LIMIT ?",
         (limit,),
     ).fetchall()
@@ -748,7 +751,23 @@ def run_sleep_cycle(
     cross_stats = {"created": 0, "skipped": 0}
     cross_link_tuples: list[tuple[str, str, float]] = []
     if len(cross_pairs) > 0:
-        cross_stats = _batch_cross_links(conn, valid_ids, cross_pairs, sim)
+        # Resolve source_file for each valid node so _batch_cross_links can
+        # skip same-document pairs (which carry no graph-discovery value).
+        source_files: dict[str, str] = {}
+        for row in conn.execute(
+            "SELECT id, source_file FROM thought_nodes "
+            "WHERE id IN ({})".format(
+                ",".join(["?"] * len(valid_ids))
+            ),
+            valid_ids,
+        ).fetchall():
+            nid, sf = row
+            if sf:
+                source_files[nid] = sf
+        cross_stats = _batch_cross_links(
+            conn, valid_ids, cross_pairs, sim,
+            source_files=source_files or None,
+        )
         if model_fn is not None:
             for i, j in cross_pairs:
                 cross_link_tuples.append((

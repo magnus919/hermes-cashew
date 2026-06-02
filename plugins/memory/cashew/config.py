@@ -423,7 +423,32 @@ _PROVIDER_ENV_MAP: dict[str, str] = {
     "xai": "XAI_API_KEY",
     "github": "COPILOT_GITHUB_TOKEN",
     "huggingface": "HF_TOKEN",
+    "qwen": "QWEN_API_KEY",
+    "minimax": "MINIMAX_API_KEY",
+    "minimax-cn": "MINIMAX_CN_API_KEY",
+    "nvidia": "NVIDIA_API_KEY",
+    "ollama": "OLLAMA_API_KEY",
 }
+
+# Well-known inference base URLs for OpenAI-compatible providers.
+# Mirrors Hermes core's PROVIDER_REGISTRY inference_base_url values.
+# Used as fallback when auxiliary.<role>.base_url is missing or empty.
+_PROVIDER_BASE_URLS: dict[str, str] = {
+    "openai": "https://api.openai.com/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "opencode-zen": "https://opencode.ai/zen/v1",
+    "opencode-go": "https://opencode.ai/zen/go/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "xai": "https://api.x.ai/v1",
+    "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "minimax": "https://api.minimaxi.chat/v1",
+    "minimax-cn": "https://api.minimax.chat/v1",
+    "nvidia": "https://integrate.api.nvidia.com/v1",
+    "ollama": "http://127.0.0.1:11434/v1",
+}
+# NOTE: "anthropic", "google", and "huggingface" are intentionally omitted.
+# They do not expose OpenAI-compatible /chat/completions endpoints natively;
+# users targeting them must set an explicit base_url in config.yaml.
 
 
 def _read_cashew_config(hermes_home: pathlib.Path) -> CashewConfig | None:
@@ -503,7 +528,10 @@ def resolve_model_fn(
         return None
 
     provider = aux_config.get("provider", "openai")
-    base_url = aux_config.get("base_url", "https://api.openai.com/v1").rstrip("/")
+    base_url = (
+        aux_config.get("base_url")
+        or _PROVIDER_BASE_URLS.get(provider, "https://api.openai.com/v1")
+    ).rstrip("/")
 
     # Resolve API key: explicit config > env var by provider convention
     api_key = aux_config.get("api_key")

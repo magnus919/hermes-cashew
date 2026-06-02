@@ -20,6 +20,7 @@ from plugins.memory.cashew.config import (
     DEFAULTS,
     ENV_VAR_MAP,
     _env_var_name,
+    _PROVIDER_BASE_URLS,
     _PROVIDER_ENV_MAP,
     get_ai_domain,
     get_config_schema,
@@ -356,9 +357,20 @@ def test_load_config_v0_1_0_four_key_file_gets_defaults_for_new_keys(tmp_path):
 
 def test_provider_env_map_has_all_entries():
     """_PROVIDER_ENV_MAP covers all well-known providers."""
-    assert len(_PROVIDER_ENV_MAP) == 10
+    assert len(_PROVIDER_ENV_MAP) == 15
     assert _PROVIDER_ENV_MAP["deepseek"] == "DEEPSEEK_API_KEY"
     assert _PROVIDER_ENV_MAP["openai"] == "OPENAI_API_KEY"
+
+
+def test_provider_base_urls_covers_openai_compatible_providers():
+    """_PROVIDER_BASE_URLS has known endpoints for all OpenAI-compatible providers."""
+    assert _PROVIDER_BASE_URLS["deepseek"] == "https://api.deepseek.com/v1"
+    assert _PROVIDER_BASE_URLS["opencode-zen"] == "https://opencode.ai/zen/v1"
+    assert _PROVIDER_BASE_URLS["opencode-go"] == "https://opencode.ai/zen/go/v1"
+    assert _PROVIDER_BASE_URLS["openrouter"] == "https://openrouter.ai/api/v1"
+    # Anthropic and Google are intentionally NOT in the map.
+    assert "anthropic" not in _PROVIDER_BASE_URLS
+    assert "google" not in _PROVIDER_BASE_URLS
 
 
 def test_resolve_model_fn_returns_none_when_no_cashew_json(tmp_path):
@@ -498,7 +510,7 @@ def test_resolve_model_fn_graceful_on_corrupt_config_yaml(tmp_path):
 
 
 def test_resolve_model_fn_uses_default_base_url(tmp_path):
-    """No base_url in config → defaults to https://api.openai.com/v1."""
+    """No base_url in config → defaults to provider's well-known URL."""
     hermes_home = tmp_path / "h10"
     hermes_home.mkdir()
     (hermes_home / "cashew.json").write_text(
@@ -512,4 +524,47 @@ def test_resolve_model_fn_uses_default_base_url(tmp_path):
     )
     result = resolve_model_fn(hermes_home)
     assert result is not None
-    assert callable(result)
+
+
+def test_resolve_model_fn_empty_base_url_resolves_to_provider_default(tmp_path, monkeypatch):
+    """base_url: '' (Hermes convention for 'use default') → provider's well-known URL."""
+    hermes_home = tmp_path / "h11"
+    hermes_home.mkdir()
+    (hermes_home / "cashew.json").write_text(
+        json.dumps({"llm_aux_role": "memory"})
+    )
+    (hermes_home / "config.yaml").write_text(
+        "auxiliary:\n  memory:\n"
+        "    provider: deepseek\n"
+        "    model: deepseek-v4-flash\n"
+        "    base_url: ''\n"
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    result = resolve_model_fn(hermes_home)
+    assert result is not None
+    # The base_url is captured as a string in the closure
+    captured = [v.cell_contents for v in result.__closure__ if isinstance(v.cell_contents, str)]
+    assert "https://api.deepseek.com/v1" in captured, (
+        f"Expected deepseek base_url in closure, got: {captured}"
+    )
+
+
+def test_resolve_model_fn_missing_base_url_uses_provider_map(tmp_path, monkeypatch):
+    """No base_url key at all for non-OpenAI provider → resolves from _PROVIDER_BASE_URLS."""
+    hermes_home = tmp_path / "h12"
+    hermes_home.mkdir()
+    (hermes_home / "cashew.json").write_text(
+        json.dumps({"llm_aux_role": "memory"})
+    )
+    (hermes_home / "config.yaml").write_text(
+        "auxiliary:\n  memory:\n"
+        "    provider: opencode-zen\n"
+        "    model: mimo-v2.5-free\n"
+    )
+    monkeypatch.setenv("OPENCODE_ZEN_API_KEY", "test-key")
+    result = resolve_model_fn(hermes_home)
+    assert result is not None
+    captured = [v.cell_contents for v in result.__closure__ if isinstance(v.cell_contents, str)]
+    assert "https://opencode.ai/zen/v1" in captured, (
+        f"Expected opencode-zen base_url in closure, got: {captured}"
+    )

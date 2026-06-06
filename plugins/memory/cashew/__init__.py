@@ -508,9 +508,34 @@ class CashewMemoryProvider(MemoryProvider):
         Called from initialize() only on the happy path.  Safe to call
         multiple times — if a job is already registered for this provider
         instance, the call is a no-op.
+
+        The cron job persists across session boundaries (survives shutdown)
+        so the 12h schedule isn't reset on every session start.
         """
         if self._sleep_cron_job_id is not None:
-            return  # already registered
+            return  # already registered for this instance
+
+        # Phase 4b-adopt: scan for an existing sleep cron job by name.
+        # If one exists, adopt its ID and skip registration so the
+        # original 12h timer isn't reset. Without this, every session
+        # start would remove-and-re-register the job, resetting the
+        # schedule and preventing it from ever firing.
+        if self._hermes_home is not None:
+            try:
+                from cron.jobs import list_jobs  # type: ignore[import-untyped]
+
+                for job in list_jobs():
+                    if job.get("name") == "cashew-sleep-cycle":
+                        self._sleep_cron_job_id = job["id"]
+                        logger.info(
+                            "sleep: adopted existing cron job %s (preserving schedule)",
+                            job["id"],
+                        )
+                        return  # keep the existing job running
+            except ImportError:
+                logger.debug("sleep: cron module not available — cannot adopt")
+            except Exception:
+                logger.warning("sleep: failed to adopt existing cron job", exc_info=True)
 
         try:
             # Read the cron script source from disk and install it.
@@ -525,10 +550,6 @@ class CashewMemoryProvider(MemoryProvider):
                 logger.info("sleep: installed cron script to %s", script_dest)
             else:
                 logger.debug("sleep: cron script already exists at %s", script_dest)
-
-            # De-duplicate: check for an existing sleep cron job by name so
-            # we don't pile up duplicates across restarts.
-            _remove_existing_sleep_job(self._hermes_home)
 
             # Register via the Hermes cron API.
             from cron.jobs import create_job  # type: ignore[import-untyped]
@@ -1123,9 +1144,12 @@ class CashewMemoryProvider(MemoryProvider):
                     "cashew sync worker did not exit within %ss; abandoning",
                     timeout,
                 )
-        # Remove the sleep cycle cron job before clearing config state.
-        # Must run BEFORE _config is set to None since it reads config keys.
-        self._remove_sleep_cron()
+        # Sleep cycle cron job is intentionally NOT removed here.
+        # It persists across session boundaries so the 12h schedule
+        # isn't reset on every session start. The next initialize()
+        # will adopt the existing job via Phase 4b-adopt logic.
+        # See _register_sleep_cron() for the adoption logic.
+        self._sleep_cron_job_id = None  # clear instance tracking only
         # Clear state. _hermes_home persists (see Phase 2 Plan 02-02 rationale).
         self._sync_queue = None
         self._sync_worker = None

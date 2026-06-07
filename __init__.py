@@ -1,70 +1,84 @@
-# __init__.py (repo root — dual-context implementation)
+# Re-export shim for hermes-cashew.
 #
-# FLAT-ENTRY (Hermes): Loaded as hermes_plugins.cashew (Hermes 0.8.8+) or _hermes_user_memory.cashew (older Hermes)
-# Python sets __package__ to the parent namespace (a synthetic module in sys.modules).
-# We detect flat-entry by __spec__.parent not being a real package in sys.modules.
-# We provide the full implementation by pre-populating sys.modules and exec'ing the
-# nested __init__.py so relative imports resolve.
+# The actual implementation lives under plugins/memory/cashew/ so both
+# install paths work:
+#   1. `hermes plugins install magnus919/hermes-cashew`  → root __init__.py loads
+#   2. Symlink into hermes-agent/plugins/memory/cashew/   → nested __init__.py loads
 #
-# PIP / TEST: Loaded as plugins.memory.cashew via namespace package resolution.
-# Python's normal import mechanism loads nested/__init__.py directly (this root
-# __init__.py is not involved since there's no root __init__.py in the namespace).
+# This shim uses importlib so relative imports in the nested module resolve
+# regardless of how the root package was named by the plugin discovery
+# system (_hermes_user_memory.cashew, hermes_plugins.cashew, etc.).
+
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import sys
-import os
+from pathlib import Path
 
-# Detect flat-entry: __spec__.parent is a Hermes synthetic namespace (hermes_plugins or _hermes_user_memory).
-# In pip/test, this root __init__.py is NOT loaded (namespace package skips it).
+# Detect flat-entry: __spec__.parent is a Hermes synthetic namespace
+# (hermes_plugins or _hermes_user_memory). In pip/test, this root
+# __init__.py is NOT loaded (namespace package skips it).
 _spec_parent = getattr(__spec__, "parent", "") or ""
-_is_flat = _spec_parent.startswith("_hermes_user_memory") or _spec_parent.startswith("_hermes") or _spec_parent == "hermes_plugins" or _spec_parent.startswith("hermes_plugins.")
+_is_flat = (
+    _spec_parent.startswith("_hermes_user_memory")
+    or _spec_parent.startswith("_hermes")
+    or _spec_parent == "hermes_plugins"
+    or _spec_parent.startswith("hermes_plugins.")
+)
 
-if _is_flat:
-    _root = os.path.dirname(os.path.abspath(__file__))
-    _nested = os.path.join(_root, "plugins", "memory", "cashew")
+_NESTED = Path(__file__).resolve().parent / "plugins" / "memory" / "cashew"
+_IMPL_MODULE = "_hermes_cashew_impl"
 
-    # Pre-populate sys.modules so nested's relative imports resolve.
-    _pkg_name = _spec_parent
-    if _pkg_name not in sys.modules:
-        _pkg_mod = type(sys)(_pkg_name)
-        _pkg_mod.__path__ = [_nested]
-        sys.modules[_pkg_name] = _pkg_mod
-
-    # Load config/tools/verify into _pkg_name namespace
-    for _name in ("config", "tools", "verify"):
-        _path = os.path.join(_nested, f"{_name}.py")
-        _spec = importlib.util.spec_from_file_location(f"{_pkg_name}.{_name}", _path)
+if _IMPL_MODULE not in sys.modules:
+    _init = _NESTED / "__init__.py"
+    if _init.exists():
+        _spec = importlib.util.spec_from_file_location(
+            _IMPL_MODULE,
+            str(_init),
+            submodule_search_locations=[str(_NESTED)],
+        )
         if _spec and _spec.loader:
-            _m = importlib.util.module_from_spec(_spec)
-            sys.modules[f"{_pkg_name}.{_name}"] = _m
-            _spec.loader.exec_module(_m)
+            # Pre-register submodules so relative imports inside the
+            # nested __init__.py (from .config, from .tools) work.
+            for _sf in sorted(_NESTED.glob("*.py")):
+                if _sf.name == "__init__.py":
+                    continue
+                _sn = _sf.stem
+                _full = f"{_IMPL_MODULE}.{_sn}"
+                if _full not in sys.modules:
+                    _ss = importlib.util.spec_from_file_location(_full, str(_sf))
+                    if _ss and _ss.loader:
+                        _sm = importlib.util.module_from_spec(_ss)
+                        sys.modules[_full] = _sm
+                        try:
+                            _ss.loader.exec_module(_sm)
+                        except Exception:
+                            pass
 
-    # Load agent.memory_provider and core.context (may already be in sys.modules)
-    try:
-        from agent.memory_provider import MemoryProvider  # noqa: F401,F811
-    except ImportError:
-        pass
-    try:
-        from core.context import ContextRetriever  # noqa: F401,F811
-    except ImportError:
-        pass
+            _mod = importlib.util.module_from_spec(_spec)
+            sys.modules[_IMPL_MODULE] = _mod
+            _spec.loader.exec_module(_mod)
 
-    # Now exec the nested __init__.py as plugins.memory.cashew
-    _spec = importlib.util.spec_from_file_location(
-        "plugins.memory.cashew",
-        os.path.join(_nested, "__init__.py"),
-        submodule_search_locations=[_nested],
-    )
-    if _spec and _spec.loader:
-        _mod = importlib.util.module_from_spec(_spec)
-        sys.modules["plugins.memory.cashew"] = _mod
-        _spec.loader.exec_module(_mod)
-        for _attr in dir(_mod):
-            if not _attr.startswith("__"):
-                globals()[_attr] = getattr(_mod, _attr)
+            # Re-export everything the discovery system looks for
+            CashewMemoryProvider = _mod.CashewMemoryProvider
+
+            def register(ctx) -> None:
+                """Hermes discovery entry point."""
+                register_fn = getattr(ctx, "register_memory_provider", None)
+                if register_fn is not None:
+                    register_fn(CashewMemoryProvider())
+        else:
+            msg = f"hermes-cashew: nested __init__.py found at {_init} but spec_from_file_location returned {_spec}"
+            raise RuntimeError(msg)
+    else:
+        msg = f"hermes-cashew: nested implementation not found at {_NESTED}"
+        raise RuntimeError(msg)
 else:
-    # pip / test — namespace package loads nested/__init__.py directly.
-    # This root file is not involved in that path.
-    from plugins.memory.cashew import CashewMemoryProvider, register  # noqa: F401
-    __all__ = ["CashewMemoryProvider", "register"]
+    # Already loaded — re-export from cache (shouldn't normally happen)
+    from _hermes_cashew_impl import CashewMemoryProvider  # noqa: F811
+
+    def register(ctx) -> None:
+        register_fn = getattr(ctx, "register_memory_provider", None)
+        if register_fn is not None:
+            register_fn(CashewMemoryProvider())

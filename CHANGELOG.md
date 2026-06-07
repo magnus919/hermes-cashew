@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.10.3 (2026-06-07) — Standard sqlite-vec, Self-Healing, Atexit Resilience
+
+### Added
+
+- **Self-healing stale lock cleanup.** `initialize()` now calls `_heal_stale_lock()`
+  which removes `brain.db.sleep.lock` files older than 60 minutes, surviving crashes
+  that left the lock behind. ([#102](https://github.com/magnus919/hermes-cashew/pull/102))
+- **`_shutdown_flag` guard.** The sync worker short-circuits when `shutdown()`
+  signals it, preventing `RuntimeError: can't register atexit after shutdown`
+  from Python's interpreter-exit racing with the embedding model's thread pool
+  finalization. ([#102](https://github.com/magnus919/hermes-cashew/pull/102))
+
+### Changed
+
+- **sqlite-vec is now a standard dependency.** Moved from `[project.optional-dependencies] vec`
+  to `[project.dependencies]`. Users no longer need `pip install hermes-cashew[vec]`
+  to get vector search. Graceful degradation (keyword + BFS fallback) is preserved
+  for platforms where the native extension cannot load.
+  ([#101](https://github.com/magnus919/hermes-cashew/pull/101))
+- **`plugin.yaml` both files** list `sqlite-vec` in `pip_dependencies`.
+
+### Removed
+
+- **Stale `[vec]` extras group** from `pyproject.toml` — superseded by standard dep.
+
 ## v0.10.2 (2026-05-27) — Contract, Sleep, Embedding, Docs & Test Fixes
 
 ### Fixed

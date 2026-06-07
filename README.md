@@ -15,7 +15,7 @@ vectorized cross-linking, batched DB writes, ~4s at 7K nodes.
 
 - [Hermes Agent](https://github.com/nousresearch/hermes-agent) installed
 - `cashew-brain>=1.0.0` — installed automatically by `hermes plugins install`
-- `sqlite-vec` — optional, enables semantic search (install below if wanted)
+- `sqlite-vec` — enables vector similarity search. Installed automatically.
 
 ## Install
 
@@ -152,8 +152,7 @@ Expected output shows `Provider: cashew` with `Plugin: installed` and `Status: a
 `hermes-cashew` provides two LLM-accessible tools:
 
 - **`cashew_query`** — searches the local thought graph for context relevant to
-  the current conversation. Uses sqlite-vec for semantic search when available,
-  with keyword fallback on macOS or when the extension is unavailable.
+  the current conversation. Uses sqlite-vec for semantic search.
 - **`cashew_extract`** — explicitly persists a conversation turn into the graph.
   The agent can call this when it judges a turn contains worth-remembering knowledge.
 
@@ -170,8 +169,7 @@ Nodes in the thought graph can carry tags. The `cashew_query` tool accepts an
 {"query": "prior decisions", "exclude_tags": ["vault:private"]}
 ```
 
-This works in both the upstream retrieval path (sqlite-vec / BFS) and the
-keyword fallback. Common use cases:
+This works in both the vector search and keyword fallback paths. Common use cases:
 
 - **Privacy**: Tag sensitive nodes with `vault:private` to exclude them from
   group or shared contexts
@@ -285,28 +283,19 @@ the API key dependency in a subprocess.
 | ``sleep_schedule`` | ``\"every 12h\"`` | Cron expression or interval string. Set to ``\"\"`` to disable cron-based scheduling entirely. Examples: ``\"every 30m\"``, ``\"0 */2 * * *\"``, ``\"0 3 * * *\"`` (daily at 3am). |
 | ``sleep_max_nodes`` | ``2000`` | Maximum number of nodes to cross-link in a single sleep cycle. Higher values converge faster but take longer per tick. |
 
-## Semantic Search (Optional)
+## Semantic Search
 
-`sqlite-vec` is an optional SQLite extension that enables vector similarity search.
-Without it, cashew falls back to keyword-based retrieval — still functional,
+`sqlite-vec` enables vector similarity search and is installed automatically as a
+standard dependency. If your platform doesn't support sqlite-vec's native extension,
+the plugin degrades gracefully to keyword-based retrieval — still functional,
 but less precise.
 
-**Install:**
-```bash
-pip install sqlite-vec
-```
-
-You may also need to enable load extension support in your SQLite build:
-```bash
-sqlite3_config(SQLITE_ENABLE_LOAD_EXTENSION)
-```
-
-If sqlite-vec is not available at runtime, you'll see this INFO log on startup:
+When sqlite-vec is not available at runtime, you'll see this log on startup:
 ```
 sqlite-vec not available; semantic search will use fallback
 ```
 
-This is normal and expected on systems without sqlite-vec support.
+This is normal — the plugin continues operating with keyword + BFS fallback.
 
 ## Uninstall
 

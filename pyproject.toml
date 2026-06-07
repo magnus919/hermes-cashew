@@ -12,6 +12,7 @@ requires-python = ">=3.10"
 authors = [{ name = "Magnus Hedemark", email = "magnus919@pm.me" }]
 dependencies = [
     "cashew-brain>=1.1.0,<2.0.0",
+    "sqlite-vec",
 ]
 
 [project.optional-dependencies]
@@ -22,9 +23,6 @@ dev = [
     "jsonschema>=4.18,<5",
     "PyYAML>=6.0",
     "build>=1.0",
-]
-vec = [
-    "sqlite-vec",
 ]
 
 [project.entry-points."hermes_agent.plugins"]

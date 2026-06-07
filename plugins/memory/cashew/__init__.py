@@ -712,7 +712,7 @@ class CashewMemoryProvider(MemoryProvider):
                 except (ImportError, AttributeError):
                     conn.load_extension("vec0")
             except Exception:
-                pass  # sqlite-vec not available; individual callers handle their own fallback
+                pass  # sqlite-vec not available at platform level; graceful degradation active
             self._migrate_vec_embeddings(conn)
             self._create_vec_embeddings(conn)
             # Hermes provider metadata store (persistent counters, flags)
@@ -752,7 +752,7 @@ class CashewMemoryProvider(MemoryProvider):
                 logger.info("Migrating vec_embeddings from old schema (dropping and recreating)")
                 conn.execute("DROP TABLE vec_embeddings")
         except Exception:
-            logger.info("sqlite-vec not available; skipping vec_embeddings migration")
+            logger.info("sqlite-vec extension failed to load; vec_embeddings migration skipped")
 
 
 
@@ -784,7 +784,7 @@ class CashewMemoryProvider(MemoryProvider):
             """)
             logger.debug(f"vec_embeddings virtual table ready (dim={dim})")
         except Exception:
-            logger.info("sqlite-vec not available; semantic search will use fallback")
+            logger.info("sqlite-vec extension failed to load; semantic search will use fallback")
 
     def _enrich_results(self, node_ids: list[str]) -> list[dict]:
         """Fetch full node dicts from DB for upstream retrieval results.

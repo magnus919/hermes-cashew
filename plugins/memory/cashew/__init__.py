@@ -381,6 +381,11 @@ class CashewMemoryProvider(MemoryProvider):
         # _register_sleep_cron(), cleared in shutdown(). None when
         # sleep scheduling is disabled or registration failed.
         self._sleep_cron_job_id: str | None = None
+        # Shutdown flag: set by shutdown() before the sentinel is posted, and
+        # checked by _drain_once to abort early if the interpreter is shutting
+        # down (avoids RuntimeError from sentence-transformers' atexit handler
+        # racing with Python's shutdown sequence).
+        self._shutdown_flag = threading.Event()
 
     @property
     def name(self) -> str:
@@ -438,6 +443,8 @@ class CashewMemoryProvider(MemoryProvider):
         # Queue is created here so config-driven sizing/timeout values are wired in.
         # Phase 4 adds the non-daemon worker thread that drains it (see CLAUDE.md ### Threading Rule).
         self._sync_queue = queue.Queue(maxsize=16)
+        # Reset shutdown flag — a prior shutdown() may have set it.
+        self._shutdown_flag.clear()
         try:
             self._config = load_config(self._hermes_home)
             # Propagate embedding model to upstream cashew-brain.
@@ -463,6 +470,8 @@ class CashewMemoryProvider(MemoryProvider):
                     "cashew-brain dependency missing"
                 )
             self._db_path.parent.mkdir(parents=True, exist_ok=True)
+            # Phase 3.5: self-healing — clean up stale state from prior crashes.
+            self._heal_stale_lock()
             self._ensure_db_schema(self._db_path)
             self._retriever = ContextRetriever(db_path=str(self._db_path))
             self._model_fn = self._build_model_fn()
@@ -689,6 +698,28 @@ class CashewMemoryProvider(MemoryProvider):
             finally:
                 q.task_done()
 
+    def _heal_stale_lock(self) -> None:
+        """Remove stale sleep-cycle lock files left by prior crashes.
+
+        The sleep cycle creates ``brain.db.sleep.lock`` while running. If the
+        process is killed (SIGKILL, power loss, OOM) before the lock is
+        released, the file persists and blocks future sleep cycles.
+
+        Rule: any lock file older than 60 minutes is considered stale and
+        removed silently.  Newer locks are left alone (the sleep cycle may
+        still be running in another process).
+        """
+        import time
+        stale_threshold = 3600  # 60 minutes in seconds
+        lock_path = self._db_path.parent / "brain.db.sleep.lock"
+        if lock_path.exists():
+            age = time.time() - lock_path.stat().st_mtime
+            if age > stale_threshold:
+                lock_path.unlink(missing_ok=True)
+                logger.info("cashew self-heal: removed stale sleep lock (age=%.0fs)", age)
+            elif age > 0:
+                logger.debug("cashew self-heal: sleep lock is fresh (age=%.0fs) — leaving in place", age)
+
     def _ensure_db_schema(self, db_path: pathlib.Path) -> None:
         """Create or migrate Cashew schema tables.
 
@@ -869,6 +900,13 @@ class CashewMemoryProvider(MemoryProvider):
         from core.session import end_session  # lazy import (see 04-RESEARCH.md §9 + test strategy §11)
         user, assistant, session_id = turn
 
+        # Short-circuit if shutdown is in progress — the interpreter's atexit
+        # handlers may have already finalized the embedding model's thread pool,
+        # and calling end_session would raise RuntimeError from sentence-transformers.
+        if self._shutdown_flag.is_set():
+            logger.debug("cashew sync: shutdown flag set, dropping turn")
+            return
+
         import sqlite3
         max_retries = 3
         for attempt in range(max_retries):
@@ -880,6 +918,16 @@ class CashewMemoryProvider(MemoryProvider):
                     model_fn=self._model_fn,
                 )
                 break  # success
+            except RuntimeError as e:
+                # Python interpreter shutdown: sentence-transformers' thread pool
+                # was finalized by atexit handlers. There is no recovery — drop
+                # the turn silently and let the worker loop terminate naturally.
+                msg = str(e)
+                if "can't register atexit after shutdown" in msg:
+                    logger.info("cashew sync: interpreter shutting down, dropping turn")
+                    self._shutdown_flag.set()
+                    return
+                raise
             except sqlite3.OperationalError as e:
                 if "database is locked" in str(e) and attempt < max_retries - 1:
                     wait = 0.5 * (2 ** attempt)
@@ -1128,6 +1176,9 @@ class CashewMemoryProvider(MemoryProvider):
         if self._sync_queue is None:
             return  # safe no-op: initialize() was never called
         timeout = self._config.sync_queue_timeout if self._config is not None else 30.0
+        # Signal shutdown BEFORE the sentinel so _drain_once can short-circuit
+        # even if the sentinel is still queued behind pending turns.
+        self._shutdown_flag.set()
         # Post sentinel. put_nowait first; if somehow full, try a brief blocking put.
         try:
             self._sync_queue.put_nowait(_SHUTDOWN)

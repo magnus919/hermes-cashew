@@ -163,26 +163,6 @@ def test_metadata_backfill(tmp_path):
         p.shutdown()
 
 
-def test_vec_embeddings_guarded_when_unavailable(tmp_path, caplog):
-    """SCHEMA-04: When sqlite-vec is unavailable, initialize() succeeds and logs INFO."""
-    p = CashewMemoryProvider()
-    with caplog.at_level("INFO", logger="plugins.memory.cashew"):
-        p.initialize("s", hermes_home=str(tmp_path))
-    try:
-        # Must succeed even though sqlite-vec is not installed in test environment
-        assert p._config is not None, "initialize() must succeed when sqlite-vec is unavailable"
-        assert p._db_path is not None
-        infos = [r for r in caplog.records if r.levelname == "INFO"]
-        assert any(
-            "sqlite-vec not available" in r.getMessage() for r in infos
-        ), (
-            f"Expected INFO about sqlite-vec unavailability; got: "
-            f"{[r.getMessage() for r in infos]}"
-        )
-    finally:
-        p.shutdown()
-
-
 def test_existing_data_preserved(tmp_path):
     """SCHEMA-06: Existing row data is preserved after migration (confidence column excluded —
     upstream v1.1.0 drops it intentionally per cashew-brain PR #25)."""

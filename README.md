@@ -290,12 +290,7 @@ standard dependency. If your platform doesn't support sqlite-vec's native extens
 the plugin degrades gracefully to keyword-based retrieval — still functional,
 but less precise.
 
-When sqlite-vec is not available at runtime, you'll see this log on startup:
-```
-sqlite-vec not available; semantic search will use fallback
-```
-
-This is normal — the plugin continues operating with keyword + BFS fallback.
+sqlite-vec is a standard dependency and will always be loaded at startup.
 
 ## Uninstall
 

@@ -12,7 +12,7 @@ def test_name_is_cashew():
 def test_is_available_false_before_config():
     """ABC-03: is_available returns False when deps are unavailable and no config exists."""
     import plugins.memory.cashew as cashew_mod
-    import sys as _sys
+
     _cashew_impl = _sys.modules.get("plugins.memory.cashew") or cashew_mod
     from plugins.memory.cashew import ContextRetriever as real_retriever
     # Temporarily null ContextRetriever to simulate no-cashew-brain scenario
@@ -28,18 +28,25 @@ def test_is_available_false_before_config():
 def test_is_available_no_filesystem_calls(monkeypatch):
     """ABC-03: no filesystem I/O on is_available()."""
     import pathlib
+
     calls = []
     original_exists = pathlib.Path.exists
+
     def _track_exists(self):
         calls.append(("exists", str(self)))
         return original_exists(self)
+
     monkeypatch.setattr("pathlib.Path.exists", _track_exists)
 
-    original_open = __builtins__["open"] if isinstance(__builtins__, dict) else __builtins__.open
+    original_open = (
+        __builtins__["open"] if isinstance(__builtins__, dict) else __builtins__.open
+    )
     open_calls = []
+
     def _track_open(*args, **kwargs):
         open_calls.append(args[0] if args else None)
         return original_open(*args, **kwargs)
+
     monkeypatch.setattr("builtins.open", _track_open)
 
     CashewMemoryProvider().is_available()

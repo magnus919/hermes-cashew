@@ -21,6 +21,10 @@ def test_root_init_reexports_register_and_provider():
     spec.loader.exec_module(mod)
 
     assert hasattr(mod, "register"), "root __init__.py must re-export register"
-    assert callable(mod.register), f"register must be callable, got {type(mod.register)}"
-    assert hasattr(mod, "CashewMemoryProvider"), "root __init__.py must re-export CashewMemoryProvider"
+    assert callable(mod.register), (
+        f"register must be callable, got {type(mod.register)}"
+    )
+    assert hasattr(mod, "CashewMemoryProvider"), (
+        "root __init__.py must re-export CashewMemoryProvider"
+    )
     assert mod.CashewMemoryProvider().name == "cashew"

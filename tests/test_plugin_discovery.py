@@ -19,12 +19,17 @@ def test_entry_point_loads():
     cashew_eps = [ep for ep in eps if ep.name == "cashew"]
     assert len(cashew_eps) == 1, f"expected 1 cashew entry point, got {len(cashew_eps)}"
     mod = cashew_eps[0].load()
-    assert hasattr(mod, "register"), "entry point module must expose a register function"
-    assert callable(mod.register), f"register must be callable, got {type(mod.register)}"
+    assert hasattr(mod, "register"), (
+        "entry point module must expose a register function"
+    )
+    assert callable(mod.register), (
+        f"register must be callable, got {type(mod.register)}"
+    )
 
 
 def test_module_importable():
     """PKG-01: plugins.memory.cashew is importable from the installed package."""
     import plugins.memory.cashew
+
     assert hasattr(plugins.memory.cashew, "CashewMemoryProvider")
     assert hasattr(plugins.memory.cashew, "register")

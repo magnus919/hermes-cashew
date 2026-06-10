@@ -16,7 +16,9 @@ def test_full_lifecycle_does_not_touch_home(tmp_path, home_snapshot):
     The fixture also calls assert_unchanged() at teardown as belt-and-suspenders.
     """
     p = CashewMemoryProvider()
-    p.save_config({"recall_k": 9, "embedding_model": "BAAI/bge-small-en"}, str(tmp_path))
+    p.save_config(
+        {"recall_k": 9, "embedding_model": "BAAI/bge-small-en"}, str(tmp_path)
+    )
     p.initialize("session-no-leak", hermes_home=str(tmp_path))
     # Mid-lifecycle check: cashew.json exists under tmp_path
     assert (tmp_path / "cashew.json").exists()

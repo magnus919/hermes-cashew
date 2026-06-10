@@ -40,7 +40,9 @@ def _strip_comments_and_docstrings(source: str) -> str:
     import tokenize
 
     # Step 1: collect docstring byte-offset ranges via AST walk.
-    docstring_ranges: list[tuple[int, int, int, int]] = []  # (start_line, start_col, end_line, end_col)
+    docstring_ranges: list[
+        tuple[int, int, int, int]
+    ] = []  # (start_line, start_col, end_line, end_col)
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -61,11 +63,18 @@ def _strip_comments_and_docstrings(source: str) -> str:
         return None
 
     for node in ast.walk(tree):
-        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if isinstance(
+            node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
             const = _is_docstring(node)
             if const is not None:
                 docstring_ranges.append(
-                    (const.lineno, const.col_offset, const.end_lineno or const.lineno, const.end_col_offset or 0)
+                    (
+                        const.lineno,
+                        const.col_offset,
+                        const.end_lineno or const.lineno,
+                        const.end_col_offset or 0,
+                    )
                 )
 
     # Step 2: build line-indexed list, blank out docstring ranges and comments.
@@ -79,7 +88,9 @@ def _strip_comments_and_docstrings(source: str) -> str:
             line = out_lines[sl0]
             out_lines[sl0] = line[:sc] + " " * (ec - sc) + line[ec:]
         else:
-            out_lines[sl0] = out_lines[sl0][:sc] + " " * max(0, len(out_lines[sl0]) - sc)
+            out_lines[sl0] = out_lines[sl0][:sc] + " " * max(
+                0, len(out_lines[sl0]) - sc
+            )
             for i in range(sl0 + 1, el0):
                 out_lines[i] = " " * len(out_lines[i])
             out_lines[el0] = " " * ec + out_lines[el0][ec:]

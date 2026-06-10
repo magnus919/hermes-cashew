@@ -186,9 +186,13 @@ def test_existing_data_preserved(tmp_path):
             "SELECT id, content, node_type, domain, timestamp "
             "FROM thought_nodes WHERE id = 'n1'"
         ).fetchone()
-        assert row == ("n1", "hello world", "fact", "test-domain", "2024-01-01T00:00:00"), (
-            f"Existing data was corrupted during migration: {row}"
-        )
+        assert row == (
+            "n1",
+            "hello world",
+            "fact",
+            "test-domain",
+            "2024-01-01T00:00:00",
+        ), f"Existing data was corrupted during migration: {row}"
         conn.close()
     finally:
         p.shutdown()
@@ -200,6 +204,7 @@ def test_fresh_db_has_all_columns(tmp_path):
     p.initialize("s", hermes_home=str(tmp_path))
     try:
         import pathlib
+
         db_path = pathlib.Path(str(tmp_path)) / "cashew" / "brain.db"
         conn = sqlite3.connect(str(db_path))
         cols = _get_columns(conn, "thought_nodes")

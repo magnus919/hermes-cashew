@@ -122,5 +122,9 @@ def test_provider_get_tool_schemas_returns_single_cashew_query_schema():
     callers must not mutate them.
     """
     schemas = CashewMemoryProvider().get_tool_schemas()
-    assert len(schemas) == 2, "Phase 4 expects two schemas: cashew_query + cashew_extract"
-    assert schemas[0] is CASHEW_QUERY_SCHEMA, "get_tool_schemas must return the module constant, not a copy"
+    assert len(schemas) == 2, (
+        "Phase 4 expects two schemas: cashew_query + cashew_extract"
+    )
+    assert schemas[0] is CASHEW_QUERY_SCHEMA, (
+        "get_tool_schemas must return the module constant, not a copy"
+    )

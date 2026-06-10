@@ -14,7 +14,9 @@ from plugins.memory.cashew import CashewMemoryProvider
 from plugins.memory.cashew.config import DEFAULTS, resolve_db_path
 
 
-def _make_initialized_provider(tmp_path, recall_k: int | None = None) -> CashewMemoryProvider:
+def _make_initialized_provider(
+    tmp_path, recall_k: int | None = None
+) -> CashewMemoryProvider:
     """Mirror helper from test_recall.py: initialize with real DB."""
     p = CashewMemoryProvider()
     overrides = {"recall_k": recall_k} if recall_k is not None else {}
@@ -95,7 +97,9 @@ def test_max_nodes_override_wins_over_recall_k(tmp_path):
     for i in range(5):
         _seed_node(db, id=f"n{i}", content=f"shared keyword {i}")
     try:
-        result = p.handle_tool_call("cashew_query", {"query": "shared keyword", "max_nodes": 3})
+        result = p.handle_tool_call(
+            "cashew_query", {"query": "shared keyword", "max_nodes": 3}
+        )
         d = json.loads(result)
         assert d["ok"] is True
         assert d["node_count"] <= 3
@@ -156,7 +160,9 @@ def test_missing_query_returns_error_envelope_and_logs_once(tmp_path, caplog):
         p.shutdown()
 
 
-def test_retrieval_exception_returns_error_envelope_and_logs_once(tmp_path, caplog, monkeypatch):
+def test_retrieval_exception_returns_error_envelope_and_logs_once(
+    tmp_path, caplog, monkeypatch
+):
     """RECALL-04: retrieval raises -> error envelope + one WARNING with exc_info."""
     p = _make_initialized_provider(tmp_path)
     db = resolve_db_path(tmp_path, DEFAULTS["cashew_db_path"])
@@ -195,7 +201,13 @@ def test_error_envelope_has_no_stack_trace_substrings(tmp_path, caplog, monkeypa
     try:
         with caplog.at_level(logging.WARNING, logger="plugins.memory.cashew"):
             result = p.handle_tool_call("cashew_query", {"query": "x"})
-        forbidden = ["Traceback", "File \"", "sqlite3.OperationalError", "at line", "/some/secret/path/"]
+        forbidden = [
+            "Traceback",
+            'File "',
+            "sqlite3.OperationalError",
+            "at line",
+            "/some/secret/path/",
+        ]
         for f in forbidden:
             assert f not in result, f"error envelope leaks {f!r}: {result!r}"
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]

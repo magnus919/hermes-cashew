@@ -59,6 +59,7 @@ def main() -> int:
         provider = CashewMemoryProvider()
 
         from plugins.memory.cashew.config import save_config
+
         save_config(
             {
                 "cashew_db_path": "cashew/brain.db",
@@ -71,6 +72,7 @@ def main() -> int:
         (hermes_home / "cashew").mkdir(exist_ok=True)
         db_path = hermes_home / "cashew" / "brain.db"
         import sqlite3
+
         conn = sqlite3.connect(str(db_path))
         conn.execute("""
             CREATE TABLE IF NOT EXISTS thought_nodes (
@@ -117,7 +119,9 @@ def main() -> int:
         conn.close()
 
         try:
-            provider.initialize(session_id="verify-session", hermes_home=str(hermes_home))
+            provider.initialize(
+                session_id="verify-session", hermes_home=str(hermes_home)
+            )
         except Exception as exc:
             _error(f"initialize raised {type(exc).__name__}: {exc}")
 

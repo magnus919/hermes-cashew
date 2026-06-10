@@ -23,6 +23,7 @@ def _clear_cashew_env_vars(monkeypatch: pytest.MonkeyPatch):
         if key.startswith("CASHEW_"):
             monkeypatch.delenv(key, raising=False)
 
+
 # Synthesize agent.memory_provider if hermes-agent is not installed.
 # Verified minimal contract: MemoryProvider has `name` property and a set of abstract methods.
 # We only need the ABC to be importable — actual method signatures are exercised by Hermes at runtime.
@@ -107,15 +108,24 @@ def fake_embedder(monkeypatch):
     `raising=False` makes each patch a no-op if that attribute is absent on the current Cashew version —
     the fixture is belt-and-suspenders, not a pinned-version contract.
     """
+
     def _stub(*args, **kwargs):
         raise RuntimeError(
             "Real embedding load blocked in tests. Use a fixture-provided stub retriever."
         )
+
     try:
         import core.embeddings  # noqa: F401
-        for attr in ("load_embeddings", "load_all_embeddings", "embed_text", "embed_nodes"):
+
+        for attr in (
+            "load_embeddings",
+            "load_all_embeddings",
+            "embed_text",
+            "embed_nodes",
+        ):
             monkeypatch.setattr(f"core.embeddings.{attr}", _stub, raising=False)
-        import core.session
+        import core.session  # noqa: F401
+
         for attr in ("embed_text", "embed_nodes"):
             monkeypatch.setattr(f"core.session.{attr}", _stub, raising=False)
     except ImportError:
@@ -131,12 +141,12 @@ def _mock_heavy_imports(monkeypatch: pytest.MonkeyPatch):
     """
     import numpy as np
 
-    def _numpy_cosine_similarity(X: np.ndarray) -> np.ndarray:
+    def _numpy_cosine_similarity(x: np.ndarray) -> np.ndarray:
         """Pure numpy cosine similarity — replaces sklearn for tests."""
-        norms = np.linalg.norm(X, axis=1, keepdims=True)
+        norms = np.linalg.norm(x, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
-        X_norm = X / norms
-        return np.dot(X_norm, X_norm.T)
+        x_norm = x / norms
+        return np.dot(x_norm, x_norm.T)
 
     class _FakeSentenceTransformer:
         """No-op SentenceTransformer that returns deterministic embeddings."""
@@ -144,7 +154,9 @@ def _mock_heavy_imports(monkeypatch: pytest.MonkeyPatch):
         def __init__(self, model_name: str = ""):
             self.model_name = model_name
 
-        def encode(self, texts, normalize_embeddings: bool = True, **kwargs) -> np.ndarray:
+        def encode(
+            self, texts, normalize_embeddings: bool = True, **kwargs
+        ) -> np.ndarray:
             if isinstance(texts, str):
                 texts = [texts]
             # Deterministic: hash-based embedding
@@ -169,6 +181,7 @@ def _mock_heavy_imports(monkeypatch: pytest.MonkeyPatch):
 
     # Mock SentenceTransformer at the import level — used inside _embed_orphans()
     import sys
+
     _had_st = "sentence_transformers" in sys.modules
     _saved_st = sys.modules.get("sentence_transformers")
     fake_st_module = type(sys)("sentence_transformers")
@@ -201,6 +214,7 @@ def home_snapshot():
     Never creates files under ~ — purely observational.
     """
     import pathlib
+
     home_hermes = pathlib.Path.home() / ".hermes"
 
     def _snapshot():
@@ -209,8 +223,7 @@ def home_snapshot():
         files = frozenset(
             p.relative_to(home_hermes).as_posix()
             for p in home_hermes.rglob("*")
-            if p.is_file()
-            and not p.name.endswith((".db-wal", ".db-shm"))
+            if p.is_file() and not p.name.endswith((".db-wal", ".db-shm"))
         )
         return {"exists": True, "files": files}
 
@@ -224,8 +237,12 @@ def home_snapshot():
         if pre["exists"]:
             new_files = post["files"] - pre["files"]
             removed_files = pre["files"] - post["files"]
-            assert not new_files, f"~/.hermes gained files during test: {sorted(new_files)}"
-            assert not removed_files, f"~/.hermes lost files during test: {sorted(removed_files)}"
+            assert not new_files, (
+                f"~/.hermes gained files during test: {sorted(new_files)}"
+            )
+            assert not removed_files, (
+                f"~/.hermes lost files during test: {sorted(removed_files)}"
+            )
 
     yield {"pre": pre, "assert_unchanged": assert_unchanged}
     assert_unchanged()

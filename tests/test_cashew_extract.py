@@ -149,9 +149,7 @@ def test_extract_calls_end_session_with_canonical_kwargs(tmp_path, monkeypatch):
 def test_extract_bypasses_sync_queue(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "core.session.end_session",
-        lambda **k: types.SimpleNamespace(
-            new_nodes=[], new_edges=[], updated_nodes=[]
-        ),
+        lambda **k: types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[]),
         raising=False,
     )
     p = make_initialized_provider(tmp_path)
@@ -190,9 +188,7 @@ def test_extract_missing_arg_returns_error_envelope_and_logs_once(
 ):
     monkeypatch.setattr(
         "core.session.end_session",
-        lambda **k: types.SimpleNamespace(
-            new_nodes=[], new_edges=[], updated_nodes=[]
-        ),
+        lambda **k: types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[]),
         raising=False,
     )
     p = make_initialized_provider(tmp_path)

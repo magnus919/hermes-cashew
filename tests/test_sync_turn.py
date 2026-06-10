@@ -101,7 +101,7 @@ def test_sync_turn_fast_on_empty_queue(tmp_path, monkeypatch):
         start = time.monotonic()
         p.sync_turn("u", "a")
         elapsed = time.monotonic() - start
-        assert elapsed < 0.05, f"sync_turn blocked for {elapsed*1000:.1f}ms"
+        assert elapsed < 0.05, f"sync_turn blocked for {elapsed * 1000:.1f}ms"
     finally:
         p.shutdown()
 
@@ -135,7 +135,7 @@ def test_sync_turn_empty_queue_strict_15ms(tmp_path, monkeypatch):
         p.sync_turn("u", "a")
         elapsed = time.monotonic() - start
         assert elapsed < 0.015, (
-            f"sync_turn blocked for {elapsed*1000:.1f}ms; strict bound 15ms"
+            f"sync_turn blocked for {elapsed * 1000:.1f}ms; strict bound 15ms"
         )
     finally:
         p.shutdown()
@@ -156,7 +156,7 @@ def test_sync_turn_fast_even_on_full_queue(tmp_path, monkeypatch):
         p.sync_turn("u17", "a17")
         elapsed = time.monotonic() - start
         assert elapsed < 0.05, (
-            f"sync_turn blocked for {elapsed*1000:.1f}ms on full queue — hot path violation"
+            f"sync_turn blocked for {elapsed * 1000:.1f}ms on full queue — hot path violation"
         )
     finally:
         # Swap fake for fast so shutdown doesn't hang on the 100s sleep
@@ -233,8 +233,7 @@ def test_sync_turn_silent_noop_on_fresh_provider(caplog):
         p.sync_turn("u", "a")  # must not raise
     # No records at any level from sync_turn itself
     assert not caplog.records, (
-        f"fresh provider sync_turn logged: "
-        f"{[r.getMessage() for r in caplog.records]}"
+        f"fresh provider sync_turn logged: {[r.getMessage() for r in caplog.records]}"
     )
 
 

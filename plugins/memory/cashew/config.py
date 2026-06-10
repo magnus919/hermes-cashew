@@ -9,6 +9,7 @@
 CashewMemoryProvider in plugins/memory/cashew/__init__.py delegates to these
 helpers; tests in tests/test_config_roundtrip.py exercise them directly.
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -455,14 +456,17 @@ def _read_cashew_config(hermes_home: pathlib.Path) -> CashewConfig | None:
     """Read cashew.json and return a CashewConfig, or None if absent/unparseable."""
     cashew_path = resolve_config_path(hermes_home)
     if not cashew_path.exists():
-        logger.debug("cashew.json not found at %s; cannot resolve model_fn", cashew_path)
+        logger.debug(
+            "cashew.json not found at %s; cannot resolve model_fn", cashew_path
+        )
         return None
     try:
         return load_config(hermes_home)
     except Exception:
         logger.warning(
             "Failed to load cashew.json from %s; cannot resolve model_fn",
-            cashew_path, exc_info=True,
+            cashew_path,
+            exc_info=True,
         )
         return None
 
@@ -504,18 +508,22 @@ def resolve_model_fn(
     if not config_yaml_path.exists():
         logger.info(
             "llm_aux_role=%r but %s not found; falling back to heuristic extraction",
-            role, config_yaml_path,
+            role,
+            config_yaml_path,
         )
         return None
 
     try:
         import yaml
+
         raw = yaml.safe_load(config_yaml_path.read_text(encoding="utf-8"))
         aux_config = (raw or {}).get("auxiliary", {}).get(role, {})
     except Exception:
         logger.warning(
             "llm_aux_role=%r: failed to parse %s; falling back to heuristic extraction",
-            role, config_yaml_path, exc_info=True,
+            role,
+            config_yaml_path,
+            exc_info=True,
         )
         return None
 
@@ -523,7 +531,9 @@ def resolve_model_fn(
     if not model:
         logger.warning(
             "llm_aux_role=%r: no model in auxiliary.%s config; "
-            "falling back to heuristic extraction", role, role,
+            "falling back to heuristic extraction",
+            role,
+            role,
         )
         return None
 
@@ -543,19 +553,25 @@ def resolve_model_fn(
     if not api_key:
         logger.warning(
             "llm_aux_role=%r: no API key for provider=%r; "
-            "falling back to heuristic extraction", role, provider,
+            "falling back to heuristic extraction",
+            role,
+            provider,
         )
         return None
 
     logger.info(
         "llm_aux_role=%r: using %s %s via %s",
-        role, provider, model, base_url,
+        role,
+        provider,
+        model,
+        base_url,
     )
 
     def _model_fn(prompt: str) -> str:
         """OpenAI-compatible chat completion callable."""
         try:
             import httpx
+
             resp = httpx.post(
                 f"{base_url}/chat/completions",
                 json={
@@ -570,7 +586,9 @@ def resolve_model_fn(
         except Exception:
             logger.warning(
                 "LLM call failed for role=%r (model=%s)",
-                role, model, exc_info=True,
+                role,
+                model,
+                exc_info=True,
             )
             return ""
 
@@ -582,7 +600,9 @@ def resolve_config_path(hermes_home: str | os.PathLike[str]) -> pathlib.Path:
     return pathlib.Path(hermes_home) / CONFIG_FILENAME
 
 
-def resolve_db_path(hermes_home: str | os.PathLike[str], db_path_value: str) -> pathlib.Path:
+def resolve_db_path(
+    hermes_home: str | os.PathLike[str], db_path_value: str
+) -> pathlib.Path:
     """Resolve the Cashew DB path under hermes_home.
 
     `db_path_value` is the user-configured string from `cashew_db_path`. Absolute
@@ -620,7 +640,9 @@ def load_config(hermes_home: str | os.PathLike[str]) -> CashewConfig:
     else:
         raw = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
-            raise ValueError(f"{path} must contain a JSON object, got {type(raw).__name__}")
+            raise ValueError(
+                f"{path} must contain a JSON object, got {type(raw).__name__}"
+            )
         merged = {**DEFAULTS, **raw}
 
     for key, default_val in DEFAULTS.items():
@@ -648,11 +670,15 @@ def load_config(hermes_home: str | os.PathLike[str]) -> CashewConfig:
                                 if item.strip()
                             ]
                     else:
-                        merged[key] = [item.strip() for item in env_val.split(",") if item.strip()]
+                        merged[key] = [
+                            item.strip() for item in env_val.split(",") if item.strip()
+                        ]
                 else:
                     merged[key] = env_val
             except ValueError:
-                logger.warning("Invalid value for %s (%s), skipping: %r", key, env_name, env_val)
+                logger.warning(
+                    "Invalid value for %s (%s), skipping: %r", key, env_name, env_val
+                )
 
     known = {f.name for f in dataclasses.fields(CashewConfig)}
     filtered = {k: v for k, v in merged.items() if k in known}
@@ -674,7 +700,9 @@ def generate_default_config(hermes_home: str | os.PathLike[str]) -> pathlib.Path
     return save_config(dict(DEFAULTS), hermes_home)
 
 
-def save_config(values: dict[str, Any], hermes_home: str | os.PathLike[str]) -> pathlib.Path:
+def save_config(
+    values: dict[str, Any], hermes_home: str | os.PathLike[str]
+) -> pathlib.Path:
     """Persist the provider config to $HERMES_HOME/cashew.json (CONF-02).
 
     Preserves unknown keys from existing files. Unknown keys in `values` are dropped.

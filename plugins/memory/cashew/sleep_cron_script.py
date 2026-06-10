@@ -86,6 +86,7 @@ def main() -> None:
 
     # Resolve the LLM callable from auxiliary config for dream generation.
     from plugins.memory.cashew.config import resolve_model_fn as _resolve_model_fn
+
     model_fn = _resolve_model_fn(hermes_home=hermes_home)
 
     result = run_sleep_cycle(

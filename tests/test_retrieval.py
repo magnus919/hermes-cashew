@@ -114,7 +114,13 @@ def test_lazy_import_preserves_module_loadability():
 
 
 def test_format_context_with_domain_and_type(provider, db_path):
-    _seed_node(db_path, id="n1", content="node content", domain="test_domain", node_type="belief")
+    _seed_node(
+        db_path,
+        id="n1",
+        content="node content",
+        domain="test_domain",
+        node_type="belief",
+    )
     result = provider.prefetch("node")
     assert "[domain: test_domain | type: belief]" in result
 
@@ -145,10 +151,13 @@ def test_macos_fallback_simulated(provider, db_path, monkeypatch):
         _can_mock = False
 
     if _can_mock:
+
         def _blocked_enable_load(self, *args, **kwargs):
             raise AttributeError("simulated macOS: extension loading blocked")
 
-        monkeypatch.setattr(sqlite3.Connection, "enable_load_extension", _blocked_enable_load)
+        monkeypatch.setattr(
+            sqlite3.Connection, "enable_load_extension", _blocked_enable_load
+        )
 
     _seed_node(db_path, id="n1", content="test content")
     result = provider.prefetch("test")

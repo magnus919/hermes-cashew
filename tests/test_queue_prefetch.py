@@ -1,4 +1,5 @@
 """Tests for CashewMemoryProvider.queue_prefetch and its supporting machinery."""
+
 from __future__ import annotations
 
 import threading
@@ -116,7 +117,10 @@ def test_queue_prefetch_dispatches_background_thread():
     """queue_prefetch must start a daemon thread."""
     provider = _provider_with_mock_config()
     provider.queue_prefetch("test query")
-    threads = [t for t in threading.enumerate()
-               if t.name and t.name.startswith("cashew-prefetch-")]
+    threads = [
+        t
+        for t in threading.enumerate()
+        if t.name and t.name.startswith("cashew-prefetch-")
+    ]
     assert len(threads) >= 1
     assert all(t.daemon for t in threads)

@@ -114,9 +114,9 @@ def test_worker_processes_single_turn(tmp_path, monkeypatch):
     p = make_initialized_provider(tmp_path)
     try:
         p.sync_turn("hi", "hello")
-        assert drain_queue(
-            p, budget_s=2.0
-        ), f"drain timeout; unfinished={p._sync_queue.unfinished_tasks}"
+        assert drain_queue(p, budget_s=2.0), (
+            f"drain timeout; unfinished={p._sync_queue.unfinished_tasks}"
+        )
         assert len(calls) == 1
         assert calls[0]["session_id"] == "test-sync"
         assert calls[0]["conversation_text"] == "User: hi\nAssistant: hello"
@@ -160,9 +160,7 @@ def test_poisoned_turn_does_not_break_worker(tmp_path, monkeypatch, caplog):
             for i in range(16):
                 p.sync_turn(f"u{i}", f"a{i}")
             assert drain_queue(p, budget_s=3.0)
-        assert (
-            len(calls) == 16
-        ), f"expected all 16 turns attempted; got {len(calls)}"
+        assert len(calls) == 16, f"expected all 16 turns attempted; got {len(calls)}"
         # ONE WARNING from the poisoned turn
         worker_warnings = [
             r
@@ -193,9 +191,9 @@ def test_shutdown_posts_sentinel_and_joins(tmp_path, monkeypatch):
     baseline = threading.active_count()
     p = make_initialized_provider(tmp_path)
     p.shutdown()
-    assert wait_for_thread_exit(
-        baseline
-    ), f"thread leak: {threading.active_count()} vs {baseline}"
+    assert wait_for_thread_exit(baseline), (
+        f"thread leak: {threading.active_count()} vs {baseline}"
+    )
     assert p._sync_worker is None
     assert p._sync_queue is None
     assert p._config is None

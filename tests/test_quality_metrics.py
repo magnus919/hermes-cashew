@@ -57,7 +57,9 @@ def test_access_count_incremented_after_retrieval(provider, db_path):
     _seed_node(db_path, id="n1", content="test", access_count=0)
     provider.prefetch("test")
     conn = sqlite3.connect(str(db_path))
-    row = conn.execute("SELECT access_count FROM thought_nodes WHERE id = ?", ("n1",)).fetchone()
+    row = conn.execute(
+        "SELECT access_count FROM thought_nodes WHERE id = ?", ("n1",)
+    ).fetchone()
     conn.close()
     assert row[0] == 1
 
@@ -66,14 +68,24 @@ def test_last_accessed_updated_after_retrieval(provider, db_path):
     _seed_node(db_path, id="n1", content="test", last_accessed=None)
     provider.prefetch("test")
     conn = sqlite3.connect(str(db_path))
-    row = conn.execute("SELECT last_accessed FROM thought_nodes WHERE id = ?", ("n1",)).fetchone()
+    row = conn.execute(
+        "SELECT last_accessed FROM thought_nodes WHERE id = ?", ("n1",)
+    ).fetchone()
     conn.close()
     assert row[0] is not None
 
 
 def test_permanent_nodes_ranked_higher(provider, db_path):
-    _seed_node(db_path, id="perm", content="permanent node", permanent=1, timestamp="2026-01-01")
-    _seed_node(db_path, id="norm", content="normal node", permanent=0, timestamp="2026-01-01")
+    _seed_node(
+        db_path,
+        id="perm",
+        content="permanent node",
+        permanent=1,
+        timestamp="2026-01-01",
+    )
+    _seed_node(
+        db_path, id="norm", content="normal node", permanent=0, timestamp="2026-01-01"
+    )
     result = provider.prefetch("node")
     perm_idx = result.find("permanent node")
     norm_idx = result.find("normal node")
@@ -97,8 +109,20 @@ def test_tag_filtering(provider, db_path):
 
 
 def test_recency_weighting_uses_referent_time(provider, db_path):
-    _seed_node(db_path, id="old", content="old news", referent_time="2024-01-01", timestamp="2026-01-01")
-    _seed_node(db_path, id="new", content="new news", referent_time="2026-01-01", timestamp="2024-01-01")
+    _seed_node(
+        db_path,
+        id="old",
+        content="old news",
+        referent_time="2024-01-01",
+        timestamp="2026-01-01",
+    )
+    _seed_node(
+        db_path,
+        id="new",
+        content="new news",
+        referent_time="2026-01-01",
+        timestamp="2024-01-01",
+    )
     result = provider.prefetch("news")
     new_idx = result.find("new news")
     old_idx = result.find("old news")
@@ -106,8 +130,20 @@ def test_recency_weighting_uses_referent_time(provider, db_path):
 
 
 def test_recency_fallback_to_timestamp(provider, db_path):
-    _seed_node(db_path, id="old", content="old item", referent_time=None, timestamp="2024-01-01")
-    _seed_node(db_path, id="new", content="new item", referent_time=None, timestamp="2026-01-01")
+    _seed_node(
+        db_path,
+        id="old",
+        content="old item",
+        referent_time=None,
+        timestamp="2024-01-01",
+    )
+    _seed_node(
+        db_path,
+        id="new",
+        content="new item",
+        referent_time=None,
+        timestamp="2026-01-01",
+    )
     result = provider.prefetch("item")
     new_idx = result.find("new item")
     old_idx = result.find("old item")

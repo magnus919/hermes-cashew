@@ -1,0 +1,15 @@
+# Default owner for all files
+* @magnus919
+
+# Core plugin implementation
+/plugins/memory/cashew/ @magnus919
+
+# Tests
+/tests/ @magnus919
+
+# CI/CD configuration
+/.github/workflows/ @magnus919
+
+# Project configuration
+/pyproject.toml @magnus919
+/plugin.yaml @magnus919

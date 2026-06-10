@@ -12,7 +12,9 @@ from plugins.memory.cashew import CashewMemoryProvider
 from plugins.memory.cashew.config import DEFAULTS, resolve_db_path
 
 
-def _make_initialized_provider(tmp_path, recall_k: int | None = None) -> CashewMemoryProvider:
+def _make_initialized_provider(
+    tmp_path, recall_k: int | None = None
+) -> CashewMemoryProvider:
     """Construct a provider, save a minimal config, and initialize it."""
     p = CashewMemoryProvider()
     overrides = {"recall_k": recall_k} if recall_k is not None else {}
@@ -94,6 +96,7 @@ def test_prefetch_corrupt_config_half_state_returns_empty_no_new_log(tmp_path, c
     """RECALL-04 + Phase 2 carryover: corrupt config -> initialize emits WARNING;
     subsequent prefetch MUST NOT emit a second WARNING."""
     from plugins.memory.cashew.config import CONFIG_FILENAME
+
     (tmp_path / CONFIG_FILENAME).write_text("not json {")
     p = CashewMemoryProvider()
     with caplog.at_level(logging.WARNING, logger="plugins.memory.cashew"):
@@ -111,7 +114,9 @@ def test_prefetch_corrupt_config_half_state_returns_empty_no_new_log(tmp_path, c
         p.shutdown()
 
 
-def test_prefetch_retrieval_exception_logs_once_and_returns_empty(tmp_path, caplog, monkeypatch):
+def test_prefetch_retrieval_exception_logs_once_and_returns_empty(
+    tmp_path, caplog, monkeypatch
+):
     """RECALL-04: retrieval raises -> "" + ONE WARNING with exc_info."""
     p = _make_initialized_provider(tmp_path)
     db = resolve_db_path(tmp_path, DEFAULTS["cashew_db_path"])
@@ -134,7 +139,9 @@ def test_prefetch_retrieval_exception_logs_once_and_returns_empty(tmp_path, capl
         p.shutdown()
 
 
-def test_prefetch_format_context_exception_logs_once_and_returns_empty(tmp_path, caplog, monkeypatch):
+def test_prefetch_format_context_exception_logs_once_and_returns_empty(
+    tmp_path, caplog, monkeypatch
+):
     """RECALL-04: _format_context() raises -> same contract as retrieve() raising."""
     p = _make_initialized_provider(tmp_path)
     db = resolve_db_path(tmp_path, DEFAULTS["cashew_db_path"])

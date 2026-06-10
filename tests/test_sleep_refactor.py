@@ -76,20 +76,36 @@ def _create_schema(conn: sqlite3.Connection) -> None:
     """)
 
 
-def _insert_node(conn, id_: str, content: str, node_type: str = "observation",
-                 timestamp: str = "2026-01-01T00:00:00", domain: str = "user",
-                 source_file: str = None, access_count: int = 0,
-                 permanent: bool = False) -> None:
+def _insert_node(
+    conn,
+    id_: str,
+    content: str,
+    node_type: str = "observation",
+    timestamp: str = "2026-01-01T00:00:00",
+    domain: str = "user",
+    source_file: str = None,
+    access_count: int = 0,
+    permanent: bool = False,
+) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO thought_nodes (id, content, node_type, timestamp, "
         "domain, source_file, access_count, permanent) VALUES (?,?,?,?,?,?,?,?)",
-        (id_, content, node_type, timestamp, domain, source_file or "",
-         access_count, 1 if permanent else 0),
+        (
+            id_,
+            content,
+            node_type,
+            timestamp,
+            domain,
+            source_file or "",
+            access_count,
+            1 if permanent else 0,
+        ),
     )
 
 
-def _insert_embedding(conn, nid: str, seed: int = 42,
-                     model: str = "all-MiniLM-L6-v2") -> None:
+def _insert_embedding(
+    conn, nid: str, seed: int = 42, model: str = "all-MiniLM-L6-v2"
+) -> None:
     vec = _make_fake_embedding(nid, seed)
     conn.execute(
         "INSERT OR REPLACE INTO embeddings (node_id, vector, model, updated_at) "
@@ -98,8 +114,9 @@ def _insert_embedding(conn, nid: str, seed: int = 42,
     )
 
 
-def _insert_edge(conn, parent: str, child: str, weight: float = 1.0,
-                 reasoning: str = "") -> None:
+def _insert_edge(
+    conn, parent: str, child: str, weight: float = 1.0, reasoning: str = ""
+) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO derivation_edges (parent_id, child_id, weight, reasoning) "
         "VALUES (?, ?, ?, ?)",
@@ -124,23 +141,53 @@ def small_graph(db_path):
     conn = sqlite3.connect(db_path)
     # Three distinct clusters: [a,b] near-dups, [c,d] near-dups, [e,f] cross-link
     _insert_node(conn, "a", "alpha beta gamma delta", node_type="observation")
-    _insert_node(conn, "b", "alpha beta gamma delta epsilon", node_type="observation",
-                 access_count=3)
+    _insert_node(
+        conn,
+        "b",
+        "alpha beta gamma delta epsilon",
+        node_type="observation",
+        access_count=3,
+    )
     _insert_node(conn, "c", "lorem ipsum dolor sit", node_type="fact")
-    _insert_node(conn, "d", "lorem ipsum dolor sit amet", node_type="fact",
-                 access_count=5)
-    _insert_node(conn, "e", "machine learning gradient descent", node_type="insight",
-                 source_file="file_A")
-    _insert_node(conn, "f", "neural networks backpropagation optimization", node_type="insight",
-                 source_file="file_B")
+    _insert_node(
+        conn, "d", "lorem ipsum dolor sit amet", node_type="fact", access_count=5
+    )
+    _insert_node(
+        conn,
+        "e",
+        "machine learning gradient descent",
+        node_type="insight",
+        source_file="file_A",
+    )
+    _insert_node(
+        conn,
+        "f",
+        "neural networks backpropagation optimization",
+        node_type="insight",
+        source_file="file_B",
+    )
     # Add a permanent node
-    _insert_node(conn, "perm1", "permanent reference node", node_type="core_memory",
-                 permanent=True, access_count=100)
+    _insert_node(
+        conn,
+        "perm1",
+        "permanent reference node",
+        node_type="core_memory",
+        permanent=True,
+        access_count=100,
+    )
     _insert_node(conn, "perm2", "another permanent node", node_type="core_memory")
 
     for nid in ("a", "b", "c", "d", "e", "f", "perm1", "perm2"):
-        seed = {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6,
-                "perm1": 10, "perm2": 11}[nid]
+        seed = {
+            "a": 1,
+            "b": 2,
+            "c": 3,
+            "d": 4,
+            "e": 5,
+            "f": 6,
+            "perm1": 10,
+            "perm2": 11,
+        }[nid]
         _insert_embedding(conn, nid, seed=seed)
 
     _insert_edge(conn, "e", "f", weight=0.8, reasoning="cross_link - similarity=0.800")
@@ -149,7 +196,9 @@ def small_graph(db_path):
     va = _make_fake_embedding("a", seed=1)
     vb = _make_fake_embedding("b", seed=2)
     sim_ab = float(np.dot(va, vb))
-    _insert_edge(conn, "a", "b", weight=sim_ab, reasoning="cross_link - similarity=0.800")
+    _insert_edge(
+        conn, "a", "b", weight=sim_ab, reasoning="cross_link - similarity=0.800"
+    )
 
     conn.commit()
     conn.close()
@@ -165,6 +214,7 @@ def empty_graph(db_path):
 # ──────────────────────────────────────────────────────────────────────────────
 # Phase 1: Candidate discovery
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def test_find_candidates_smoke(small_graph):
     """Smoke test: find_candidates runs and returns shaped arrays."""
@@ -204,6 +254,7 @@ def test_find_candidates_no_pairs():
 # Phase 2: Batched cross-linking
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def test_batch_cross_links_creates_edges(small_graph):
     """Batch insert creates edges for pairs above threshold."""
     conn = sqlite3.connect(small_graph)
@@ -212,6 +263,7 @@ def test_batch_cross_links_creates_edges(small_graph):
     # but a-b already exists
 
     from plugins.memory.cashew.sleep_refactor import _load_embedding_matrix
+
     valid_ids, matrix = _load_embedding_matrix(conn, ids)
     cross_pairs, _, sim = _find_candidates(valid_ids, matrix)
 
@@ -222,7 +274,10 @@ def test_batch_cross_links_creates_edges(small_graph):
     stats = _batch_cross_links(conn, valid_ids, cross_pairs, sim)
 
     assert stats["candidates"] >= 0
-    assert stats["created"] + stats["skipped"] + stats["same_source_skipped"] == stats["candidates"]
+    assert (
+        stats["created"] + stats["skipped"] + stats["same_source_skipped"]
+        == stats["candidates"]
+    )
     # Edges may or may not increase depending on pre-existing
     conn.close()
 
@@ -232,8 +287,13 @@ def test_batch_cross_links_empty():
     conn = sqlite3.connect(":memory:")
     _create_schema(conn)
     stats = _batch_cross_links(conn, [], np.array([]).reshape(0, 2), np.array([]))
-    assert stats == {"candidates": 0, "created": 0, "skipped": 0,
-                     "same_source_skipped": 0, "capped": False}
+    assert stats == {
+        "candidates": 0,
+        "created": 0,
+        "skipped": 0,
+        "same_source_skipped": 0,
+        "capped": False,
+    }
     conn.close()
 
 
@@ -251,6 +311,7 @@ def test_batch_cross_links_cross_source_filter(db_path):
 
     ids = ["a", "b", "c", "d"]
     from plugins.memory.cashew.sleep_refactor import _load_embedding_matrix
+
     valid_ids, matrix = _load_embedding_matrix(conn, ids)
     cross_pairs, _, sim = _find_candidates(valid_ids, matrix)
 
@@ -258,16 +319,17 @@ def test_batch_cross_links_cross_source_filter(db_path):
         conn.close()
         pytest.skip("No cross-link pairs generated at random with these seeds")
 
-    source_files = {"a": "source_X", "b": "source_X",
-                    "c": "source_Y", "d": "source_Y"}
+    source_files = {"a": "source_X", "b": "source_X", "c": "source_Y", "d": "source_Y"}
 
-    stats = _batch_cross_links(conn, valid_ids, cross_pairs, sim,
-                               source_files=source_files)
+    stats = _batch_cross_links(
+        conn, valid_ids, cross_pairs, sim, source_files=source_files
+    )
 
-    assert stats["same_source_skipped"] > 0, \
-        "Expected same-source pairs to be skipped"
-    assert stats["created"] + stats["skipped"] + stats["same_source_skipped"] \
+    assert stats["same_source_skipped"] > 0, "Expected same-source pairs to be skipped"
+    assert (
+        stats["created"] + stats["skipped"] + stats["same_source_skipped"]
         == stats["candidates"]
+    )
     conn.close()
 
 
@@ -284,6 +346,7 @@ def test_batch_cross_links_edge_cap(db_path):
 
     ids = [f"n{i:04d}" for i in range(100)]
     from plugins.memory.cashew.sleep_refactor import _load_embedding_matrix
+
     valid_ids, matrix = _load_embedding_matrix(conn, ids)
     cross_pairs, _, sim = _find_candidates(valid_ids, matrix)
 
@@ -302,6 +365,7 @@ def test_batch_cross_links_edge_cap(db_path):
 # ──────────────────────────────────────────────────────────────────────────────
 # Phase 3: Dedup via connected components
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def test_merge_cluster_rewires_edges(small_graph):
     """merge_cluster keeps the most-accessed node and decays the losers."""
@@ -382,6 +446,7 @@ def test_run_dedup_empty():
 # Phase 4: Node metrics
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def test_compute_metrics(small_graph):
     """compute_metrics returns a dict with expected keys for each active node."""
     conn = sqlite3.connect(small_graph)
@@ -412,6 +477,7 @@ def test_compute_metrics_empty(empty_graph):
 # ──────────────────────────────────────────────────────────────────────────────
 # Phase 5: Garbage collection
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def test_garbage_collect_decays_low_fitness(small_graph):
     """GC decays non-permanent nodes with fitness=0."""
@@ -469,6 +535,7 @@ def test_garbage_collect_empty_metrics(empty_graph):
 # Phase 6: Permanence evaluation
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def test_evaluate_permanence():
     """Promotes nodes with access_count >= 10 directly via SQL."""
     conn = sqlite3.connect(":memory:")
@@ -491,9 +558,7 @@ def test_evaluate_permanence():
         assert perm[0] == 1, f"node {nid} should be permanent"
 
     # low should not
-    perm = conn.execute(
-        "SELECT permanent FROM thought_nodes WHERE id='low'"
-    ).fetchone()
+    perm = conn.execute("SELECT permanent FROM thought_nodes WHERE id='low'").fetchone()
     assert perm[0] == 0
     conn.close()
 
@@ -501,6 +566,7 @@ def test_evaluate_permanence():
 # ──────────────────────────────────────────────────────────────────────────────
 # Phase 7: Core memory promotion
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def test_promote_core_memories(small_graph):
     """Top √N by fitness become core_memory."""
@@ -549,6 +615,7 @@ def test_promote_core_memories_sets_permanent(small_graph):
 # ──────────────────────────────────────────────────────────────────────────────
 # Phase 8: Dream generation
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def test_generate_dream_no_model_fn(small_graph):
     """Dream generation returns None without model_fn."""
@@ -620,6 +687,7 @@ def test_generate_dream_no_cross_source_bridge(small_graph):
 # Phase 9: Embedding gap closure
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def test_embed_orphans_no_orphans(small_graph):
     """Returns 0 when all active nodes have embeddings."""
     conn = sqlite3.connect(small_graph)
@@ -645,7 +713,9 @@ def test_embed_orphans_regression_not_null_schema(db_path):
     assert "updated_at" in cols, "test schema must include updated_at column"
 
     # Insert a node without an embedding row (an orphan)
-    _insert_node(conn, "orphan1", "this node needs an embedding", node_type="observation")
+    _insert_node(
+        conn, "orphan1", "this node needs an embedding", node_type="observation"
+    )
     conn.commit()
 
     count = _embed_orphans(conn)
@@ -656,7 +726,9 @@ def test_embed_orphans_regression_not_null_schema(db_path):
         "SELECT node_id, model, updated_at FROM embeddings WHERE node_id='orphan1'"
     ).fetchone()
     assert row is not None, "embedding row should exist"
-    assert row[1] == "thenlper/gte-large", f"expected model='thenlper/gte-large', got {row[1]!r}"
+    assert row[1] == "thenlper/gte-large", (
+        f"expected model='thenlper/gte-large', got {row[1]!r}"
+    )
     assert row[2] is not None and len(str(row[2])) > 0, "updated_at should be set"
 
     conn.close()
@@ -688,6 +760,7 @@ def test_embed_orphans_mixed_orphans(db_path):
 # Smoke test: full cycle
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def test_run_sleep_cycle_smoke(small_graph, monkeypatch):
     """Full cycle completes without error and returns expected summary keys."""
     # Mock sklearn to avoid real dependency (HF_HUB_OFFLINE is set)
@@ -697,16 +770,26 @@ def test_run_sleep_cycle_smoke(small_graph, monkeypatch):
     assert "error" not in result
 
     expected_keys = {
-        "nodes_selected", "nodes_with_embeddings",
-        "cross_link_candidates", "dedup_candidates",
-        "cross_links_created", "cross_links_skipped",
-        "cross_link_same_source_skipped", "cross_link_capped",
-        "dedup_components", "dedup_nodes_merged",
-        "nodes_gc_decayed", "nodes_made_permanent",
-        "core_promoted", "core_demoted",
-        "dream_id", "dream_pending", "dream_generation",
+        "nodes_selected",
+        "nodes_with_embeddings",
+        "cross_link_candidates",
+        "dedup_candidates",
+        "cross_links_created",
+        "cross_links_skipped",
+        "cross_link_same_source_skipped",
+        "cross_link_capped",
+        "dedup_components",
+        "dedup_nodes_merged",
+        "nodes_gc_decayed",
+        "nodes_made_permanent",
+        "core_promoted",
+        "core_demoted",
+        "dream_id",
+        "dream_pending",
+        "dream_generation",
         "orphans_embedded",
-        "total_nodes", "elapsed_s",
+        "total_nodes",
+        "elapsed_s",
     }
     for key in expected_keys:
         assert key in result, f"Missing key: {key}"
@@ -730,8 +813,11 @@ def test_run_sleep_cycle_respects_limit(small_graph):
 
 def test_run_sleep_cycle_with_model_fn(small_graph):
     """Full cycle with model_fn enables dream generation."""
+
     def fake_model_fn(prompt: str) -> str:
-        return "Cross-domain synthesis: both perspectives converge on batch-first design."
+        return (
+            "Cross-domain synthesis: both perspectives converge on batch-first design."
+        )
 
     result = run_sleep_cycle(small_graph, limit=6, model_fn=fake_model_fn)
     # dream_id may be None if no cross-source bridge exists, but shouldn't crash
@@ -742,6 +828,7 @@ def test_run_sleep_cycle_with_model_fn(small_graph):
 # Integration: on_session_end triggers sleep
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def test_on_session_end_does_not_call_sleep_cycle(tmp_path, monkeypatch):
     """on_session_end no longer calls run_sleep_cycle — migrated to cron (v0.11.0)."""
     import json
@@ -751,12 +838,16 @@ def test_on_session_end_does_not_call_sleep_cycle(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes_test1"
     hermes_home.mkdir()
     cashew_cfg = hermes_home / "cashew.json"
-    cashew_cfg.write_text(json.dumps({
-        "sleep_cycles": True,
-        "sleep_schedule": "every 12h",
-        "think_cycles": False,
-        "cashew_db_path": "cashew/brain.db",
-    }))
+    cashew_cfg.write_text(
+        json.dumps(
+            {
+                "sleep_cycles": True,
+                "sleep_schedule": "every 12h",
+                "think_cycles": False,
+                "cashew_db_path": "cashew/brain.db",
+            }
+        )
+    )
 
     config_yaml = hermes_home / "config.yaml"
     config_yaml.write_text("model:\n  provider: test\n  default: test\n")
@@ -771,9 +862,11 @@ def test_on_session_end_does_not_call_sleep_cycle(tmp_path, monkeypatch):
     provider.initialize(session_id="test-session", hermes_home=str(hermes_home))
 
     import time
+
     time.sleep(0.3)
 
     call_log = []
+
     def fake_run_sleep(*args, **kwargs):
         call_log.append(1)
         return {}
@@ -798,10 +891,14 @@ def test_on_session_end_skips_when_disabled(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes_test2"
     hermes_home.mkdir()
     cashew_cfg = hermes_home / "cashew.json"
-    cashew_cfg.write_text(json.dumps({
-        "sleep_cycles": False,
-        "think_cycles": False,
-    }))
+    cashew_cfg.write_text(
+        json.dumps(
+            {
+                "sleep_cycles": False,
+                "think_cycles": False,
+            }
+        )
+    )
 
     db_dir = hermes_home / "cashew"
     db_dir.mkdir(parents=True)
@@ -813,14 +910,17 @@ def test_on_session_end_skips_when_disabled(tmp_path, monkeypatch):
     provider.initialize(session_id="test-session", hermes_home=str(hermes_home))
 
     import time
+
     time.sleep(0.3)
 
     call_log = []
+
     def fake_run_sleep(*args, **kwargs):
         call_log.append(1)
         return {}
 
     import plugins.memory.cashew.sleep_refactor as sr
+
     monkeypatch.setattr(sr, "run_sleep_cycle", fake_run_sleep)
 
     provider.on_session_end([])
@@ -838,10 +938,14 @@ def test_on_session_end_does_not_raise(tmp_path):
     hermes_home = tmp_path / "hermes_test3"
     hermes_home.mkdir()
     cashew_cfg = hermes_home / "cashew.json"
-    cashew_cfg.write_text(json.dumps({
-        "sleep_cycles": True,
-        "think_cycles": False,
-    }))
+    cashew_cfg.write_text(
+        json.dumps(
+            {
+                "sleep_cycles": True,
+                "think_cycles": False,
+            }
+        )
+    )
 
     db_dir = hermes_home / "cashew"
     db_dir.mkdir(parents=True)
@@ -853,6 +957,7 @@ def test_on_session_end_does_not_raise(tmp_path):
     provider.initialize(session_id="test-session", hermes_home=str(hermes_home))
 
     import time
+
     time.sleep(0.3)
 
     # Should not raise even though sleep cycle was previously called here
@@ -869,14 +974,20 @@ def test_on_session_end_does_not_drain_sync_queue(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes_test4"
     hermes_home.mkdir()
     cashew_cfg = hermes_home / "cashew.json"
-    cashew_cfg.write_text(json.dumps({
-        "sleep_cycles": True,
-        "think_cycles": False,
-        "sync_queue_timeout": 30.0,
-    }))
+    cashew_cfg.write_text(
+        json.dumps(
+            {
+                "sleep_cycles": True,
+                "think_cycles": False,
+                "sync_queue_timeout": 30.0,
+            }
+        )
+    )
 
     config_yaml = hermes_home / "config.yaml"
-    config_yaml.write_text("auxiliary:\n  memory:\n    provider: test\n    model: test\n    api_key: fake\n")
+    config_yaml.write_text(
+        "auxiliary:\n  memory:\n    provider: test\n    model: test\n    api_key: fake\n"
+    )
 
     db_dir = hermes_home / "cashew"
     db_dir.mkdir(parents=True)
@@ -893,6 +1004,7 @@ def test_on_session_end_does_not_drain_sync_queue(tmp_path, monkeypatch):
 
     # Let the initial drain settle
     import time
+
     time.sleep(0.3)
 
     # Simulate a pending queue by adding turns that the worker will process
@@ -907,6 +1019,7 @@ def test_on_session_end_does_not_drain_sync_queue(tmp_path, monkeypatch):
     )
 
     import time as _time
+
     t0 = _time.monotonic()
     provider.on_session_end([])
     elapsed = _time.monotonic() - t0
@@ -920,6 +1033,7 @@ def test_on_session_end_does_not_drain_sync_queue(tmp_path, monkeypatch):
 # ──────────────────────────────────────────────────────────────────────────────
 # Edge cases
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def test_merge_cluster_preserves_edge_count(small_graph):
     """After merge, total edge count should not collapse to near zero."""
@@ -956,15 +1070,18 @@ def test_sleep_cycle_idempotency(small_graph):
 
 def test_run_dream_async_spawns_daemon_thread(small_graph):
     """_run_dream_async spawns a daemon thread that writes a dream node."""
+
     def fake_model_fn(prompt: str) -> str:
         return "Dream synthesis bridging file_A and file_B."
 
     cross_tuples = [("e", "f", 0.85)]
     from plugins.memory.cashew.sleep_refactor import _run_dream_async
+
     _run_dream_async(small_graph, cross_tuples, fake_model_fn)
 
     # Give the daemon thread time to write
     import time
+
     time.sleep(1.0)
 
     conn = sqlite3.connect(small_graph)
@@ -982,18 +1099,19 @@ def test_run_dream_async_handles_exception(small_graph):
     """Exception in daemon thread is caught and logged — does not propagate."""
     cross_tuples = [("e", "f", 0.85)]
     from plugins.memory.cashew.sleep_refactor import _run_dream_async
+
     _run_dream_async(small_graph, cross_tuples, None)  # None model_fn -> skips dream
 
     # Should not crash
     import time
+
     time.sleep(0.3)
     assert True
 
 
 def test_background_dream_flag_requires_model_fn_and_tuples(small_graph, monkeypatch):
     """background_dream=True without model_fn sets dream_generation='skipped'."""
-    result = run_sleep_cycle(small_graph, limit=6, model_fn=None,
-                             background_dream=True)
+    result = run_sleep_cycle(small_graph, limit=6, model_fn=None, background_dream=True)
     assert "dream_pending" in result
     assert result["dream_pending"] is False
     assert result["dream_generation"] == "skipped"
@@ -1001,8 +1119,7 @@ def test_background_dream_flag_requires_model_fn_and_tuples(small_graph, monkeyp
 
 def test_background_dream_runs_sync_phases_before_returning(small_graph):
     """Synchronous phases (cross-links, dedup, GC, core) complete even with bg dream."""
-    result = run_sleep_cycle(small_graph, limit=6, model_fn=None,
-                             background_dream=True)
+    result = run_sleep_cycle(small_graph, limit=6, model_fn=None, background_dream=True)
     assert result["nodes_selected"] > 0
     assert "cross_link_candidates" in result
     assert "nodes_gc_decayed" in result
@@ -1012,11 +1129,13 @@ def test_background_dream_runs_sync_phases_before_returning(small_graph):
 
 def test_background_dream_false_maintains_legacy_behavior(small_graph):
     """background_dream=False with model_fn runs dream synchronously."""
+
     def fake_model_fn(prompt: str) -> str:
         return "Legacy dream synthesis for testing."
 
-    result = run_sleep_cycle(small_graph, limit=6, model_fn=fake_model_fn,
-                             background_dream=False)
+    result = run_sleep_cycle(
+        small_graph, limit=6, model_fn=fake_model_fn, background_dream=False
+    )
     assert "dream_pending" in result
     assert result["dream_pending"] is False
     assert "dream_id" in result

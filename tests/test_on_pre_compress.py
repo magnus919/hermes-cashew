@@ -16,7 +16,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _create_minimal_schema(conn: sqlite3.Connection) -> None:
@@ -222,7 +221,6 @@ class TestLLMPath:
         ])
         provider_with_llm._model_fn = MagicMock(return_value=response)
 
-        from plugins.memory.cashew import CashewMemoryProvider
         original_create = provider_with_llm._create_insight_nodes
         captured: list[list[dict]] = []
 

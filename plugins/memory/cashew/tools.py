@@ -2,25 +2,22 @@
 
 This module owns:
   - CASHEW_QUERY_SCHEMA (dict): OpenAI-style tool schema for the cashew_query tool.
-    Structure matches 03-RESEARCH.md §3; description wording matches PHASE_DESIGN_NOTES
-    Decision Point 6.
+  - CASHEW_EXTRACT_SCHEMA (dict): OpenAI-style tool schema for the cashew_extract
+    tool (synchronous, bypasses the sync queue).
   - build_success_envelope / build_error_envelope: pure functions that return
     json.dumps(...) strings for handle_tool_call to return.
+  - build_extract_success_envelope / build_extract_error_envelope: return JSON
+    strings in shape {ok/tool/new_nodes/new_edges} (success) or {ok/tool/error}
+    (error).
 
-Contract per PHASE_DESIGN_NOTES Decision Point 3:
+Contract:
   - Success envelope fields: ok=True, tool, query, context, node_count.
   - Error envelope fields: ok=False, tool, error, query.
   - Error messages are GENERIC ("cashew recall failed", "unknown tool").
     Exception types/messages never leak through these builders — the caller is
     expected to logger.warning(..., exc_info=True) for the audit trail.
-
-Phase 4 additions (shipped in Plan 04-02):
-  - EXTRACT_TOOL_NAME + CASHEW_EXTRACT_SCHEMA for the cashew_extract
-    tool (synchronous, bypasses the sync queue).
-  - build_extract_success_envelope / build_extract_error_envelope
-    return JSON strings in shape {ok/tool/new_nodes/new_edges} (success)
-    or {ok/tool/error} (error). Extract envelopes do NOT echo
-    user/assistant content — PHASE_DESIGN_NOTES Decision Point 7.
+  - Extract envelopes do NOT echo user/assistant content — the LLM already has
+    both strings in its context.
 """
 from __future__ import annotations
 
@@ -38,7 +35,7 @@ __all__ = [
 
 TOOL_NAME: str = "cashew_query"
 """Stable tool identifier. Referenced in the schema AND in both envelope builders;
-exporting as a module constant means Phase 4's cashew_extract can do the same
+exporting as a module constant means cashew_extract can do the same
 without string duplication."""
 
 
@@ -77,11 +74,7 @@ CASHEW_QUERY_SCHEMA: dict[str, Any] = {
         "additionalProperties": False,
     },
 }
-"""OpenAI-format tool schema (parameters, not Anthropic's input_schema).
-
-Description length: 284 characters (>= 50-char RECALL-02 floor with ~5x headroom).
-Do NOT rewrap or paraphrase; Plan 03-03 Task 2 asserts the exact wording.
-"""
+"""OpenAI-format tool schema (parameters, not Anthropic's input_schema)."""
 
 
 def build_success_envelope(query: str, context: str, node_count: int) -> str:
@@ -168,8 +161,8 @@ CASHEW_EXTRACT_SCHEMA: dict[str, Any] = {
 }
 """OpenAI-format tool schema for cashew_extract.
 
-Mirrors CASHEW_QUERY_SCHEMA shape (Phase 3 Plan 03-02): parameters key
-(OpenAI format), explicit required, additionalProperties False.
+Mirrors CASHEW_QUERY_SCHEMA shape: parameters key (OpenAI format),
+explicit required, additionalProperties False.
 """
 
 
@@ -204,8 +197,7 @@ def build_extract_error_envelope(error_message: str = "cashew extract failed") -
             file paths, line numbers, or traceback fragments. The full
             traceback is the caller's responsibility to route to
             logger.warning with exc_info=True. Intentionally does NOT accept
-            an exception argument — structural stack-trace-leak prevention,
-            matching Phase 3's build_error_envelope.
+            an exception argument — structural stack-trace-leak prevention.
 
     Returns:
         A JSON string. Never None, never raises.
@@ -214,8 +206,8 @@ def build_extract_error_envelope(error_message: str = "cashew extract failed") -
         {"ok": false, "tool": "cashew_extract", "error": <message>}
 
     Note: unlike build_error_envelope (query tool) this envelope does NOT
-    echo user/assistant content. See PHASE_DESIGN_NOTES Decision Point 7 —
-    the LLM already has both strings in its context.
+    echo user/assistant content — the LLM already has both strings in its
+    context.
     """
     return json.dumps({
         "ok": False,

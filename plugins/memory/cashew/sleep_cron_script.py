@@ -82,9 +82,11 @@ def main() -> None:
         from plugins.memory.cashew.sleep_refactor import run_sleep_cycle
     except ImportError:
         # Fallback: try the installed package (PyPI install path)
-        from cashew_sleep_refactor import run_sleep_cycle  # type: ignore[import-not-found]
+        from cashew_sleep_refactor import (
+            run_sleep_cycle,  # type: ignore[import-not-found]
+        )
 
-    # Resolve the LLM callable from auxiliary config for dream generation (Phase 8).
+    # Resolve the LLM callable from auxiliary config for dream generation.
     from plugins.memory.cashew.config import resolve_model_fn as _resolve_model_fn
     model_fn = _resolve_model_fn(hermes_home=hermes_home)
 

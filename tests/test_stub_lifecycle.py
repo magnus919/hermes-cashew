@@ -11,10 +11,10 @@ def test_name_is_cashew():
 
 def test_is_available_false_before_config():
     """ABC-03: is_available returns False when deps are unavailable and no config exists."""
-    import plugins.memory.cashew as cashew_mod
     import sys as _sys
+
+    import plugins.memory.cashew as cashew_mod
     _cashew_impl = _sys.modules.get("plugins.memory.cashew") or cashew_mod
-    from plugins.memory.cashew import ContextRetriever as real_retriever
     # Temporarily null ContextRetriever to simulate no-cashew-brain scenario
     original = _cashew_impl.ContextRetriever
     _cashew_impl.ContextRetriever = None

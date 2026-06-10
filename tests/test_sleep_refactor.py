@@ -9,32 +9,22 @@ from __future__ import annotations
 
 import math
 import sqlite3
-import os
-import sys
-import tempfile
-import hashlib
-from typing import Optional
-from unittest.mock import patch, MagicMock
 
 import numpy as np
 import pytest
 
 from plugins.memory.cashew.sleep_refactor import (
-    CROSS_LINK_THRESHOLD,
-    DEDUP_THRESHOLD,
-    MAX_NODES_PER_CYCLE,
-    MAX_EDGES_PER_CYCLE,
-    run_sleep_cycle,
-    _find_candidates,
     _batch_cross_links,
-    _run_dedup,
     _compute_metrics,
-    _garbage_collect,
-    _evaluate_permanence,
-    _promote_core_memories,
-    _generate_dream,
     _embed_orphans,
+    _evaluate_permanence,
+    _find_candidates,
+    _garbage_collect,
+    _generate_dream,
     _merge_cluster,
+    _promote_core_memories,
+    _run_dedup,
+    run_sleep_cycle,
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -220,7 +210,6 @@ def test_batch_cross_links_creates_edges(small_graph):
     ids = ["a", "b", "c"]
     # Simulate a precomputed similarity where a-c is above threshold
     # but a-b already exists
-    from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine_sim
 
     from plugins.memory.cashew.sleep_refactor import _load_embedding_matrix
     valid_ids, matrix = _load_embedding_matrix(conn, ids)
@@ -230,9 +219,7 @@ def test_batch_cross_links_creates_edges(small_graph):
         conn.close()
         pytest.skip("No cross-link pairs generated at random")
 
-    edge_before = conn.execute("SELECT COUNT(*) FROM derivation_edges").fetchone()[0]
     stats = _batch_cross_links(conn, valid_ids, cross_pairs, sim)
-    edge_after = conn.execute("SELECT COUNT(*) FROM derivation_edges").fetchone()[0]
 
     assert stats["candidates"] >= 0
     assert stats["created"] + stats["skipped"] + stats["same_source_skipped"] == stats["candidates"]
@@ -704,7 +691,6 @@ def test_embed_orphans_mixed_orphans(db_path):
 def test_run_sleep_cycle_smoke(small_graph, monkeypatch):
     """Full cycle completes without error and returns expected summary keys."""
     # Mock sklearn to avoid real dependency (HF_HUB_OFFLINE is set)
-    from unittest.mock import patch as _patch
 
     # We rely on the existing test embedding vectors + sklearn being available
     result = run_sleep_cycle(small_graph, limit=6, model_fn=None)
@@ -759,6 +745,7 @@ def test_run_sleep_cycle_with_model_fn(small_graph):
 def test_on_session_end_does_not_call_sleep_cycle(tmp_path, monkeypatch):
     """on_session_end no longer calls run_sleep_cycle — migrated to cron (v0.11.0)."""
     import json
+
     from plugins.memory.cashew import CashewMemoryProvider
 
     hermes_home = tmp_path / "hermes_test1"
@@ -805,6 +792,7 @@ def test_on_session_end_does_not_call_sleep_cycle(tmp_path, monkeypatch):
 def test_on_session_end_skips_when_disabled(tmp_path, monkeypatch):
     """When sleep_cycles=false, on_session_end does NOT call run_sleep_cycle."""
     import json
+
     from plugins.memory.cashew import CashewMemoryProvider
 
     hermes_home = tmp_path / "hermes_test2"
@@ -844,6 +832,7 @@ def test_on_session_end_skips_when_disabled(tmp_path, monkeypatch):
 def test_on_session_end_does_not_raise(tmp_path):
     """on_session_end is a safe no-op — sleep cycle was migrated to cron (v0.11.0)."""
     import json
+
     from plugins.memory.cashew import CashewMemoryProvider
 
     hermes_home = tmp_path / "hermes_test3"
@@ -874,6 +863,7 @@ def test_on_session_end_does_not_raise(tmp_path):
 def test_on_session_end_does_not_drain_sync_queue(tmp_path, monkeypatch):
     """on_session_end returns promptly even when the sync queue has pending items."""
     import json
+
     from plugins.memory.cashew import CashewMemoryProvider
 
     hermes_home = tmp_path / "hermes_test4"

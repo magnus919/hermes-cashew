@@ -16,7 +16,6 @@ import pytest
 from plugins.memory.cashew import CashewMemoryProvider
 from plugins.memory.cashew.config import CONFIG_FILENAME
 
-
 # -- Module-level helpers (self-contained per PHASE_DESIGN_NOTES Decision Point 5) --
 
 

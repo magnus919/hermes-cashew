@@ -34,10 +34,16 @@ jobs:
       - name: Lint with ruff
         run: ruff check plugins/memory/cashew/ tests/ --output-format=github
 
-      - name: Run tests (capture log for offline-download scan)
+      - name: Run tests with coverage (capture log for offline-download scan)
         run: |
           set -o pipefail
-          pytest -xvs 2>&1 | tee pytest.log
+          pytest -xvs --cov=plugins/memory/cashew --cov-report=term --cov-report=xml --cov-fail-under=65 2>&1 | tee pytest.log
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
 
       - name: CI-03 — fail if embedding model was downloaded
         run: |

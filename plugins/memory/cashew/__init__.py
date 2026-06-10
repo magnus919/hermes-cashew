@@ -6,7 +6,7 @@ import logging
 import os
 import pathlib
 import queue
-import threading  # Phase 4: non-daemon worker for sync_turn drain
+import threading
 from typing import Any, Callable, Dict, List
 
 try:
@@ -58,14 +58,14 @@ _SHUTDOWN = object()
 
 Compared with `is` (identity), never `==`. Never None — None collides with
 legitimate test-code payloads and with Python 3.13's queue.Queue.shutdown()
-signal path. See 04-RESEARCH.md §6.4 for rationale.
+signal path.
 """
 
 # Probe for the Hermes cron module. In a full Hermes Agent environment the
 # cron.jobs package is importable (the agent root is on sys.path). In CI and
 # standalone test environments it is not — the sleep cycle cron job cannot be
-# registered. This constant is checked at cron-registration time (Phase 4b)
-# so the provider silently skips cron setup rather than logging WARNINGs.
+# registered. This constant is checked at cron-registration time so the
+# provider silently skips cron setup rather than logging WARNINGs.
 _HAS_HERMES_CRON: bool = False
 try:
     from cron.jobs import create_job, remove_job, list_jobs  # noqa: F401
@@ -343,27 +343,24 @@ class CashewMemoryProvider(MemoryProvider):
     """Cashew thought-graph memory provider for Hermes Agent."""
 
     def __init__(self) -> None:
-        # Phase 3 — eager lifecycle: constructed in initialize() once _db_path is
-        # known, cleared in shutdown(). None during Phase 2 half-state (corrupt
-        # config) so prefetch() + handle_tool_call() can short-circuit uniformly.
+        # ContextRetriever: constructed in initialize() once _db_path is
+        # known, cleared in shutdown(). None in half-state (corrupt
+        # config) so prefetch() + handle_tool_call() short-circuit uniformly.
         self._retriever: "ContextRetriever | None" = None
-        # Phase 2 lifecycle state (None until initialize() runs)
+        # Lifecycle state (None until initialize() runs)
         self._hermes_home: pathlib.Path | None = None
         self._config: CashewConfig | None = None
         self._db_path: pathlib.Path | None = None
         self._sync_queue: queue.Queue | None = None
         self._session_id: str = ""
         self._sync_worker: "threading.Thread | None" = None
-        # Phase 4: non-daemon worker that drains _sync_queue. Started in
-        # initialize() only on happy path (Pitfall 4). Joined in shutdown()
-        # with bounded timeout. See 04-RESEARCH.md §§6.5, 6.6.
+        # Non-daemon worker that drains _sync_queue. Started in
+        # initialize() only on happy path. Joined in shutdown()
+        # with bounded timeout.
         self._dropped_turn_count: int = 0
-        # Phase 4: monotonic counter of drop-oldest events on the sync queue.
+        # Monotonic counter of drop-oldest events on the sync queue.
         # Incremented inside sync_turn's overflow branch each time a queued
-        # turn is evicted to make room for a new one. Exposed for Plan 04-04's
-        # test_burst_default_queue_drops_oldest_cleanly to assert counter
-        # matches the WARNING-log count. See B-02 revision in
-        # PHASE_DESIGN_NOTES (2026-04-20).
+        # turn is evicted to make room for a new one.
         self._model_fn: Callable[[str], str] | None = None
         # Prefetch warm cache: cue → formatted context string.
         # Populated by queue_prefetch(), consumed by prefetch(), cleared in
@@ -425,10 +422,10 @@ class CashewMemoryProvider(MemoryProvider):
         Reads kwargs["hermes_home"] (KeyError if absent — surfaces actionable
         message because Hermes always passes it; the only way it's missing is a
         test / programmer error). Loads config, resolves DB path, creates the
-        bounded sync queue. Does NOT start a worker thread — Phase 4 owns that.
-        Does NOT touch the Cashew runtime — Phase 3 owns the ContextRetriever.
+        bounded sync queue and starts the sync worker. Creates the
+        ContextRetriever lazily.
 
-        Cashew/load failures degrade silently per PROJECT.md Key Decisions:
+        Cashew/load failures degrade silently:
         WARNING is logged with exc_info=True and self._config stays None;
         is_available() will still answer correctly because it probes the file
         directly, not self._config.
@@ -441,7 +438,7 @@ class CashewMemoryProvider(MemoryProvider):
         self._session_id = session_id
         self._hermes_home = pathlib.Path(kwargs["hermes_home"])
         # Queue is created here so config-driven sizing/timeout values are wired in.
-        # Phase 4 adds the non-daemon worker thread that drains it (see CLAUDE.md ### Threading Rule).
+        # The non-daemon worker thread drains it (see CLAUDE.md ### Threading Rule).
         self._sync_queue = queue.Queue(maxsize=16)
         # Reset shutdown flag — a prior shutdown() may have set it.
         self._shutdown_flag.clear()
@@ -461,7 +458,6 @@ class CashewMemoryProvider(MemoryProvider):
             if self._config.llm_aux_role:
                 _ensure_auxiliary_memory(self._hermes_home)
             self._db_path = resolve_db_path(self._hermes_home, self._config.cashew_db_path)
-            # Phase 3 eager construction (PHASE_DESIGN_NOTES Decision Point 1).
             # ContextRetriever.__init__ is lazy — no SQLite open, no embedding load yet.
             # Guard against the defensive-import fallback (ContextRetriever = None).
             if ContextRetriever is None:
@@ -470,15 +466,15 @@ class CashewMemoryProvider(MemoryProvider):
                     "cashew-brain dependency missing"
                 )
             self._db_path.parent.mkdir(parents=True, exist_ok=True)
-            # Phase 3.5: self-healing — clean up stale state from prior crashes.
+            # Self-healing — clean up stale state from prior crashes.
             self._heal_stale_lock()
             self._ensure_db_schema(self._db_path)
             self._retriever = ContextRetriever(db_path=str(self._db_path))
             self._model_fn = self._build_model_fn()
-            # Phase 4: start the sync worker AFTER all worker-read state
-            # is populated (db_path, session_id, sync_queue). Pitfall 4.
+            # Start the sync worker AFTER all worker-read state
+            # is populated (db_path, session_id, sync_queue).
             self._start_sync_worker()
-            # Phase 4b: register the sleep cycle cron job if configured.
+            # Register the sleep cycle cron job if configured.
             # Runs AFTER the sync worker so the provider is fully initialized
             # before any background work begins. Silently skips when the
             # Hermes cron module is not available (e.g. CI, standalone tests).
@@ -499,8 +495,8 @@ class CashewMemoryProvider(MemoryProvider):
     def _start_sync_worker(self) -> None:
         """Launch the non-daemon worker. Called from initialize() only on happy path.
 
-        MUST run AFTER self._db_path / self._session_id / self._sync_queue are set
-        (Pitfall 4). daemon=False is load-bearing (PROJECT.md Key Decision).
+        MUST run AFTER self._db_path / self._session_id / self._sync_queue are set.
+        daemon=False is load-bearing (see CLAUDE.md Threading Rule).
         """
         self._sync_worker = threading.Thread(
             target=self._worker_loop,
@@ -524,7 +520,7 @@ class CashewMemoryProvider(MemoryProvider):
         if self._sleep_cron_job_id is not None:
             return  # already registered for this instance
 
-        # Phase 4b-adopt: scan for an existing sleep cron job by name.
+        # Scan for an existing sleep cron job by name.
         # If one exists, adopt its ID and skip registration so the
         # original 12h timer isn't reset. Without this, every session
         # start would remove-and-re-register the job, resetting the
@@ -634,12 +630,12 @@ class CashewMemoryProvider(MemoryProvider):
         )
 
     def sync_turn(self, user_content: str, assistant_content: str, session_id: str = "") -> None:
-        """Hot-path enqueue of a completed turn (SYNC-01).
+        """Hot-path enqueue of a completed turn.
 
         Contract: returns in <10ms. Never raises. If the queue is full, drops the
         OLDEST queued turn, logs a WARNING, and enqueues the new one (drop-oldest
-        policy, 04-RESEARCH.md §6.3). If somehow still full after the drop (rare
-        worker-draining race), drops the NEW turn with a second WARNING.
+        policy). If somehow still full after the drop (rare worker-draining race),
+        drops the NEW turn with a second WARNING.
 
         Half-state (_sync_queue is None) is a silent no-op.
         """
@@ -654,13 +650,13 @@ class CashewMemoryProvider(MemoryProvider):
         try:
             self._sync_queue.put_nowait(turn)
         except queue.Full:
-            # Drop-oldest (04-RESEARCH.md §6.3 + Pitfall 3).
+            # Drop-oldest policy.
             try:
                 self._sync_queue.get_nowait()
-                self._sync_queue.task_done()  # balance the drop (EXACTLY ONCE)
+                self._sync_queue.task_done()  # balance the drop (exactly once)
             except queue.Empty:
                 pass  # worker drained between Full and get_nowait — rare race; no-op
-            self._dropped_turn_count += 1  # per-drop counter — asserted by Plan 04-04 burst test
+            self._dropped_turn_count += 1
             logger.warning(
                 "cashew sync queue overflow (maxsize=%d); dropped oldest turn",
                 self._sync_queue.maxsize,
@@ -673,16 +669,16 @@ class CashewMemoryProvider(MemoryProvider):
     def _worker_loop(self) -> None:
         """Background drain loop. Entry point for self._sync_worker.
 
-        Sentinel check BEFORE try (Pitfall 1 — must not be reachable from the
-        exception path). task_done() ALWAYS in finally (Pitfall 2). Per-iteration
-        except catches all Cashew failures (SYNC-06) without poisoning the queue.
+        Sentinel check BEFORE try (must not be reachable from the exception
+        path). task_done() ALWAYS in finally. Per-iteration except catches all
+        Cashew failures without poisoning the queue.
 
-        Plan 04-04 race fix: binds the queue reference to a local `q` at loop
-        entry. If shutdown() times out waiting for this worker, it clears
-        `self._sync_queue = None` and abandons the worker. Without this local
-        bind, the abandoned worker's `finally: self._sync_queue.task_done()`
-        would raise AttributeError on NoneType. Using `q` keeps task_done()
-        bound to the queue the worker was actually draining, race-free.
+        Binds the queue reference to a local `q` at loop entry. If shutdown()
+        times out waiting for this worker, it clears `self._sync_queue = None`
+        and abandons the worker. Without this local bind, the abandoned worker's
+        `finally: self._sync_queue.task_done()` would raise AttributeError on
+        NoneType. Using `q` keeps task_done() bound to the queue the worker was
+        actually draining, race-free.
         """
         q = self._sync_queue  # bind once; shutdown may clear self._sync_queue before we exit
         assert q is not None  # invariant: worker only starts when queue exists
@@ -889,15 +885,14 @@ class CashewMemoryProvider(MemoryProvider):
         """Persist one turn via Cashew's heuristic extractor (or LLM if configured).
 
         Lazy-imports core.session so the plugin module loads even when cashew-brain
-        is not installed (matches Phase 1 Pattern 3 for agent.memory_provider).
-        When self._model_fn is set (via llm_aux_role config), upstream receives
-        the LLM callable and can perform LLM extraction, think cycles, and sleep
-        synthesis. When None, Cashew's built-in heuristic extractor is used
-        (04-RESEARCH.md §§1, 6.2 — no LLM round-trip).
+        is not installed. When self._model_fn is set (via llm_aux_role config),
+        upstream receives the LLM callable and can perform LLM extraction, think
+        cycles, and sleep synthesis. When None, Cashew's built-in heuristic
+        extractor is used (no LLM round-trip).
 
         Retries up to 3 times on SQLITE_BUSY with exponential backoff before
-        dropping the turn (SYNC-05)."""
-        from core.session import end_session  # lazy import (see 04-RESEARCH.md §9 + test strategy §11)
+        dropping the turn."""
+        from core.session import end_session  # lazy import
         user, assistant, session_id = turn
 
         # Short-circuit if shutdown is in progress — the interpreter's atexit
@@ -1148,30 +1143,30 @@ class CashewMemoryProvider(MemoryProvider):
         return count
 
     def on_session_end(self, messages: list) -> None:
-        """Session boundary notification (ABC-06).
+        """Session boundary notification.
 
         Does NOT drain the sync queue — the background worker is non-daemon and
         keeps running across session boundaries. Data-loss protection is handled
-        by dispose(), which posts a sentinel and bounded-joins the worker.
+        by shutdown(), which posts a sentinel and bounded-joins the worker.
 
-        Sleep cycle processing has been migrated to a Hermes cron job (v0.11.0).
+        Sleep cycle processing is handled by a Hermes cron job.
         See ``sleep_schedule`` in cashew.json.
         """
         if self._sync_queue is None:
             return  # not initialized or silent-degraded
 
     def shutdown(self) -> None:
-        """Post sentinel, bounded-join worker, clear references (ABC-05 + SYNC-05).
+        """Post sentinel, bounded-join worker, clear references.
 
         Order is load-bearing:
-          1. If not initialized, return (Phase 2 safe-no-op carryover).
+          1. If not initialized, return.
           2. Post _SHUTDOWN sentinel to the queue. put_nowait first; fallback to
              a 1s blocking put if the queue is full (worker is draining fast).
           3. Bounded-join the worker using sync_queue_timeout. WARNING on timeout.
           4. Clear _sync_queue, _sync_worker, _config, _db_path, _retriever.
 
         _hermes_home is intentionally NOT reset — is_available() must keep
-        reflecting on-disk reality (Phase 2 Success #3).
+        reflecting on-disk reality.
         """
         if self._sync_queue is None:
             return  # safe no-op: initialize() was never called
@@ -1187,7 +1182,7 @@ class CashewMemoryProvider(MemoryProvider):
                 self._sync_queue.put(_SHUTDOWN, block=True, timeout=1.0)
             except queue.Full:
                 logger.warning("cashew shutdown: could not post sentinel; worker may leak")
-        # Bounded join. NEVER raise (silent-degrade Key Decision).
+        # Bounded join. Never raise.
         if self._sync_worker is not None:
             self._sync_worker.join(timeout=timeout)
             if self._sync_worker.is_alive():
@@ -1198,10 +1193,9 @@ class CashewMemoryProvider(MemoryProvider):
         # Sleep cycle cron job is intentionally NOT removed here.
         # It persists across session boundaries so the 12h schedule
         # isn't reset on every session start. The next initialize()
-        # will adopt the existing job via Phase 4b-adopt logic.
-        # See _register_sleep_cron() for the adoption logic.
+        # will adopt the existing job if one exists.
         self._sleep_cron_job_id = None  # clear instance tracking only
-        # Clear state. _hermes_home persists (see Phase 2 Plan 02-02 rationale).
+        # Clear state. _hermes_home persists (see is_available() contract).
         self._sync_queue = None
         self._sync_worker = None
         self._config = None
@@ -1210,7 +1204,7 @@ class CashewMemoryProvider(MemoryProvider):
         self._warm_cache.clear()
         self._prefetch_pending = None
         self._last_assistant = ""
-        logger.debug("cashew provider shutdown complete (Phase 4 — worker drained)")
+        logger.debug("cashew provider shutdown complete")
 
     def prefetch(self, query: str, domain: str | None = None, tag: str | None = None,
                  exclude_tags: list[str] | None = None, **kwargs: Any) -> str:
@@ -1452,10 +1446,10 @@ class CashewMemoryProvider(MemoryProvider):
             conn.close()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        """Return the list of LLM tool schemas this provider exposes (RECALL-02 + SYNC-03).
+        """Return the list of LLM tool schemas this provider exposes.
 
-        Phase 3 + Phase 4: two tools — cashew_query (recall) and cashew_extract
-        (explicit sync). Schema structure follows OpenAI's parameters convention.
+        Two tools — cashew_query (recall) and cashew_extract (explicit sync).
+        Schema structure follows OpenAI's parameters convention.
 
         The returned list is a fresh list literal each call, but the schema dicts
         themselves are module constants (not copies) — callers must not mutate.
@@ -1466,12 +1460,12 @@ class CashewMemoryProvider(MemoryProvider):
         """Route an LLM tool call to the Cashew backend.
 
         Two tools are handled:
-          - cashew_query (Phase 3): recall from the thought graph.
-          - cashew_extract (Phase 4): explicit, synchronous extraction of
+          - cashew_query: recall from the thought graph.
+          - cashew_extract: explicit, synchronous extraction of
             one turn. Bypasses the sync queue — returns only after Cashew
             completes.
 
-        Silent-degrade paths (per PROJECT.md Key Decision):
+        Silent-degrade paths:
           - Unknown tool -> WARNING (no exc_info) + error envelope with
             tool='cashew_query' for historical compatibility.
           - Half-state (initialize never ran or silent-degraded) -> error
@@ -1535,15 +1529,14 @@ class CashewMemoryProvider(MemoryProvider):
                 )
 
         elif name == "cashew_extract":
-            # Half-state guard (matches Phase 3 cashew_query + 04-RESEARCH.md §6.9).
-            # No log — initialize() already warned when it set _db_path / _config to None.
+            # Half-state guard. No log — initialize() already warned when it
+            # set _db_path / _config to None.
             if self._db_path is None or self._config is None:
                 return build_extract_error_envelope()
             try:
                 user = args["user_content"]  # KeyError caught below — tool-call failure
                 assistant = args["assistant_content"]
-                # Lazy import (matches _drain_once in Plan 04-01 — keeps is_available
-                # free of core.session side effects).
+                # Lazy import — keeps is_available free of core.session side effects.
                 from core.session import end_session
                 result = end_session(
                     db_path=str(self._db_path),
@@ -1564,20 +1557,15 @@ class CashewMemoryProvider(MemoryProvider):
                 return build_extract_error_envelope()
 
         else:
-            # Unknown-tool branch (Phase 3 contract preserved; note: uses the QUERY
-            # envelope because historically unknown-tool returned the cashew_query
-            # error shape. This preserves backward compatibility with Phase 3's
-            # test_handle_tool_call.py::test_unknown_tool_returns_error_envelope_and_logs_once
-            # which asserts tool='cashew_query', error='unknown tool', query=None.
-            # Rationale: unknown-tool routing predates the existence of multiple
-            # tools; the envelope has served as a generic-error shape. Phase 4 does
-            # not change this behavior — only ADDS a cashew_extract-specific error
-            # envelope for the cashew_extract branch.)
+            # Unknown-tool branch. Uses the QUERY envelope because historically
+            # unknown-tool returned the cashew_query error shape. This preserves
+            # backward compatibility with test_handle_tool_call.py which asserts
+            # tool='cashew_query', error='unknown tool', query=None.
             logger.warning("cashew unknown tool call: %r", name)
             return build_error_envelope(query=None, error_message="unknown tool")
 
     def system_prompt_block(self) -> str:
-        """Return a ~10-line LLM-visible status string for the system prompt (UX-01).
+        """Return a ~10-line LLM-visible status string for the system prompt.
 
         The returned string is included verbatim in Hermes's assembled system prompt
         so the LLM can reason about what memory is available.

@@ -10,18 +10,16 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
-import pathlib
 
 import pytest
 
 from plugins.memory.cashew.config import (
-    CashewConfig,
-    CONFIG_FILENAME,
-    DEFAULTS,
-    ENV_VAR_MAP,
-    _env_var_name,
     _PROVIDER_BASE_URLS,
     _PROVIDER_ENV_MAP,
+    DEFAULTS,
+    ENV_VAR_MAP,
+    CashewConfig,
+    _env_var_name,
     get_ai_domain,
     get_config_schema,
     get_user_domain,
@@ -31,7 +29,6 @@ from plugins.memory.cashew.config import (
     resolve_model_fn,
     save_config,
 )
-
 
 EXPECTED_KEY_COUNT = 36
 

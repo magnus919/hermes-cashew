@@ -20,12 +20,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os as _os
 import pathlib
 import shutil
 import sys
 import tempfile
 
-import os as _os
 _os.environ.setdefault("HF_HUB_OFFLINE", "1")
 _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 _os.environ.setdefault("HF_DATASETS_OFFLINE", "1")

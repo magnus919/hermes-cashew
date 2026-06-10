@@ -6,7 +6,9 @@ import logging
 import os
 import pathlib
 import queue
+import sqlite3
 import threading
+import time
 from typing import Any, Callable, Dict, List
 
 try:
@@ -16,13 +18,17 @@ except ImportError:
 
 from .config import (
     CashewConfig,
-    get_config_schema as _config_get_config_schema,
-    get_user_domain,
     get_ai_domain,
+    get_user_domain,
     load_config,
     resolve_config_path,
     resolve_db_path,
     resolve_model_fn,
+)
+from .config import (
+    get_config_schema as _config_get_config_schema,
+)
+from .config import (
     save_config as _config_save_config,
 )
 
@@ -68,7 +74,7 @@ signal path.
 # provider silently skips cron setup rather than logging WARNINGs.
 _HAS_HERMES_CRON: bool = False
 try:
-    from cron.jobs import create_job, remove_job, list_jobs  # noqa: F401
+    from cron.jobs import create_job, list_jobs, remove_job  # noqa: F401
     _HAS_HERMES_CRON = True
 except ImportError:
     pass
@@ -1104,8 +1110,8 @@ class CashewMemoryProvider(MemoryProvider):
 
         Silent-degrades: logs warning on failure, never raises.
         """
-        from core.session import _create_node, _set_node_tags
         from core.embeddings import embed_nodes
+        from core.session import _create_node, _set_node_tags
 
         db_path = str(self._db_path)
         count = 0

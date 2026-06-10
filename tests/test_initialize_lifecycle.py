@@ -13,16 +13,16 @@ import threading
 import pytest
 
 from plugins.memory.cashew import CashewMemoryProvider
-from plugins.memory.cashew.config import CashewConfig, DEFAULTS, CONFIG_FILENAME
+from plugins.memory.cashew.config import CONFIG_FILENAME, DEFAULTS, CashewConfig
 
 
 def test_fresh_provider_is_not_available_without_deps(monkeypatch):
     """ABC-04 + Phase 2 Success #3: pre-initialize is False when ContextRetriever unavailable."""
-    from plugins.memory.cashew import ContextRetriever as real_retriever
     # Simulate no-cashew-brain scenario by nulling ContextRetriever
     # (as happens at module import when cashew-brain is not installed).
-    import plugins.memory.cashew as cashew_mod
     import sys as _sys
+
+    import plugins.memory.cashew as cashew_mod
     _cashew_impl = _sys.modules.get("plugins.memory.cashew") or cashew_mod
     monkeypatch.setattr(_cashew_impl, "ContextRetriever", None)
     p = CashewMemoryProvider()

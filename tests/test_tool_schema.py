@@ -7,7 +7,6 @@ import pytest
 from plugins.memory.cashew import CashewMemoryProvider
 from plugins.memory.cashew.tools import CASHEW_QUERY_SCHEMA
 
-
 CANONICAL_DESCRIPTION_PREFIX = (
     "Retrieve related context from the Cashew thought graph. "
     "Use when the user's question references prior discussions, decisions, "

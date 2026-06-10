@@ -9,11 +9,8 @@ import time
 import types
 from typing import Any
 
-import pytest
-
 from plugins.memory.cashew import CashewMemoryProvider
 from plugins.memory.cashew.config import CONFIG_FILENAME
-
 
 # -- Module-level helpers (copy-paste idiom per PHASE_DESIGN_NOTES Decision Point 5) --
 

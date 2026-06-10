@@ -77,7 +77,6 @@ def test_initialize_skips_cron_when_sleep_disabled(tmp_path, monkeypatch):
         calls.append(kwargs)
         return {"id": "fake-job-id"}
 
-    import plugins.memory.cashew as cashew_mod
     monkeypatch.setattr(
         "plugins.memory.cashew._remove_existing_sleep_job",
         lambda *a: None,

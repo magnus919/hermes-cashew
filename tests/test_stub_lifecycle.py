@@ -1,6 +1,8 @@
 # tests/test_stub_lifecycle.py
 # Phase 1 acceptance: the stub provider has the right shape and refuses to be "available" pre-config,
 # without performing any filesystem or network I/O.
+import sys
+
 from plugins.memory.cashew import CashewMemoryProvider
 
 
@@ -13,8 +15,7 @@ def test_is_available_false_before_config():
     """ABC-03: is_available returns False when deps are unavailable and no config exists."""
     import plugins.memory.cashew as cashew_mod
 
-    _cashew_impl = _sys.modules.get("plugins.memory.cashew") or cashew_mod
-    from plugins.memory.cashew import ContextRetriever as real_retriever
+    _cashew_impl = sys.modules.get("plugins.memory.cashew") or cashew_mod
     # Temporarily null ContextRetriever to simulate no-cashew-brain scenario
     original = _cashew_impl.ContextRetriever
     _cashew_impl.ContextRetriever = None

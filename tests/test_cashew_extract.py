@@ -16,10 +16,7 @@ from plugins.memory.cashew import CashewMemoryProvider
 from plugins.memory.cashew.tools import (
     CASHEW_EXTRACT_SCHEMA,
     EXTRACT_TOOL_NAME,
-    build_extract_error_envelope,
-    build_extract_success_envelope,
 )
-
 
 # -- Module-level helpers --
 

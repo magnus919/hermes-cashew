@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import sqlite3
 
-import pytest
-
 from plugins.memory.cashew import CashewMemoryProvider
 
 
@@ -105,7 +103,7 @@ def test_migration_idempotent(tmp_path):
 
 def test_core_columns_preserved(tmp_path):
     """SCHEMA-06: Core data columns are preserved after migration.
-    
+
     Upstream v1.1.0 drops the dead confidence column (uncalibrated noise per
     cashew-brain PR #25) but preserves all meaningful data columns.
     """

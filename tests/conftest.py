@@ -68,7 +68,8 @@ if "agent.memory_provider" not in sys.modules:
 # Provides a minimal end_session stub so tests can monkeypatch core.session.end_session.
 # Use find_spec to detect cashew-brain without importing it — importing core.context
 # would populate sys.modules['core.session'] with the real module, blocking later patches.
-import importlib.util as _igu
+import importlib.util as _igu  # noqa: E402
+
 try:
     _cashew_spec = _igu.find_spec("core.context")
 except ModuleNotFoundError:
@@ -89,6 +90,7 @@ if "core.session" not in sys.modules and _cashew_spec is None:
 # is already in sys.modules because the stub imports nothing from there directly
 # but Hermes ABC ordering conventions keep memory_provider ahead of memory_manager.
 from tests._memory_manager_stub import inject_into_sys_modules  # noqa: E402
+
 inject_into_sys_modules()
 
 import pytest  # noqa: E402

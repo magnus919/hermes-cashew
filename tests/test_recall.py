@@ -8,8 +8,6 @@ from __future__ import annotations
 import logging
 import sqlite3
 
-import pytest
-
 from plugins.memory.cashew import CashewMemoryProvider
 from plugins.memory.cashew.config import DEFAULTS, resolve_db_path
 

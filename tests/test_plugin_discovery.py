@@ -3,8 +3,6 @@
 # REQUIRES: `pip install -e ".[dev]"` has been run (entry points are metadata-backed).
 import importlib.metadata as im
 
-import pytest
-
 
 def test_entry_point_registered():
     """PKG-02: pyproject.toml declares [project.entry-points."hermes_agent.plugins"]."""

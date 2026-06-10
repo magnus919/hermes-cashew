@@ -9,7 +9,9 @@ import json
 import sqlite3
 import time
 
-from agent.memory_manager import MemoryManager  # via tests/_memory_manager_stub injection
+from agent.memory_manager import (
+    MemoryManager,  # via tests/_memory_manager_stub injection
+)
 
 from plugins.memory.cashew import CashewMemoryProvider
 from plugins.memory.cashew.config import DEFAULTS, resolve_db_path

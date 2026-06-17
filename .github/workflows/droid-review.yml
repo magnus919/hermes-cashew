@@ -1,34 +1,30 @@
-# Automated PR review via Factory Droid.
-# Triggers on PR open/synchronize and posts review findings as a comment.
-name: Droid Review
+name: Droid Auto Review
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, ready_for_review, reopened]
 
-permissions:
-  contents: read
-  pull-requests: write
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  review:
+  droid-review:
+    if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+      actions: read
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v5
         with:
-          fetch-depth: 0
-
-      - uses: actions/setup-python@v5
+          fetch-depth: 1
+      - name: Run Droid Auto Review
+        uses: Factory-AI/droid-action@7c7bfea2aa3bb7ea87579402cc1d89dbcf6b13b3
         with:
-          python-version: "3.11"
-
-      - name: Install droid
-        run: |
-          curl -fsSL https://get.factory.ai | bash
-          echo "$HOME/.factory/bin" >> "$GITHUB_PATH"
-
-      - name: Run droid review
-        env:
-          FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
-        run: |
-          droid exec "Review this PR diff for bugs, security issues, and correctness problems. Post findings as a structured review comment." --non-interactive
+          factory_api_key: ${{ secrets.FACTORY_API_KEY }}
+          automatic_review: true
+          automatic_security_review: true

@@ -57,11 +57,11 @@ from .tools import (
 structlog.configure(
     processors=[
         get_scrub_processor(),
-        structlog.stdlib.add_log_level,
-        structlog.dev.ConsoleRenderer(),
     ],
     context_class=dict,
     logger_factory=LoggerFactory(),
+    wrapper_class=structlog.stdlib.BoundLogger,
+    cache_logger_on_first_use=True,
 )
 
 logger = structlog.get_logger(__name__)

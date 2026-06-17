@@ -1,0 +1,25 @@
+{
+  "name": "hermes-cashew",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "postCreateCommand": "pip install -e '.[dev]'",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "charliermarsh.ruff",
+        "ms-python.python",
+        "ms-python.mypy-type-checker"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.testing.pytestEnabled": true,
+        "[python]": {
+          "editor.defaultFormatter": "charliermarsh.ruff",
+          "editor.formatOnSave": true
+        }
+      }
+    }
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/git:1": {}
+  }
+}

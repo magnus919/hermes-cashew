@@ -1,0 +1,34 @@
+# Automated PR review via Factory Droid.
+# Triggers on PR open/synchronize and posts review findings as a comment.
+name: Droid Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install droid
+        run: |
+          curl -fsSL https://get.factory.ai | bash
+          echo "$HOME/.factory/bin" >> "$GITHUB_PATH"
+
+      - name: Run droid review
+        env:
+          FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
+        run: |
+          droid exec "Review this PR diff for bugs, security issues, and correctness problems. Post findings as a structured review comment." --non-interactive

@@ -30,9 +30,31 @@ jobs:
 
       - name: Install
         run: pip install -e ".[dev]"
+        timeout-minutes: 5
+
+      - name: AGENTS.md validation — verify install and test commands work
+        run: |
+          echo "::group::Validating AGENTS.md commands"
+          # Verify 'pip install -e .[dev]' works (just ran above, check import)
+          python -c "import plugins.memory.cashew; print('import OK')"
+          # Verify 'pytest' collect works
+          pytest --collect-only -q
+          echo "::endgroup::"
 
       - name: Lint with ruff
         run: ruff check plugins/memory/cashew/ tests/ --output-format=github
+
+      - name: Type check with mypy
+        run: mypy --explicit-package-bases plugins/memory/cashew/
+
+      - name: Dead code detection with vulture
+        run: vulture plugins/memory/cashew/ --min-confidence 80
+
+      - name: Duplicate code detection
+        run: python scripts/check-duplicates.py
+
+      - name: Unused dependency detection with deptry
+        run: deptry .
 
       - name: Run tests with coverage (capture log for offline-download scan)
         run: |

@@ -10,6 +10,8 @@ updates:
       - "dependencies"
     commit-message:
       prefix: "chore(deps)"
+    versioning-strategy: increase-if-necessary
+    stability-days: 7
 
   - package-ecosystem: "github-actions"
     directory: "/"

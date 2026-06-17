@@ -28,31 +28,32 @@
 from __future__ import annotations
 
 import fcntl
-import logging
 import math
 import random
 import sqlite3
 import threading
 import time
 from collections import defaultdict
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
+import structlog
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # ── thresholds ──────────────────────────────────────────────────────────────
-CROSS_LINK_THRESHOLD = 0.78   # cosine similarity above which nodes get cross-linked
-DEDUP_THRESHOLD = 0.82        # cosine similarity above which nodes are considered duplicates
-MAX_NODES_PER_CYCLE = 2000    # work cap per cycle
-MAX_EDGES_PER_CYCLE = 100_000 # edge cap per cycle
-EDGES_PER_BATCH = 500         # commit after this many edge inserts
-GC_K_NODES = 50               # random sample size for garbage collection
-GC_THRESHOLD = 0.0            # fitness threshold for GC (0 = decay isolated nodes)
-GC_GRACE_DAYS = 7             # min node age (days) before GC can decay it
+CROSS_LINK_THRESHOLD = 0.78  # cosine similarity above which nodes get cross-linked
+DEDUP_THRESHOLD = 0.82  # cosine similarity above which nodes are considered duplicates
+MAX_NODES_PER_CYCLE = 2000  # work cap per cycle
+MAX_EDGES_PER_CYCLE = 100_000  # edge cap per cycle
+EDGES_PER_BATCH = 500  # commit after this many edge inserts
+GC_K_NODES = 50  # random sample size for garbage collection
+GC_THRESHOLD = 0.0  # fitness threshold for GC (0 = decay isolated nodes)
+GC_GRACE_DAYS = 7  # min node age (days) before GC can decay it
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
+
 
 def _set_wal(conn: sqlite3.Connection) -> None:
     """Enable WAL mode if not already active."""
@@ -63,7 +64,8 @@ def _set_wal(conn: sqlite3.Connection) -> None:
 
 
 def _load_embedding_matrix(
-    conn: sqlite3.Connection, node_ids: list[str],
+    conn: sqlite3.Connection,
+    node_ids: list[str],
 ) -> tuple[list[str], np.ndarray]:
     """Load embeddings for *node_ids* from the `embeddings` table.
 
@@ -106,8 +108,10 @@ def _load_embedding_matrix(
 
 # ── Phase 1: candidate discovery (vectorized) ───────────────────────────────
 
+
 def _find_candidates(
-    ids: list[str], matrix: np.ndarray,
+    ids: list[str],
+    matrix: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return (cross_link_pairs, dedup_pairs, similarity_matrix).
 
@@ -119,7 +123,9 @@ def _find_candidates(
     sim = sklearn_cosine_sim(matrix)
     logger.debug(
         "sleep: similarity matrix %d×%d computed in %.1fs (%.0f MB)",
-        len(ids), len(ids), time.perf_counter() - t0,
+        len(ids),
+        len(ids),
+        time.perf_counter() - t0,
         sim.nbytes / 1024**2,
     )
 
@@ -131,9 +137,9 @@ def _find_candidates(
     dedup_pairs = np.argwhere(dedup_mask)
 
     logger.info(
-        "sleep: %d cross-link + %d dedup candidates "
-        "(%d total / %d pairs)",
-        len(cross_pairs), len(dedup_pairs),
+        "sleep: %d cross-link + %d dedup candidates (%d total / %d pairs)",
+        len(cross_pairs),
+        len(dedup_pairs),
         len(cross_pairs) + len(dedup_pairs),
         len(ids) * (len(ids) - 1) // 2,
     )
@@ -141,6 +147,7 @@ def _find_candidates(
 
 
 # ── Phase 2: batched cross-linking ──────────────────────────────────────────
+
 
 def _batch_cross_links(
     conn: sqlite3.Connection,
@@ -167,7 +174,7 @@ def _batch_cross_links(
     t0 = time.perf_counter()
 
     for batch_start in range(0, len(cross_pairs), EDGES_PER_BATCH):
-        batch = cross_pairs[batch_start:batch_start + EDGES_PER_BATCH]
+        batch = cross_pairs[batch_start : batch_start + EDGES_PER_BATCH]
         for i, j in batch:
             if max_edges is not None and stats["created"] >= max_edges:
                 stats["capped"] = True
@@ -202,10 +209,7 @@ def _batch_cross_links(
             conn.executemany(
                 "INSERT OR IGNORE INTO derivation_edges "
                 "(parent_id, child_id, weight, reasoning) VALUES (?, ?, ?, ?)",
-                [
-                    (p, c, w, f"cross_link - similarity={w:.3f}")
-                    for p, c, w in pending
-                ],
+                [(p, c, w, f"cross_link - similarity={w:.3f}") for p, c, w in pending],
             )
             conn.commit()
         pending.clear()
@@ -213,12 +217,15 @@ def _batch_cross_links(
     elapsed = time.perf_counter() - t0
     logger.info(
         "sleep: cross-links %d created, %d skipped in %.1fs",
-        stats["created"], stats["skipped"], elapsed,
+        stats["created"],
+        stats["skipped"],
+        elapsed,
     )
     return stats
 
 
 # ── Phase 3: dedup via connected components ─────────────────────────────────
+
 
 def _merge_cluster(
     conn: sqlite3.Connection,
@@ -280,7 +287,7 @@ def _merge_cluster(
         f"UPDATE thought_nodes SET decayed=1 WHERE id IN ({loser_placeholders})",
         losers,
     )
-    return keeper_id
+    return keeper_id  # type: ignore[no-any-return]
 
 
 def _run_dedup(
@@ -330,12 +337,14 @@ def _run_dedup(
 
     logger.info(
         "sleep: dedup %d components merged, %d nodes decayed",
-        stats["components"], stats["nodes_merged"],
+        stats["components"],
+        stats["nodes_merged"],
     )
     return stats
 
 
 # ── Phase 4: node metrics ───────────────────────────────────────────────────
+
 
 def _compute_metrics(conn: sqlite3.Connection) -> dict[str, dict]:
     """Compute branching factor + cross-link count for all active nodes."""
@@ -362,12 +371,14 @@ def _compute_metrics(conn: sqlite3.Connection) -> dict[str, dict]:
 
     logger.debug(
         "sleep: metrics computed for %d nodes in %.1fs",
-        len(metrics), time.perf_counter() - t0,
+        len(metrics),
+        time.perf_counter() - t0,
     )
     return metrics
 
 
 # ── Phase 5: garbage collection ─────────────────────────────────────────────
+
 
 def _garbage_collect(
     conn: sqlite3.Connection,
@@ -378,26 +389,30 @@ def _garbage_collect(
         return 0
 
     perm_ids = {
-        r[0] for r in conn.execute(
+        r[0]
+        for r in conn.execute(
             "SELECT id FROM thought_nodes "
             "WHERE permanent=1 AND (decayed IS NULL OR decayed=0)"
         ).fetchall()
     }
 
     candidates = [
-        nid for nid, m in metrics.items()
+        nid
+        for nid, m in metrics.items()
         if nid not in perm_ids and m["fitness"] <= GC_THRESHOLD
     ]
 
     # Age gate: exclude nodes created within the grace period
     if candidates and GC_GRACE_DAYS > 0:
         import datetime
+
         cutoff = (
             datetime.datetime.utcnow() - datetime.timedelta(days=GC_GRACE_DAYS)
         ).isoformat()
         ph = ",".join("?" * len(candidates))
         young = {
-            r[0] for r in conn.execute(
+            r[0]
+            for r in conn.execute(
                 f"SELECT id FROM thought_nodes WHERE id IN ({ph}) AND timestamp >= ?",
                 [*candidates, cutoff],
             ).fetchall()
@@ -425,10 +440,12 @@ def _garbage_collect(
 
 # ── Phase 6: permanence evaluation ──────────────────────────────────────────
 
+
 def _evaluate_permanence(conn: sqlite3.Connection) -> dict:
     """Promote nodes with access_count >= 10 to permanent status."""
     try:
         from core.permanence import promote_permanent_nodes
+
         db_path = conn.execute("PRAGMA database_list").fetchone()[2]
         if not db_path:
             # :memory: or temp database — use direct SQL
@@ -438,7 +455,7 @@ def _evaluate_permanence(conn: sqlite3.Connection) -> dict:
             "sleep: permanence promoted %d nodes (threshold=10)",
             stats.get("nodes_promoted", 0),
         )
-        return stats
+        return stats  # type: ignore[no-any-return]
     except ImportError:
         cur = conn.execute(
             "UPDATE thought_nodes SET permanent=1 "
@@ -454,6 +471,7 @@ def _evaluate_permanence(conn: sqlite3.Connection) -> dict:
 
 # ── Phase 7: core memory promotion ──────────────────────────────────────────
 
+
 def _promote_core_memories(
     conn: sqlite3.Connection,
     metrics: dict[str, dict],
@@ -463,7 +481,8 @@ def _promote_core_memories(
         return {"promoted": 0, "demoted": 0}
 
     curr = {
-        r[0] for r in conn.execute(
+        r[0]
+        for r in conn.execute(
             "SELECT id FROM thought_nodes WHERE node_type='core_memory'"
         ).fetchall()
     }
@@ -498,17 +517,20 @@ def _promote_core_memories(
     conn.commit()
     logger.info(
         "sleep: core memory %d promoted, %d demoted (target=%d)",
-        len(promoted), len(demoted), target,
+        len(promoted),
+        len(demoted),
+        target,
     )
     return {"promoted": len(promoted), "demoted": len(demoted), "target": target}
 
 
 # ── Phase 8: dream generation ───────────────────────────────────────────────
 
+
 def _generate_dream(
     conn: sqlite3.Connection,
     cross_link_tuples: list[tuple[str, str, float]],
-    model_fn=None,
+    model_fn: Any = None,
 ) -> Optional[str]:
     """LLM-powered dream node bridging the strongest cross-source pair."""
     if not cross_link_tuples or model_fn is None:
@@ -568,6 +590,7 @@ def _generate_dream(
         return None
 
     import hashlib
+
     dream_id = hashlib.sha256(dream_content.encode()).hexdigest()[:12]
 
     conn.execute(
@@ -592,14 +615,19 @@ def _generate_dream(
 
     logger.info(
         "sleep: dream node %s bridging %s... ↔ %s...",
-        dream_id, n1[:8], n2[:8],
+        dream_id,
+        n1[:8],
+        n2[:8],
     )
     return dream_id
 
 
 # ── Phase 9: embedding gap closure ──────────────────────────────────────────
 
-def _embed_orphans(conn: sqlite3.Connection, embedding_model: str = "thenlper/gte-large") -> int:
+
+def _embed_orphans(
+    conn: sqlite3.Connection, embedding_model: str = "thenlper/gte-large"
+) -> int:
     """Embed any active nodes lacking an embedding row. Returns count."""
     rows = conn.execute(
         "SELECT tn.id, tn.content FROM thought_nodes tn "
@@ -612,9 +640,12 @@ def _embed_orphans(conn: sqlite3.Connection, embedding_model: str = "thenlper/gt
     if not rows:
         return 0
 
-    logger.info("sleep: embedding %d orphaned nodes with %s...", len(rows), embedding_model)
+    logger.info(
+        "sleep: embedding %d orphaned nodes with %s...", len(rows), embedding_model
+    )
 
     from sentence_transformers import SentenceTransformer
+
     model = SentenceTransformer(embedding_model)
 
     embedded = 0
@@ -653,10 +684,11 @@ def _embed_orphans(conn: sqlite3.Connection, embedding_model: str = "thenlper/gt
 
 # ── main entry point ────────────────────────────────────────────────────────
 
+
 def _run_dream_async(
     db_path: str,
     cross_link_tuples: list[tuple[str, str, float]],
-    model_fn,
+    model_fn: Any,
     embedding_model: str = "thenlper/gte-large",
 ) -> None:
     """Run Phase 8 (dream) + Phase 9 (orphan embedding) in a daemon thread.
@@ -664,7 +696,8 @@ def _run_dream_async(
     Opens its own SQLite connection — WAL mode handles concurrency with
     the new session's sync worker writes.
     """
-    def _task():
+
+    def _task() -> None:
         try:
             conn = sqlite3.connect(db_path)
             conn.execute("PRAGMA busy_timeout=5000")
@@ -674,7 +707,8 @@ def _run_dream_async(
             conn.close()
             logger.info(
                 "sleep: background dream complete (id=%s, orphans=%d)",
-                dream_id or "none", orphans,
+                dream_id or "none",
+                orphans,
             )
         except Exception:
             logger.warning("sleep: background dream failed", exc_info=True)
@@ -687,7 +721,7 @@ def _run_dream_async(
 def run_sleep_cycle(
     db_path: str,
     limit: int = MAX_NODES_PER_CYCLE,
-    model_fn=None,
+    model_fn: Any = None,
     background_dream: bool = False,
     embedding_model: str = "thenlper/gte-large",
 ) -> dict:
@@ -755,8 +789,7 @@ def run_sleep_cycle(
         # skip same-document pairs (which carry no graph-discovery value).
         source_files: dict[str, str] = {}
         for row in conn.execute(
-            "SELECT id, source_file FROM thought_nodes "
-            "WHERE id IN ({})".format(
+            "SELECT id, source_file FROM thought_nodes WHERE id IN ({})".format(
                 ",".join(["?"] * len(valid_ids))
             ),
             valid_ids,
@@ -765,15 +798,21 @@ def run_sleep_cycle(
             if sf:
                 source_files[nid] = sf
         cross_stats = _batch_cross_links(
-            conn, valid_ids, cross_pairs, sim,
+            conn,
+            valid_ids,
+            cross_pairs,
+            sim,
             source_files=source_files or None,
         )
         if model_fn is not None:
             for i, j in cross_pairs:
-                cross_link_tuples.append((
-                    valid_ids[int(i)], valid_ids[int(j)],
-                    float(sim[int(i), int(j)]),
-                ))
+                cross_link_tuples.append(
+                    (
+                        valid_ids[int(i)],
+                        valid_ids[int(j)],
+                        float(sim[int(i), int(j)]),
+                    )
+                )
 
     # Phase 3: dedup
     dedup_stats = {"components": 0, "nodes_merged": 0}

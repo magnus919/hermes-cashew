@@ -11,6 +11,11 @@ import threading
 import time
 from typing import Any, Callable, Dict, List
 
+import structlog
+from structlog.stdlib import LoggerFactory
+
+from .log_filter import get_scrub_processor
+
 try:
     from agent.memory_provider import MemoryProvider
 except ImportError:
@@ -37,7 +42,7 @@ try:
 except ImportError:
     # Cashew not installed — plugin still loads (for wheel-smoke + discovery paths).
     # initialize() will silent-degrade if ContextRetriever is unavailable at runtime.
-    ContextRetriever = None  # type: ignore[assignment,misc]
+    ContextRetriever = None
 
 from .tools import (
     CASHEW_EXTRACT_SCHEMA,
@@ -48,7 +53,18 @@ from .tools import (
     build_success_envelope,
 )
 
-logger = logging.getLogger(__name__)
+# Configure structlog once at import time with log scrubbing.
+structlog.configure(
+    processors=[
+        get_scrub_processor(),
+        structlog.stdlib.add_log_level,
+        structlog.dev.ConsoleRenderer(),
+    ],
+    context_class=dict,
+    logger_factory=LoggerFactory(),
+)
+
+logger = structlog.get_logger(__name__)
 
 # Issue #18: sentence-transformers emits INFO-level progress bars and BertModel
 # load reports directly to the terminal during embedding. That noise leaks into
@@ -75,6 +91,7 @@ signal path.
 _HAS_HERMES_CRON: bool = False
 try:
     from cron.jobs import create_job, list_jobs, remove_job  # noqa: F401
+
     _HAS_HERMES_CRON = True
 except ImportError:
     pass
@@ -146,7 +163,7 @@ def _ensure_auxiliary_memory(hermes_home: pathlib.Path) -> None:
         return
 
     try:
-        import yaml
+        import yaml  # type: ignore[import-untyped]
 
         raw = config_path.read_text(encoding="utf-8")
         data = yaml.safe_load(raw) or {}
@@ -170,8 +187,7 @@ def _ensure_auxiliary_memory(hermes_home: pathlib.Path) -> None:
 
     if not provider or not default_model:
         logger.info(
-            "cannot auto-populate auxiliary.memory: "
-            "model.provider=%r model.default=%r",
+            "cannot auto-populate auxiliary.memory: model.provider=%r model.default=%r",
             provider,
             default_model,
         )
@@ -191,7 +207,9 @@ def _ensure_auxiliary_memory(hermes_home: pathlib.Path) -> None:
 
     try:
         config_path.write_text(
-            yaml.safe_dump(data, default_flow_style=False, sort_keys=False, allow_unicode=True),
+            yaml.safe_dump(
+                data, default_flow_style=False, sort_keys=False, allow_unicode=True
+            ),
             encoding="utf-8",
         )
         logger.info(
@@ -252,9 +270,7 @@ def _patch_upstream_embedding(model_name: str) -> None:
     try:
         import core.embedding_service
     except ImportError:
-        logger.warning(
-            "cashew-brain not installed; cannot patch embedding model"
-        )
+        logger.warning("cashew-brain not installed; cannot patch embedding model")
         return
 
     dim = _UPSTREAM_KNOWN_DIMS.get(model_name, 1024)
@@ -281,6 +297,7 @@ def _patch_upstream_embedding(model_name: str) -> None:
     # that swaps the label — more robust than patching co_consts.
     try:
         import core.embeddings
+
         _orig_embed_nodes = core.embeddings.embed_nodes
 
         def _patched_embed_nodes(db_path: str, batch_size: int = 100) -> dict:
@@ -290,6 +307,7 @@ def _patch_upstream_embedding(model_name: str) -> None:
             if embedded > 0:
                 try:
                     import sqlite3
+
                     conn = sqlite3.connect(db_path)
                     conn.execute("PRAGMA busy_timeout=5000")
                     conn.execute(
@@ -299,8 +317,10 @@ def _patch_upstream_embedding(model_name: str) -> None:
                     conn.commit()
                     conn.close()
                 except Exception:
-                    logger.warning("could not fix model labels after embed", exc_info=True)
-            return result
+                    logger.warning(
+                        "could not fix model labels after embed", exc_info=True
+                    )
+            return result  # type: ignore[no-any-return]
 
         core.embeddings.embed_nodes = _patched_embed_nodes
         logger.info("patched embed_nodes model label: %s", model_name)
@@ -309,7 +329,8 @@ def _patch_upstream_embedding(model_name: str) -> None:
 
     logger.info(
         "patched upstream embedding: model=%s dim=%d",
-        model_name, dim,
+        model_name,
+        dim,
     )
 
 
@@ -332,7 +353,7 @@ def _remove_existing_sleep_job(hermes_home: pathlib.Path | None) -> None:
     if not _HAS_HERMES_CRON:
         return
     try:
-        from cron.jobs import list_jobs, remove_job  # type: ignore[import-untyped]
+        from cron.jobs import list_jobs, remove_job
 
         for job in list_jobs():
             if job.get("name") == "cashew-sleep-cycle":
@@ -345,7 +366,7 @@ def _remove_existing_sleep_job(hermes_home: pathlib.Path | None) -> None:
 
 
 # ── on_pre_compress prompt template ──────────────────────────────────
-class CashewMemoryProvider(MemoryProvider):
+class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
     """Cashew thought-graph memory provider for Hermes Agent."""
 
     def __init__(self) -> None:
@@ -409,7 +430,7 @@ class CashewMemoryProvider(MemoryProvider):
         # When the home is unknown, fall back to dependency availability only.
         return ContextRetriever is not None
 
-    def get_config_schema(self) -> Dict[str, Any]:
+    def get_config_schema(self) -> list[dict[str, Any]]:
         """Return the JSON-Schema-shaped dict Hermes uses to drive `hermes memory setup` (CONF-01)."""
         return _config_get_config_schema()
 
@@ -439,7 +460,8 @@ class CashewMemoryProvider(MemoryProvider):
         if "hermes_home" not in kwargs:
             raise KeyError(
                 "CashewMemoryProvider.initialize requires hermes_home in kwargs; "
-                "Hermes Agent passes it as a keyword. Got: " + repr(sorted(kwargs.keys()))
+                "Hermes Agent passes it as a keyword. Got: "
+                + repr(sorted(kwargs.keys()))
             )
         self._session_id = session_id
         self._hermes_home = pathlib.Path(kwargs["hermes_home"])
@@ -463,7 +485,9 @@ class CashewMemoryProvider(MemoryProvider):
             _ensure_config_file(self._hermes_home)
             if self._config.llm_aux_role:
                 _ensure_auxiliary_memory(self._hermes_home)
-            self._db_path = resolve_db_path(self._hermes_home, self._config.cashew_db_path)
+            self._db_path = resolve_db_path(
+                self._hermes_home, self._config.cashew_db_path
+            )
             # ContextRetriever.__init__ is lazy — no SQLite open, no embedding load yet.
             # Guard against the defensive-import fallback (ContextRetriever = None).
             if ContextRetriever is None:
@@ -484,8 +508,11 @@ class CashewMemoryProvider(MemoryProvider):
             # Runs AFTER the sync worker so the provider is fully initialized
             # before any background work begins. Silently skips when the
             # Hermes cron module is not available (e.g. CI, standalone tests).
-            if (self._config.sleep_cycles and self._config.sleep_schedule
-                    and _HAS_HERMES_CRON):
+            if (
+                self._config.sleep_cycles
+                and self._config.sleep_schedule
+                and _HAS_HERMES_CRON
+            ):
                 self._register_sleep_cron()
         except Exception:
             logger.warning(
@@ -526,31 +553,35 @@ class CashewMemoryProvider(MemoryProvider):
         if self._sleep_cron_job_id is not None:
             return  # already registered for this instance
 
+        if self._hermes_home is None or self._config is None:
+            return
+
         # Scan for an existing sleep cron job by name.
         # If one exists, adopt its ID and skip registration so the
         # original 12h timer isn't reset. Without this, every session
         # start would remove-and-re-register the job, resetting the
         # schedule and preventing it from ever firing.
-        if self._hermes_home is not None:
-            try:
-                from cron.jobs import list_jobs  # type: ignore[import-untyped]
+        try:
+            from cron.jobs import list_jobs
 
-                for job in list_jobs():
-                    if job.get("name") == "cashew-sleep-cycle":
-                        self._sleep_cron_job_id = job["id"]
-                        logger.info(
-                            "sleep: adopted existing cron job %s (preserving schedule)",
-                            job["id"],
-                        )
-                        return  # keep the existing job running
-            except ImportError:
-                logger.debug("sleep: cron module not available — cannot adopt")
-            except Exception:
-                logger.warning("sleep: failed to adopt existing cron job", exc_info=True)
+            for job in list_jobs():
+                if job.get("name") == "cashew-sleep-cycle":
+                    self._sleep_cron_job_id = job["id"]
+                    logger.info(
+                        "sleep: adopted existing cron job %s (preserving schedule)",
+                        job["id"],
+                    )
+                    return  # keep the existing job running
+        except ImportError:
+            logger.debug("sleep: cron module not available — cannot adopt")
+        except Exception:
+            logger.warning("sleep: failed to adopt existing cron job", exc_info=True)
 
         try:
             # Read the cron script source from disk and install it.
-            script_source = (pathlib.Path(__file__).parent / "sleep_cron_script.py").read_text()
+            script_source = (
+                pathlib.Path(__file__).parent / "sleep_cron_script.py"
+            ).read_text()
 
             # Install the script to $HERMES_HOME/scripts/
             script_dest = self._hermes_home / "scripts" / "cashew-sleep-cycle.py"
@@ -563,7 +594,7 @@ class CashewMemoryProvider(MemoryProvider):
                 logger.debug("sleep: cron script already exists at %s", script_dest)
 
             # Register via the Hermes cron API.
-            from cron.jobs import create_job  # type: ignore[import-untyped]
+            from cron.jobs import create_job
 
             job = create_job(
                 prompt="hermes-cashew sleep cycle",
@@ -601,7 +632,7 @@ class CashewMemoryProvider(MemoryProvider):
         if self._sleep_cron_job_id is None:
             return
         try:
-            from cron.jobs import remove_job  # type: ignore[import-untyped]
+            from cron.jobs import remove_job
 
             remove_job(self._sleep_cron_job_id)
             logger.info("sleep: removed cron job %s", self._sleep_cron_job_id)
@@ -635,7 +666,9 @@ class CashewMemoryProvider(MemoryProvider):
             config=self._config,
         )
 
-    def sync_turn(self, user_content: str, assistant_content: str, session_id: str = "") -> None:
+    def sync_turn(
+        self, user_content: str, assistant_content: str, session_id: str = ""
+    ) -> None:
         """Hot-path enqueue of a completed turn.
 
         Contract: returns in <10ms. Never raises. If the queue is full, drops the
@@ -670,7 +703,9 @@ class CashewMemoryProvider(MemoryProvider):
             try:
                 self._sync_queue.put_nowait(turn)
             except queue.Full:
-                logger.warning("cashew sync queue still full after drop-oldest; dropping new turn")
+                logger.warning(
+                    "cashew sync queue still full after drop-oldest; dropping new turn"
+                )
 
     def _worker_loop(self) -> None:
         """Background drain loop. Entry point for self._sync_worker.
@@ -686,7 +721,9 @@ class CashewMemoryProvider(MemoryProvider):
         NoneType. Using `q` keeps task_done() bound to the queue the worker was
         actually draining, race-free.
         """
-        q = self._sync_queue  # bind once; shutdown may clear self._sync_queue before we exit
+        q = (
+            self._sync_queue
+        )  # bind once; shutdown may clear self._sync_queue before we exit
         assert q is not None  # invariant: worker only starts when queue exists
         while True:
             item = q.get()
@@ -712,15 +749,23 @@ class CashewMemoryProvider(MemoryProvider):
         still be running in another process).
         """
         import time
+
         stale_threshold = 3600  # 60 minutes in seconds
+        if self._db_path is None:
+            return
         lock_path = self._db_path.parent / "brain.db.sleep.lock"
         if lock_path.exists():
             age = time.time() - lock_path.stat().st_mtime
             if age > stale_threshold:
                 lock_path.unlink(missing_ok=True)
-                logger.info("cashew self-heal: removed stale sleep lock (age=%.0fs)", age)
+                logger.info(
+                    "cashew self-heal: removed stale sleep lock (age=%.0fs)", age
+                )
             elif age > 0:
-                logger.debug("cashew self-heal: sleep lock is fresh (age=%.0fs) — leaving in place", age)
+                logger.debug(
+                    "cashew self-heal: sleep lock is fresh (age=%.0fs) — leaving in place",
+                    age,
+                )
 
     def _ensure_db_schema(self, db_path: pathlib.Path) -> None:
         """Create or migrate Cashew schema tables.
@@ -732,15 +777,18 @@ class CashewMemoryProvider(MemoryProvider):
         extensions (vec_embeddings virtual table for sqlite-vec).
         """
         from core.db import ensure_schema
+
         ensure_schema(str(db_path))
 
         import sqlite3
+
         conn = sqlite3.connect(str(db_path))
         try:
             try:
                 conn.enable_load_extension(True)
                 try:
                     import sqlite_vec
+
                     sqlite_vec.load(conn)
                 except (ImportError, AttributeError):
                     conn.load_extension("vec0")
@@ -782,12 +830,14 @@ class CashewMemoryProvider(MemoryProvider):
             except Exception:
                 pass
             if not has_node_id:
-                logger.info("Migrating vec_embeddings from old schema (dropping and recreating)")
+                logger.info(
+                    "Migrating vec_embeddings from old schema (dropping and recreating)"
+                )
                 conn.execute("DROP TABLE vec_embeddings")
         except Exception:
-            logger.info("sqlite-vec extension failed to load; vec_embeddings migration skipped")
-
-
+            logger.info(
+                "sqlite-vec extension failed to load; vec_embeddings migration skipped"
+            )
 
     def _create_vec_embeddings(self, conn: sqlite3.Connection) -> None:
         try:
@@ -799,6 +849,7 @@ class CashewMemoryProvider(MemoryProvider):
             conn.enable_load_extension(True)
             try:
                 import sqlite_vec
+
                 sqlite_vec.load(conn)
             except (ImportError, AttributeError):
                 conn.load_extension("vec0")
@@ -808,6 +859,7 @@ class CashewMemoryProvider(MemoryProvider):
             # silently refuses dual-writes from any model with a different dim.
             try:
                 from core.embedding_service import resolve_embedding_dim
+
                 dim = resolve_embedding_dim()
             except Exception:
                 dim = 384  # fallback for test environments without models
@@ -817,7 +869,9 @@ class CashewMemoryProvider(MemoryProvider):
             """)
             logger.debug(f"vec_embeddings virtual table ready (dim={dim})")
         except Exception:
-            logger.info("sqlite-vec extension failed to load; semantic search will use fallback")
+            logger.info(
+                "sqlite-vec extension failed to load; semantic search will use fallback"
+            )
 
     def _enrich_results(self, node_ids: list[str]) -> list[dict]:
         """Fetch full node dicts from DB for upstream retrieval results.
@@ -829,6 +883,7 @@ class CashewMemoryProvider(MemoryProvider):
         if not node_ids:
             return []
         import sqlite3
+
         conn = sqlite3.connect(str(self._db_path))
         try:
             placeholders = ",".join("?" * len(node_ids))
@@ -869,6 +924,7 @@ class CashewMemoryProvider(MemoryProvider):
             return
         try:
             import sqlite3
+
             conn = sqlite3.connect(str(self._db_path))
             try:
                 placeholders = ",".join("?" * len(node_ids))
@@ -887,7 +943,7 @@ class CashewMemoryProvider(MemoryProvider):
         except Exception:
             logger.warning("cashew access metrics update failed", exc_info=True)
 
-    def _drain_once(self, turn: tuple[str, str]) -> None:
+    def _drain_once(self, turn: tuple[str, str, str]) -> None:
         """Persist one turn via Cashew's heuristic extractor (or LLM if configured).
 
         Lazy-imports core.session so the plugin module loads even when cashew-brain
@@ -899,6 +955,7 @@ class CashewMemoryProvider(MemoryProvider):
         Retries up to 3 times on SQLITE_BUSY with exponential backoff before
         dropping the turn."""
         from core.session import end_session  # lazy import
+
         user, assistant, session_id = turn
 
         # Short-circuit if shutdown is in progress — the interpreter's atexit
@@ -909,6 +966,7 @@ class CashewMemoryProvider(MemoryProvider):
             return
 
         import sqlite3
+
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -931,21 +989,28 @@ class CashewMemoryProvider(MemoryProvider):
                 raise
             except sqlite3.OperationalError as e:
                 if "database is locked" in str(e) and attempt < max_retries - 1:
-                    wait = 0.5 * (2 ** attempt)
+                    wait = 0.5 * (2**attempt)
                     logger.info(
                         "cashew sync: database locked, retrying in %.1fs (attempt %d/%d)",
-                        wait, attempt + 1, max_retries,
+                        wait,
+                        attempt + 1,
+                        max_retries,
                     )
                     time.sleep(wait)
                 else:
                     raise  # give up — let the outer except in _worker_loop handle it
         # Run think cycle periodically if LLM is wired
-        if self._model_fn is not None and self._config and self._config.think_interval > 0:
+        if (
+            self._model_fn is not None
+            and self._config
+            and self._config.think_interval > 0
+        ):
             counter = self._load_think_counter() + 1
             if counter >= self._config.think_interval:
                 counter = 0
                 try:
                     from core.session import think_cycle
+
                     result = think_cycle(
                         db_path=str(self._db_path),
                         model_fn=self._model_fn,
@@ -964,6 +1029,7 @@ class CashewMemoryProvider(MemoryProvider):
         """Read persistent think counter from DB. Resets to 0 on any error."""
         try:
             import sqlite3
+
             conn = sqlite3.connect(str(self._db_path))
             try:
                 row = conn.execute(
@@ -979,6 +1045,7 @@ class CashewMemoryProvider(MemoryProvider):
         """Write persistent think counter to DB."""
         try:
             import sqlite3
+
             conn = sqlite3.connect(str(self._db_path))
             try:
                 conn.execute(
@@ -1041,7 +1108,7 @@ class CashewMemoryProvider(MemoryProvider):
                 end = cleaned.rfind("]")
                 if end == -1:
                     return ""
-                cleaned = cleaned[start:end + 1]
+                cleaned = cleaned[start : end + 1]
 
             items = _json.loads(cleaned)
             if not isinstance(items, list):
@@ -1068,7 +1135,9 @@ class CashewMemoryProvider(MemoryProvider):
             return ""
 
         except _json.JSONDecodeError:
-            logger.warning("on_pre_compress: failed to parse LLM response", exc_info=True)
+            logger.warning(
+                "on_pre_compress: failed to parse LLM response", exc_info=True
+            )
             return ""
         except Exception:
             logger.warning("on_pre_compress failed", exc_info=True)
@@ -1187,7 +1256,9 @@ class CashewMemoryProvider(MemoryProvider):
             try:
                 self._sync_queue.put(_SHUTDOWN, block=True, timeout=1.0)
             except queue.Full:
-                logger.warning("cashew shutdown: could not post sentinel; worker may leak")
+                logger.warning(
+                    "cashew shutdown: could not post sentinel; worker may leak"
+                )
         # Bounded join. Never raise.
         if self._sync_worker is not None:
             self._sync_worker.join(timeout=timeout)
@@ -1212,8 +1283,14 @@ class CashewMemoryProvider(MemoryProvider):
         self._last_assistant = ""
         logger.debug("cashew provider shutdown complete")
 
-    def prefetch(self, query: str, domain: str | None = None, tag: str | None = None,
-                 exclude_tags: list[str] | None = None, **kwargs: Any) -> str:
+    def prefetch(
+        self,
+        query: str,
+        domain: str | None = None,
+        tag: str | None = None,
+        exclude_tags: list[str] | None = None,
+        **kwargs: Any,
+    ) -> str:
         """Return recalled-context string from Cashew (RECALL-01).
 
         Checks the warm cache (populated by queue_prefetch) first. On a cache
@@ -1256,15 +1333,23 @@ class CashewMemoryProvider(MemoryProvider):
                 cue_words = set(w for w in cue_lower.split() if len(w) > 3)
                 query_words = set(w for w in query_lower.split() if len(w) > 3)
                 if len(cue_words & query_words) >= 2:
-                    logger.info("prefetch warm cache HIT: cue=%r query=%r (word overlap)", cue, query)
+                    logger.info(
+                        "prefetch warm cache HIT: cue=%r query=%r (word overlap)",
+                        cue,
+                        query,
+                    )
                     self._warm_cache.clear()
                     return ctx
             # No match — clear stale cache and fall through to cold retrieval.
-            logger.info("prefetch warm cache MISS (%d cue(s) in cache) — falling through to cold retrieval", len(self._warm_cache))
+            logger.info(
+                "prefetch warm cache MISS (%d cue(s) in cache) — falling through to cold retrieval",
+                len(self._warm_cache),
+            )
             self._warm_cache.clear()
         max_nodes = self._config.recall_k
         try:
             from core.retrieval import retrieve_recursive_bfs
+
             results = retrieve_recursive_bfs(
                 db_path=str(self._db_path),
                 query=query,
@@ -1279,7 +1364,9 @@ class CashewMemoryProvider(MemoryProvider):
                 nodes = self._enrich_results(node_ids)
                 return self._format_context(nodes)
         except Exception:
-            logger.debug("upstream retrieval failed, falling back to keyword", exc_info=True)
+            logger.debug(
+                "upstream retrieval failed, falling back to keyword", exc_info=True
+            )
         try:
             nodes = self._keyword_search(query, max_nodes, domain, tag, exclude_tags)
             if nodes:
@@ -1331,7 +1418,9 @@ class CashewMemoryProvider(MemoryProvider):
                             len(cues),
                         )
                     except Exception:
-                        logger.debug("queue_prefetch: LLM cue extraction failed, using raw query")
+                        logger.debug(
+                            "queue_prefetch: LLM cue extraction failed, using raw query"
+                        )
                         cues = [query] if query else []
                 else:
                     cues = [query] if query else []
@@ -1340,11 +1429,14 @@ class CashewMemoryProvider(MemoryProvider):
                     return
 
                 from core.retrieval import retrieve_recursive_bfs
+
                 seen_ids: set[str] = set()
                 all_nodes: list[dict] = []
                 for cue in cues:
                     results = retrieve_recursive_bfs(
-                        db_path=db_path, query=cue, top_k=top_k,
+                        db_path=db_path,
+                        query=cue,
+                        top_k=top_k,
                     )
                     if results:
                         node_ids = [r.node_id for r in results]
@@ -1361,13 +1453,19 @@ class CashewMemoryProvider(MemoryProvider):
                     self._prefetch_pending = ctx
                     logger.info(
                         "queue_prefetch: cached %d result(s) from %d cue(s) for next turn",
-                        len(all_nodes), len(cues),
+                        len(all_nodes),
+                        len(cues),
                     )
             except Exception:
-                logger.debug("queue_prefetch background worker failed (non-fatal)", exc_info=True)
+                logger.debug(
+                    "queue_prefetch background worker failed (non-fatal)", exc_info=True
+                )
 
-        t = threading.Thread(target=_warmup_worker, daemon=True,
-                             name=f"cashew-prefetch-{self._session_id}")
+        t = threading.Thread(
+            target=_warmup_worker,
+            daemon=True,
+            name=f"cashew-prefetch-{self._session_id}",
+        )
         t.start()
 
     def _extract_prefetch_cues(self, query: str) -> list[str]:
@@ -1398,17 +1496,22 @@ class CashewMemoryProvider(MemoryProvider):
         ).format(n, query, assistant)
         raw = self._model_fn(prompt)
         cues = [
-            line.strip() for line in raw.strip().split("\n")
+            line.strip()
+            for line in raw.strip().split("\n")
             if line.strip() and not line.strip().startswith(("```", "Here", "Sure"))
         ]
         return cues[:n] if cues else [query] if query else []
 
     def _keyword_search(
-        self, query: str, max_nodes: int,
-        domain: str | None = None, tag: str | None = None,
+        self,
+        query: str,
+        max_nodes: int,
+        domain: str | None = None,
+        tag: str | None = None,
         exclude_tags: list[str] | None = None,
     ) -> list[dict]:
         import sqlite3
+
         conn = sqlite3.connect(str(self._db_path))
         try:
             where_clauses: list[str] = ["(decayed IS NULL OR decayed = 0)"]
@@ -1436,9 +1539,9 @@ class CashewMemoryProvider(MemoryProvider):
             cursor = conn.execute(
                 f"""
                 SELECT * FROM thought_nodes
-                WHERE {' AND '.join(where_clauses) if where_clauses else '1=1'}
+                WHERE {" AND ".join(where_clauses) if where_clauses else "1=1"}
                 ORDER BY
-                    {'(CASE WHEN content LIKE ? THEN 1 ELSE 0 END) DESC,' if order_params else ''}
+                    {"(CASE WHEN content LIKE ? THEN 1 ELSE 0 END) DESC," if order_params else ""}
                     referent_time DESC NULLS LAST,
                     timestamp DESC
                 LIMIT ?
@@ -1496,6 +1599,7 @@ class CashewMemoryProvider(MemoryProvider):
                 exclude_tags = args.get("exclude_tags")
                 try:
                     from core.retrieval import retrieve_recursive_bfs
+
                     results = retrieve_recursive_bfs(
                         db_path=str(self._db_path),
                         query=query,
@@ -1510,7 +1614,9 @@ class CashewMemoryProvider(MemoryProvider):
                     node_ids = [r.node_id for r in results]
                     nodes = self._enrich_results(node_ids)
                 else:
-                    nodes = self._keyword_search(query, max_nodes, domain, tag, exclude_tags)
+                    nodes = self._keyword_search(
+                        query, max_nodes, domain, tag, exclude_tags
+                    )
                 if nodes:
                     self._update_access_metrics([n["id"] for n in nodes])
                     context = self._format_context(nodes)
@@ -1544,6 +1650,7 @@ class CashewMemoryProvider(MemoryProvider):
                 assistant = args["assistant_content"]
                 # Lazy import — keeps is_available free of core.session side effects.
                 from core.session import end_session
+
                 result = end_session(
                     db_path=str(self._db_path),
                     session_id=self._session_id,
@@ -1601,6 +1708,7 @@ class CashewMemoryProvider(MemoryProvider):
 
         try:
             import sqlite3
+
             conn = sqlite3.connect(str(self._db_path))
             cursor = conn.execute(
                 "SELECT COUNT(*), (SELECT COUNT(*) FROM derivation_edges) FROM thought_nodes"
@@ -1630,7 +1738,7 @@ class CashewMemoryProvider(MemoryProvider):
     # All other ABC methods are inherited as no-ops from the ABC defaults (when Hermes is present).
 
 
-def register(ctx) -> None:
+def register(ctx: Any) -> None:
     """Hermes discovery entry point — filesystem loader calls this.
 
     Two code paths:

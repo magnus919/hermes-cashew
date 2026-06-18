@@ -71,6 +71,13 @@ DEFAULTS: dict[str, Any] = {
     # Sleep cycle cron scheduling (2)
     "sleep_schedule": "every 12h",
     "sleep_max_nodes": 2000,
+    # Feature flags for experimental behavior gating.
+    # Agents and users can toggle these to opt into experimental features
+    # without affecting stable code paths. All default to false.
+    "_features": {
+        "experimental_batch_sync": False,
+        "experimental_parallel_retrieval": False,
+    },
 }
 
 
@@ -125,6 +132,27 @@ class CashewConfig:
     # Sleep cycle cron scheduling
     sleep_schedule: str = DEFAULTS["sleep_schedule"]
     sleep_max_nodes: int = DEFAULTS["sleep_max_nodes"]
+    # Feature flags
+    _features: dict[str, bool] = dataclasses.field(
+        default_factory=lambda: dict(DEFAULTS["_features"])
+    )
+
+
+def is_feature_enabled(config: CashewConfig, flag: str) -> bool:
+    """Check whether an experimental feature flag is enabled.
+
+    Feature flags are stored in the ``_features`` dict of the config.
+    Unknown flags default to False. This allows agents to ship new
+    behavior behind a toggle without affecting the stable code path.
+
+    Example:
+        if is_feature_enabled(config, "experimental_batch_sync"):
+            _batch_drain(queue, config)
+
+    Flags are configured in cashew.json:
+        {"_features": {"experimental_batch_sync": true}}
+    """
+    return config._features.get(flag, False)
 
 
 def _env_var_name(key: str) -> str:

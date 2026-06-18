@@ -26,10 +26,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
 
       - name: Install
-        run: pip install -e ".[dev]"
+        run: pip install uv && uv pip install --system -e ".[dev]"
         timeout-minutes: 5
 
       - name: AGENTS.md validation — verify install and test commands work
@@ -67,12 +66,30 @@ jobs:
           name: coverage
           path: coverage.xml
 
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
       - name: CI-03 — fail if embedding model was downloaded
         run: |
           if grep -E 'Downloading.*MiniLM' pytest.log; then
             echo "::error::Embedding model download detected — offline fixture bypassed"
             exit 1
           fi
+
+      - name: Build performance summary
+        run: |
+          START=$(date -d "${{ github.run_started_at }}" +%s 2>/dev/null || date -jf "%Y-%m-%dT%H:%M:%S" "${{ github.run_started_at }}" +%s)
+          NOW=$(date +%s)
+          ELAPSED=$((NOW - START))
+          echo "Workflow run started at: ${{ github.run_started_at }}"
+          echo "Total elapsed time: ${ELAPSED}s (test job only)"
+          echo "Install: uv pip install (uv.lock cached)"
+          echo "Optimizations: uv resolver (10x faster than pip), pytest-xvs (fail-fast)"
 
   wheel-smoke:
     runs-on: ubuntu-latest

@@ -54,6 +54,45 @@ Troubleshooting guides for common operational issues.
 2. Set `llm_aux_role` in `$HERMES_HOME/cashew.json` to `"memory"`.
 3. Logs should show: `using llm_aux_role='memory' model=gpt-4o-mini`
 
+## Deployment Observability
+
+### Where to Monitor Deployments
+
+Every tag push (`v*`) triggers an automated release to PyPI via OIDC trusted
+publishing. Monitor deployment health at these locations:
+
+| What | Where |
+|------|-------|
+| CI status (all branches) | [GitHub Actions](https://github.com/magnus919/hermes-cashew/actions) |
+| Release history | [GitHub Releases](https://github.com/magnus919/hermes-cashew/releases) |
+| Published package | [PyPI](https://pypi.org/project/hermes-cashew/) |
+| Test coverage | [Codecov](https://app.codecov.io/gh/magnus919/hermes-cashew) |
+
+### Verifying a Deployment
+
+1. Check the [release workflow run](https://github.com/magnus919/hermes-cashew/actions/workflows/release.yml) — all jobs must be green.
+2. Confirm the version appears on [PyPI](https://pypi.org/project/hermes-cashew/#history).
+3. Verify `pip install hermes-cashew==<version>` succeeds from a clean venv.
+4. Run `hermes plugins install magnus919/hermes-cashew` in a test Hermes environment.
+
+### Deployment Anomalies
+
+**Symptom:** Release workflow succeeds but package not visible on PyPI.
+
+**Cause:** PyPI index propagation delay (typically under 1 minute, rarely up to 10).
+
+**Resolution:** Wait and retry. If still missing after 15 minutes, check the
+`publish-pypi` job logs for OIDC authentication errors.
+
+**Symptom:** `pip install` pulls an older version.
+
+**Cause:** pip cache or index mirror lag.
+
+**Resolution:**
+```bash
+pip install --no-cache-dir hermes-cashew==<expected-version>
+```
+
 ## Sync Queue Overflow
 
 **Symptom:** `WARNING: cashew sync queue full, dropping oldest pending turn` in logs.

@@ -31,6 +31,10 @@ dev = [
     "deptry>=0.12,<1",
 ]
 
+tracing = [
+    "opentelemetry-api>=1.20,<2",
+]
+
 [project.entry-points."hermes_agent.plugins"]
 cashew = "plugins.memory.cashew"
 
@@ -101,8 +105,9 @@ disable_error_code = ["type-arg"]
 [tool.deptry]
 extend_exclude = ["tests", "__init__\\.py", "\\.venv"]
 known_first_party = ["plugins"]
+package_module_name_map = { "opentelemetry-api" = "opentelemetry" }
 
 [tool.deptry.per_rule_ignores]
-DEP001 = ["cashew-brain", "sqlite-vec", "agent", "cron", "cashew_sleep_refactor", "_hermes_cashew_impl"]
-DEP002 = ["pytest", "pytest-cov", "pytest-asyncio", "pytest-mock", "build", "ruff", "mypy", "pre-commit", "vulture", "deptry", "jsonschema"]
+DEP001 = ["cashew-brain", "sqlite-vec", "agent", "cron", "cashew_sleep_refactor", "_hermes_cashew_impl", "opentelemetry-api"]
+DEP002 = ["pytest", "pytest-cov", "pytest-asyncio", "pytest-mock", "build", "ruff", "mypy", "pre-commit", "vulture", "deptry", "jsonschema", "opentelemetry-api"]
 DEP003 = ["numpy", "sklearn", "sentence_transformers", "httpx", "yaml"]

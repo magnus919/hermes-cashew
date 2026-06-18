@@ -23,13 +23,16 @@ def test_fresh_provider_is_not_available_without_deps(monkeypatch):
     import sys as _sys
 
     import plugins.memory.cashew as cashew_mod
+
     _cashew_impl = _sys.modules.get("plugins.memory.cashew") or cashew_mod
     monkeypatch.setattr(_cashew_impl, "ContextRetriever", None)
     p = CashewMemoryProvider()
     # Without deps AND without config file, is_available must be False
     assert p.is_available() is False
     monkeypatch.undo()
-    assert p.is_available() is True, "restored: with deps and no file, should be available"
+    assert p.is_available() is True, (
+        "restored: with deps and no file, should be available"
+    )
 
 
 def test_shutdown_pre_initialize_is_safe_noop():
@@ -75,6 +78,9 @@ def test_initialize_then_shutdown_returns_to_baseline_threads(tmp_path):
     baseline = threading.active_count()
     p.initialize("s", hermes_home=str(tmp_path))
     p.shutdown()
+    import time as _time
+
+    _time.sleep(0.05)
     assert threading.active_count() == baseline
 
 
@@ -93,6 +99,7 @@ def test_initialize_loads_default_config_when_no_file(tmp_path):
 def test_initialize_resolves_db_path_under_hermes_home(tmp_path):
     """CONF-03: DB at $HERMES_HOME/cashew/brain.db (nested) when default is in effect."""
     import pathlib
+
     p = CashewMemoryProvider()
     p.initialize("s", hermes_home=str(tmp_path))
     try:
@@ -109,7 +116,10 @@ def test_initialize_succeeds_on_fresh_hermes_home(tmp_path):
     directory does not exist, so we must create it before ContextRetriever.
     """
     import pathlib
-    assert not (tmp_path / "cashew").exists(), "precondition: cashew/ dir must not exist"
+
+    assert not (tmp_path / "cashew").exists(), (
+        "precondition: cashew/ dir must not exist"
+    )
 
     p = CashewMemoryProvider()
     p.initialize("s", hermes_home=str(tmp_path))
@@ -119,7 +129,9 @@ def test_initialize_succeeds_on_fresh_hermes_home(tmp_path):
             "ContextRetriever must be created even when cashew/ is absent"
         )
         assert p._db_path == pathlib.Path(str(tmp_path)) / "cashew" / "brain.db"
-        assert (tmp_path / "cashew").is_dir(), "initialize() must create the cashew/ parent directory"
+        assert (tmp_path / "cashew").is_dir(), (
+            "initialize() must create the cashew/ parent directory"
+        )
     finally:
         p.shutdown()
 
@@ -141,7 +153,9 @@ def test_initialize_generates_config_file_on_first_load(tmp_path):
     assert not (tmp_path / CONFIG_FILENAME).exists(), "precondition: no config file"
     p.initialize("s", hermes_home=str(tmp_path))
     try:
-        assert (tmp_path / CONFIG_FILENAME).exists(), "initialize() must create cashew.json"
+        assert (tmp_path / CONFIG_FILENAME).exists(), (
+            "initialize() must create cashew.json"
+        )
         assert p.is_available() is True, "is_available must be True after file exists"
     finally:
         p.shutdown()
@@ -167,6 +181,7 @@ def test_initialize_does_not_overwrite_existing_config(tmp_path):
 def test_is_available_calls_path_exists_exactly_once(tmp_path, monkeypatch):
     """Pitfall 5 enforcement: zero I/O beyond ONE Path.exists call. No content reads."""
     import pathlib
+
     open_calls = []
     read_text_calls = []
     exists_calls = []
@@ -182,7 +197,9 @@ def test_is_available_calls_path_exists_exactly_once(tmp_path, monkeypatch):
         read_text_calls.append(str(self))
         return real_read_text(self, *args, **kwargs)
 
-    real_open = __builtins__["open"] if isinstance(__builtins__, dict) else __builtins__.open
+    real_open = (
+        __builtins__["open"] if isinstance(__builtins__, dict) else __builtins__.open
+    )
 
     def _open(*args, **kwargs):
         open_calls.append(args[0] if args else None)
@@ -201,8 +218,12 @@ def test_is_available_calls_path_exists_exactly_once(tmp_path, monkeypatch):
 
         p.is_available()
 
-        assert len(exists_calls) == 1, f"expected exactly 1 Path.exists call, got {exists_calls}"
-        assert read_text_calls == [], f"is_available read file content: {read_text_calls}"
+        assert len(exists_calls) == 1, (
+            f"expected exactly 1 Path.exists call, got {exists_calls}"
+        )
+        assert read_text_calls == [], (
+            f"is_available read file content: {read_text_calls}"
+        )
         assert open_calls == [], f"is_available called open(): {open_calls}"
     finally:
         p.shutdown()
@@ -216,7 +237,9 @@ def test_initialize_does_not_import_cashew_runtime(tmp_path):
     try:
         post = set(sys.modules.keys())
         new = post - pre
-        forbidden = {"core.embeddings"}  # Phase 3: core.context is now legitimately loaded at initialize; embedding still lazy.
+        forbidden = {
+            "core.embeddings"
+        }  # Phase 3: core.context is now legitimately loaded at initialize; embedding still lazy.
         assert not (new & forbidden), (
             f"initialize() loaded forbidden Cashew runtime modules: {new & forbidden}"
         )
@@ -231,7 +254,9 @@ def test_initialize_silent_degrades_on_corrupt_config(tmp_path, caplog):
     with caplog.at_level("WARNING"):
         p.initialize("s", hermes_home=str(tmp_path))
     try:
-        assert p._config is None, "corrupt config must result in _config=None (silent degrade)"
+        assert p._config is None, (
+            "corrupt config must result in _config=None (silent degrade)"
+        )
         assert p._db_path is None
         # WARNING was logged with exc_info
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
@@ -250,6 +275,7 @@ def test_initialize_silent_degrades_on_corrupt_config(tmp_path, caplog):
 def test_get_config_schema_returns_helper_module_schema():
     """The provider's ABC method delegates verbatim to the helper — no inline schema definition."""
     from plugins.memory.cashew.config import get_config_schema as helper_schema
+
     p = CashewMemoryProvider()
     assert p.get_config_schema() == helper_schema()
 
@@ -260,6 +286,7 @@ def test_get_config_schema_returns_helper_module_schema():
 def test_ensure_config_file_writes_defaults(tmp_path):
     """_ensure_config_file writes cashew.json when absent, no-ops when present."""
     from plugins.memory.cashew import _ensure_config_file
+
     assert not (tmp_path / "cashew.json").exists()
     _ensure_config_file(tmp_path)
     assert (tmp_path / "cashew.json").exists()
@@ -272,6 +299,7 @@ def test_ensure_config_file_writes_defaults(tmp_path):
 def test_ensure_auxiliary_memory_populates_from_main_model(tmp_path):
     """_ensure_auxiliary_memory creates auxiliary.memory from model section."""
     from plugins.memory.cashew import _ensure_auxiliary_memory
+
     config_yaml = tmp_path / "config.yaml"
     config_yaml.write_text("""model:
   provider: openrouter
@@ -281,6 +309,7 @@ def test_ensure_auxiliary_memory_populates_from_main_model(tmp_path):
     assert not (tmp_path / "cashew.json").exists()
     _ensure_auxiliary_memory(tmp_path)
     import yaml
+
     data = yaml.safe_load(config_yaml.read_text())
     aux_memory = data.get("auxiliary", {}).get("memory", {})
     assert aux_memory["provider"] == "openrouter"
@@ -291,6 +320,7 @@ def test_ensure_auxiliary_memory_populates_from_main_model(tmp_path):
 def test_ensure_auxiliary_memory_does_not_overwrite_existing(tmp_path):
     """_ensure_auxiliary_memory never overwrites existing auxiliary.memory."""
     from plugins.memory.cashew import _ensure_auxiliary_memory
+
     config_yaml = tmp_path / "config.yaml"
     config_yaml.write_text("""model:
   provider: openrouter
@@ -302,6 +332,7 @@ auxiliary:
 """)
     _ensure_auxiliary_memory(tmp_path)
     import yaml
+
     data = yaml.safe_load(config_yaml.read_text())
     assert data["auxiliary"]["memory"]["provider"] == "custom"
     assert data["auxiliary"]["memory"]["model"] == "custom-model"

@@ -11,7 +11,10 @@ import threading
 import time
 from typing import Any, Callable, Dict, List
 
+from .error_tracking import capture_exception, set_plugin_context
 from .log_filter import add_scrub_filter
+from .metrics import _METRICS
+from .tracing import trace_operation
 
 try:
     from agent.memory_provider import MemoryProvider
@@ -22,6 +25,7 @@ from .config import (
     CashewConfig,
     get_ai_domain,
     get_user_domain,
+    is_feature_enabled,
     load_config,
     resolve_config_path,
     resolve_db_path,
@@ -459,60 +463,77 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         self._sync_queue = queue.Queue(maxsize=16)
         # Reset shutdown flag — a prior shutdown() may have set it.
         self._shutdown_flag.clear()
-        try:
-            self._config = load_config(self._hermes_home)
-            # Propagate embedding model to upstream cashew-brain.
-            # PyPI v1.1.0 hardcodes DEFAULT_MODEL = "all-MiniLM-L6-v2" and
-            # EMBEDDING_DIM = 384; the embedded get_default_service() singleton
-            # is created with those values. We patch the module-level constants
-            # before any end_session() / embed_nodes() call so the upstream
-            # creates 1024-dim embeddings matching our config.
-            _patch_upstream_embedding(self._config.embedding_model)
-            # First-load bootstrap: generate default cashew.json and
-            # auto-populate auxiliary.memory if absent. Safe to call
-            # on every initialize() — no-op after the first run.
-            _ensure_config_file(self._hermes_home)
-            if self._config.llm_aux_role:
-                _ensure_auxiliary_memory(self._hermes_home)
-            self._db_path = resolve_db_path(
-                self._hermes_home, self._config.cashew_db_path
-            )
-            # ContextRetriever.__init__ is lazy — no SQLite open, no embedding load yet.
-            # Guard against the defensive-import fallback (ContextRetriever = None).
-            if ContextRetriever is None:
-                raise RuntimeError(
-                    "core.context.ContextRetriever unavailable at import time; "
-                    "cashew-brain dependency missing"
+        with trace_operation("cashew.initialize") as span:
+            span.set_attribute("session_id", session_id)
+            try:
+                self._config = load_config(self._hermes_home)
+                # Propagate embedding model to upstream cashew-brain.
+                # PyPI v1.1.0 hardcodes DEFAULT_MODEL = "all-MiniLM-L6-v2" and
+                # EMBEDDING_DIM = 384; the embedded get_default_service() singleton
+                # is created with those values. We patch the module-level constants
+                # before any end_session() / embed_nodes() call so the upstream
+                # creates 1024-dim embeddings matching our config.
+                _patch_upstream_embedding(self._config.embedding_model)
+                # First-load bootstrap: generate default cashew.json and
+                # auto-populate auxiliary.memory if absent. Safe to call
+                # on every initialize() — no-op after the first run.
+                _ensure_config_file(self._hermes_home)
+                if self._config.llm_aux_role:
+                    _ensure_auxiliary_memory(self._hermes_home)
+                self._db_path = resolve_db_path(
+                    self._hermes_home, self._config.cashew_db_path
                 )
-            self._db_path.parent.mkdir(parents=True, exist_ok=True)
-            # Self-healing — clean up stale state from prior crashes.
-            self._heal_stale_lock()
-            self._ensure_db_schema(self._db_path)
-            self._retriever = ContextRetriever(db_path=str(self._db_path))
-            self._model_fn = self._build_model_fn()
-            # Start the sync worker AFTER all worker-read state
-            # is populated (db_path, session_id, sync_queue).
-            self._start_sync_worker()
-            # Register the sleep cycle cron job if configured.
-            # Runs AFTER the sync worker so the provider is fully initialized
-            # before any background work begins. Silently skips when the
-            # Hermes cron module is not available (e.g. CI, standalone tests).
-            if (
-                self._config.sleep_cycles
-                and self._config.sleep_schedule
-                and _HAS_HERMES_CRON
-            ):
-                self._register_sleep_cron()
-        except Exception:
-            logger.warning(
-                "cashew initialize failed at %s; provider will report unavailable until fixed",
-                resolve_config_path(self._hermes_home),
-                exc_info=True,
-            )
-            self._config = None
-            self._db_path = None
-            self._retriever = None
-            self._sync_worker = None
+                # ContextRetriever.__init__ is lazy — no SQLite open, no embedding load yet.
+                # Guard against the defensive-import fallback (ContextRetriever = None).
+                if ContextRetriever is None:
+                    raise RuntimeError(
+                        "core.context.ContextRetriever unavailable at import time; "
+                        "cashew-brain dependency missing"
+                    )
+                self._db_path.parent.mkdir(parents=True, exist_ok=True)
+                # Self-healing — clean up stale state from prior crashes.
+                self._heal_stale_lock()
+                self._ensure_db_schema(self._db_path)
+                self._retriever = ContextRetriever(db_path=str(self._db_path))
+                self._model_fn = self._build_model_fn()
+                # Start the sync worker AFTER all worker-read state
+                # is populated (db_path, session_id, sync_queue).
+                self._start_sync_worker()
+                # Register the sleep cycle cron job if configured.
+                # Runs AFTER the sync worker so the provider is fully initialized
+                # before any background work begins. Silently skips when the
+                # Hermes cron module is not available (e.g. CI, standalone tests).
+                if (
+                    self._config.sleep_cycles
+                    and self._config.sleep_schedule
+                    and _HAS_HERMES_CRON
+                ):
+                    self._register_sleep_cron()
+                set_plugin_context(
+                    session_id=session_id,
+                    config={
+                        "recall_k": self._config.recall_k,
+                        "cashew_db_path": self._config.cashew_db_path,
+                        "embedding_model": self._config.embedding_model,
+                        "auto_extraction": self._config.auto_extraction,
+                        "sleep_cycles": self._config.sleep_cycles,
+                    },
+                )
+            except Exception as _exc:
+                capture_exception(
+                    _exc,
+                    operation="cashew.initialize",
+                    session_id=session_id,
+                )
+                logger.warning(
+                    "cashew initialize failed at %s; provider will report unavailable until fixed",
+                    resolve_config_path(self._hermes_home),
+                    exc_info=True,
+                )
+                self._config = None
+                self._db_path = None
+                self._retriever = None
+                self._sync_worker = None
 
     def _start_sync_worker(self) -> None:
         """Launch the non-daemon worker. Called from initialize() only on happy path.
@@ -685,6 +706,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             except queue.Empty:
                 pass  # worker drained between Full and get_nowait — rare race; no-op
             self._dropped_turn_count += 1
+            _METRICS.record_sync_dropped()
             logger.warning(
                 "cashew sync queue overflow (maxsize=%d); dropped oldest turn",
                 self._sync_queue.maxsize,
@@ -703,6 +725,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         path). task_done() ALWAYS in finally. Per-iteration except catches all
         Cashew failures without poisoning the queue.
 
+        When ``experimental_batch_sync`` feature flag is enabled, drains up to
+        ``_BATCH_SIZE`` items per iteration instead of one-at-a-time, reducing
+        per-turn overhead.
+
         Binds the queue reference to a local `q` at loop entry. If shutdown()
         times out waiting for this worker, it clears `self._sync_queue = None`
         and abandons the worker. Without this local bind, the abandoned worker's
@@ -714,17 +740,46 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._sync_queue
         )  # bind once; shutdown may clear self._sync_queue before we exit
         assert q is not None  # invariant: worker only starts when queue exists
+        _BATCH_SIZE = 8
         while True:
             item = q.get()
             if item is _SHUTDOWN:
                 q.task_done()
                 return
-            try:
-                self._drain_once(item)
-            except Exception:
-                logger.warning("cashew sync worker: turn failed", exc_info=True)
-            finally:
-                q.task_done()
+            items = [item]
+            # Batch drain when feature flag is enabled
+            if self._config is not None and is_feature_enabled(
+                self._config, "experimental_batch_sync"
+            ):
+                for _ in range(_BATCH_SIZE - 1):
+                    try:
+                        extra = q.get_nowait()
+                    except queue.Empty:
+                        break
+                    if extra is _SHUTDOWN:
+                        items.append(extra)
+                        break
+                    items.append(extra)
+            for turn in items:
+                if turn is _SHUTDOWN:
+                    q.task_done()
+                    return
+                try:
+                    with trace_operation("cashew.sync") as span:
+                        span.set_attribute("user.length", len(turn[0]))
+                        self._drain_once(turn)
+                except Exception as _exc:
+                    _METRICS.record_sync_failure()
+                    capture_exception(
+                        _exc,
+                        operation="cashew.sync",
+                        session_id=self._session_id,
+                        extra={"turn_user_len": len(turn[0])},
+                    )
+                    logger.warning("cashew sync worker: turn failed", exc_info=True)
+                finally:
+                    q.task_done()
+                    _METRICS.set_queue_depth(q.qsize())
 
     def _heal_stale_lock(self) -> None:
         """Remove stale sleep-cycle lock files left by prior crashes.
@@ -965,6 +1020,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     conversation_text=f"User: {user}\nAssistant: {assistant}",
                     model_fn=self._model_fn,
                 )
+                _METRICS.record_sync_success()
                 break  # success
             except RuntimeError as e:
                 # Python interpreter shutdown: sentence-transformers' thread pool
@@ -1234,6 +1290,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         """
         if self._sync_queue is None:
             return  # safe no-op: initialize() was never called
+        _METRICS.emit()
         timeout = self._config.sync_queue_timeout if self._config is not None else 30.0
         # Signal shutdown BEFORE the sentinel so _drain_once can short-circuit
         # even if the sentinel is still queued behind pending turns.
@@ -1271,6 +1328,51 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         self._prefetch_pending = None
         self._last_assistant = ""
         logger.debug("cashew provider shutdown complete")
+
+    def _parallel_retrieve(
+        self,
+        query: str,
+        max_nodes: int,
+        domain: str | None,
+        tag: str | None,
+        exclude_tags: list[str] | None,
+    ) -> list[dict] | None:
+        """Parallel retrieval: run upstream + keyword search concurrently."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _upstream() -> list[dict] | None:
+            from core.retrieval import retrieve_recursive_bfs
+
+            results = retrieve_recursive_bfs(
+                db_path=str(self._db_path),
+                query=query,
+                top_k=max_nodes,
+                domain=domain,
+                tags=[tag] if tag else None,
+                exclude_tags=exclude_tags,
+            )
+            if results:
+                node_ids = [r.node_id for r in results]
+                self._update_access_metrics(node_ids)
+                return self._enrich_results(node_ids)
+            return None
+
+        def _keyword() -> list[dict] | None:
+            return self._keyword_search(query, max_nodes, domain, tag, exclude_tags)
+
+        with ThreadPoolExecutor(max_workers=2) as _pool:
+            futures = [
+                _pool.submit(_upstream),
+                _pool.submit(_keyword),
+            ]
+            for fut in as_completed(futures):
+                try:
+                    nodes: list[dict] | None = fut.result(timeout=30)
+                except Exception:
+                    nodes = None
+                if nodes:
+                    return nodes
+        return None
 
     def prefetch(
         self,
@@ -1336,33 +1438,51 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             )
             self._warm_cache.clear()
         max_nodes = self._config.recall_k
-        try:
-            from core.retrieval import retrieve_recursive_bfs
+        with trace_operation(
+            "cashew.prefetch",
+            {"query.length": len(query)},
+        ) as _span:
+            if self._config is not None and is_feature_enabled(
+                self._config, "experimental_parallel_retrieval"
+            ):
+                nodes = self._parallel_retrieve(
+                    query, max_nodes, domain, tag, exclude_tags
+                )
+                if nodes:
+                    return self._format_context(nodes)
+                return ""
 
-            results = retrieve_recursive_bfs(
-                db_path=str(self._db_path),
-                query=query,
-                top_k=max_nodes,
-                domain=domain,
-                tags=[tag] if tag else None,
-                exclude_tags=exclude_tags,
-            )
-            if results:
-                node_ids = [r.node_id for r in results]
-                self._update_access_metrics(node_ids)
-                nodes = self._enrich_results(node_ids)
-                return self._format_context(nodes)
-        except Exception:
-            logger.debug(
-                "upstream retrieval failed, falling back to keyword", exc_info=True
-            )
-        try:
-            nodes = self._keyword_search(query, max_nodes, domain, tag, exclude_tags)
-            if nodes:
-                self._update_access_metrics([n["id"] for n in nodes])
-                return self._format_context(nodes)
-        except Exception:
-            logger.warning("cashew recall failed for query=%r", query, exc_info=True)
+            try:
+                from core.retrieval import retrieve_recursive_bfs
+
+                results = retrieve_recursive_bfs(
+                    db_path=str(self._db_path),
+                    query=query,
+                    top_k=max_nodes,
+                    domain=domain,
+                    tags=[tag] if tag else None,
+                    exclude_tags=exclude_tags,
+                )
+                if results:
+                    node_ids = [r.node_id for r in results]
+                    self._update_access_metrics(node_ids)
+                    nodes = self._enrich_results(node_ids)
+                    return self._format_context(nodes)
+            except Exception:
+                logger.debug(
+                    "upstream retrieval failed, falling back to keyword", exc_info=True
+                )
+            try:
+                nodes = self._keyword_search(
+                    query, max_nodes, domain, tag, exclude_tags
+                )
+                if nodes:
+                    self._update_access_metrics([n["id"] for n in nodes])
+                    return self._format_context(nodes)
+            except Exception:
+                logger.warning(
+                    "cashew recall failed for query=%r", query, exc_info=True
+                )
         return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
@@ -1581,44 +1701,62 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     error_message="cashew recall failed",
                 )
             try:
+                _t0 = time.perf_counter()
                 query = args["query"]
-                max_nodes = args.get("max_nodes", self._config.recall_k)
-                domain = args.get("domain")
-                tag = args.get("tag")
-                exclude_tags = args.get("exclude_tags")
-                try:
-                    from core.retrieval import retrieve_recursive_bfs
+                with trace_operation(
+                    "cashew.query",
+                    {"query.length": len(query)},
+                ) as span:
+                    max_nodes = args.get("max_nodes", self._config.recall_k)
+                    domain = args.get("domain")
+                    tag = args.get("tag")
+                    exclude_tags = args.get("exclude_tags")
+                    try:
+                        from core.retrieval import retrieve_recursive_bfs
 
-                    results = retrieve_recursive_bfs(
-                        db_path=str(self._db_path),
-                        query=query,
-                        top_k=max_nodes,
-                        domain=domain,
-                        tags=[tag] if tag else None,
-                        exclude_tags=exclude_tags,
-                    )
-                except Exception:
-                    results = None
-                if results:
-                    node_ids = [r.node_id for r in results]
-                    nodes = self._enrich_results(node_ids)
-                else:
-                    nodes = self._keyword_search(
-                        query, max_nodes, domain, tag, exclude_tags
-                    )
-                if nodes:
-                    self._update_access_metrics([n["id"] for n in nodes])
-                    context = self._format_context(nodes)
-                    node_count = len(nodes)
-                else:
-                    context = ""
-                    node_count = 0
+                        results = retrieve_recursive_bfs(
+                            db_path=str(self._db_path),
+                            query=query,
+                            top_k=max_nodes,
+                            domain=domain,
+                            tags=[tag] if tag else None,
+                            exclude_tags=exclude_tags,
+                        )
+                    except Exception:
+                        results = None
+                    if results:
+                        node_ids = [r.node_id for r in results]
+                        nodes = self._enrich_results(node_ids)
+                    else:
+                        nodes = self._keyword_search(
+                            query, max_nodes, domain, tag, exclude_tags
+                        )
+                    if nodes:
+                        self._update_access_metrics([n["id"] for n in nodes])
+                        context = self._format_context(nodes)
+                        node_count = len(nodes)
+                    else:
+                        context = ""
+                        node_count = 0
+                    _elapsed_ms = (time.perf_counter() - _t0) * 1000
+                    _METRICS.record_query(cache_hit=False, elapsed_ms=_elapsed_ms)
+                    span.set_attribute("node_count", node_count)
+                    span.set_attribute("elapsed_ms", _elapsed_ms)
                 return build_success_envelope(
                     query=query,
                     context=context,
                     node_count=node_count,
                 )
-            except Exception:
+            except Exception as _exc:
+                capture_exception(
+                    _exc,
+                    operation="cashew.query",
+                    session_id=self._session_id,
+                    extra={
+                        "query_len": len(args.get("query", "")),
+                        "max_nodes": args.get("max_nodes", "default"),
+                    },
+                )
                 logger.warning(
                     "cashew tool call %r failed",
                     name,
@@ -1650,7 +1788,13 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     new_nodes=len(result.new_nodes),
                     new_edges=len(result.new_edges),
                 )
-            except Exception:
+            except Exception as _exc:
+                capture_exception(
+                    _exc,
+                    operation="cashew.extract",
+                    session_id=self._session_id,
+                    extra={"user_len": len(args.get("user_content", ""))},
+                )
                 logger.warning(
                     "cashew tool call %r failed",
                     name,

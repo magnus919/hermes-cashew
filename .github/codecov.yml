@@ -1,0 +1,21 @@
+# Codecov configuration for hermes-cashew
+# Posts coverage reports as PR comments and enforces thresholds via status checks.
+
+coverage:
+  status:
+    project:
+      default:
+        target: 65%
+        threshold: 2%
+    patch:
+      default:
+        target: 50%
+        threshold: 5%
+
+comment:
+  layout: "reach, diff, flags, files"
+  behavior: default
+  require_changes: false
+
+github_checks:
+  annotations: true

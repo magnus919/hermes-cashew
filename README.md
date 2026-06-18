@@ -135,6 +135,20 @@ EOF
 | `clustering_eps` | `0.35` | DBSCAN epsilon for think-cycle clustering |
 | `clustering_min_samples` | `3` | Minimum samples per cluster in think cycle |
 
+#### Feature Flags
+
+Experimental features gated behind boolean toggles. All default to `false`.
+Enable in `cashew.json` under the `_features` key:
+
+```json
+{"_features": {"experimental_batch_sync": true}}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `experimental_batch_sync` | `false` | Drain up to 8 sync turns per worker iteration instead of one-at-a-time |
+| `experimental_parallel_retrieval` | `false` | Use parallel retrieval paths for semantic search |
+
 Environment variables override config values: prefix any key with `CASHEW_`
 (e.g. `CASHEW_RECALL_K=10`).
 

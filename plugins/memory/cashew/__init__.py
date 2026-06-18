@@ -1341,7 +1341,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         """Parallel retrieval: run upstream + keyword search concurrently."""
         from concurrent.futures import Future, ThreadPoolExecutor
 
-        def _upstream():
+        def _upstream() -> list[dict] | None:
             from core.retrieval import retrieve_recursive_bfs
 
             results = retrieve_recursive_bfs(
@@ -1358,17 +1358,17 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 return self._enrich_results(node_ids)
             return None
 
-        def _keyword():
+        def _keyword() -> list[dict] | None:
             return self._keyword_search(query, max_nodes, domain, tag, exclude_tags)
 
         with ThreadPoolExecutor(max_workers=2) as _pool:
-            futures: list[Future] = [
+            futures: list[Future[list[dict] | None]] = [
                 _pool.submit(_upstream),
                 _pool.submit(_keyword),
             ]
             for fut in futures:
                 try:
-                    nodes = fut.result(timeout=30)
+                    nodes: list[dict] | None = fut.result(timeout=30)
                 except Exception:
                     nodes = None
                 if nodes:

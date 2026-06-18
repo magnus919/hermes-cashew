@@ -73,7 +73,7 @@ def test_full_lifecycle_initialize_to_shutdown(tmp_path):
         session_id="lifecycle-1", platform="cli", hermes_home=str(tmp_path)
     )
 
-    schemas = mgr.get_tool_schemas_all()
+    schemas = provider.get_tool_schemas()
     assert len(schemas) == 1
     schema = schemas[0]
     assert "function" in schema

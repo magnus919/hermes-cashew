@@ -533,7 +533,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._config = None
                 self._db_path = None
                 self._retriever = None
-            self._sync_worker = None
+                self._sync_worker = None
 
     def _start_sync_worker(self) -> None:
         """Launch the non-daemon worker. Called from initialize() only on happy path.

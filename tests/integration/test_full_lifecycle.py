@@ -74,10 +74,9 @@ def test_full_lifecycle_initialize_to_shutdown(tmp_path):
     )
 
     schemas = provider.get_tool_schemas()
-    assert len(schemas) == 1
-    schema = schemas[0]
-    assert "function" in schema
-    assert schema["function"]["name"] in ("cashew_query",)
+    assert len(schemas) == 2
+    names = {s["function"]["name"] for s in schemas}
+    assert names == {"cashew_query", "cashew_extract"}
 
     mgr.shutdown_all()
 

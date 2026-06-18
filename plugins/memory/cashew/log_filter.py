@@ -38,6 +38,7 @@ class ScrubFilter(logging.Filter):
         if len(msg) > _MAX_CONTENT_LENGTH:
             msg = msg[:_MAX_CONTENT_LENGTH] + "..."
         record.msg = _scrub(msg)
+        record.args = None  # prevent double-formatting after msg is rewritten
         return True
 
 

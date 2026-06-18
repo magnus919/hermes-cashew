@@ -757,7 +757,6 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     except queue.Empty:
                         break
                     if extra is _SHUTDOWN:
-                        q.task_done()
                         items.append(extra)
                         break
                     items.append(extra)
@@ -1339,7 +1338,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         exclude_tags: list[str] | None,
     ) -> list[dict] | None:
         """Parallel retrieval: run upstream + keyword search concurrently."""
-        from concurrent.futures import Future, ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         def _upstream() -> list[dict] | None:
             from core.retrieval import retrieve_recursive_bfs
@@ -1362,11 +1361,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             return self._keyword_search(query, max_nodes, domain, tag, exclude_tags)
 
         with ThreadPoolExecutor(max_workers=2) as _pool:
-            futures: list[Future[list[dict] | None]] = [
+            futures = [
                 _pool.submit(_upstream),
                 _pool.submit(_keyword),
             ]
-            for fut in futures:
+            for fut in as_completed(futures):
                 try:
                     nodes: list[dict] | None = fut.result(timeout=30)
                 except Exception:
@@ -1725,24 +1724,24 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         )
                     except Exception:
                         results = None
-                if results:
-                    node_ids = [r.node_id for r in results]
-                    nodes = self._enrich_results(node_ids)
-                else:
-                    nodes = self._keyword_search(
-                        query, max_nodes, domain, tag, exclude_tags
-                    )
-                if nodes:
-                    self._update_access_metrics([n["id"] for n in nodes])
-                    context = self._format_context(nodes)
-                    node_count = len(nodes)
-                else:
-                    context = ""
-                    node_count = 0
-                _elapsed_ms = (time.perf_counter() - _t0) * 1000
-                _METRICS.record_query(cache_hit=False, elapsed_ms=_elapsed_ms)
-                span.set_attribute("node_count", node_count)
-                span.set_attribute("elapsed_ms", _elapsed_ms)
+                    if results:
+                        node_ids = [r.node_id for r in results]
+                        nodes = self._enrich_results(node_ids)
+                    else:
+                        nodes = self._keyword_search(
+                            query, max_nodes, domain, tag, exclude_tags
+                        )
+                    if nodes:
+                        self._update_access_metrics([n["id"] for n in nodes])
+                        context = self._format_context(nodes)
+                        node_count = len(nodes)
+                    else:
+                        context = ""
+                        node_count = 0
+                    _elapsed_ms = (time.perf_counter() - _t0) * 1000
+                    _METRICS.record_query(cache_hit=False, elapsed_ms=_elapsed_ms)
+                    span.set_attribute("node_count", node_count)
+                    span.set_attribute("elapsed_ms", _elapsed_ms)
                 return build_success_envelope(
                     query=query,
                     context=context,
@@ -1753,7 +1752,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     _exc,
                     operation="cashew.query",
                     session_id=self._session_id,
-                    extra={"query": args.get("query", "")[:100]},
+                    extra={
+                        "query_len": len(args.get("query", "")),
+                        "max_nodes": args.get("max_nodes", "default"),
+                    },
                 )
                 logger.warning(
                     "cashew tool call %r failed",

@@ -27,6 +27,8 @@ dev = [
     "ruff>=0.4,<1",
     "mypy>=1.8,<2",
     "pre-commit>=3.6,<4",
+    "vulture>=2.11,<3",
+    "deptry>=0.12,<1",
 ]
 
 [project.entry-points."hermes_agent.plugins"]
@@ -55,11 +57,14 @@ addopts = "--durations=10"
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "F", "N", "W", "I"]
+select = ["E", "F", "N", "W", "I", "TD", "C90"]
 ignore = ["E501", "N802", "N806"]
 
+[tool.ruff.lint.mccabe]
+max-complexity = 15
+
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["N801", "N999"]
+"tests/*" = ["N801", "N999", "C901"]
 "__init__.py" = ["N999"]
 
 [tool.ruff.format]
@@ -67,14 +72,11 @@ line-ending = "lf"
 
 [tool.mypy]
 python_version = "3.10"
-strict = false
-warn_unused_configs = true
-warn_redundant_casts = true
-warn_unreachable = true
+strict = true
 ignore_missing_imports = true
-disallow_untyped_defs = false
-disallow_incomplete_defs = false
-check_untyped_defs = false
+explicit_package_bases = true
+files = ["plugins/memory/cashew"]
+exclude = ["^__init__\\.py$"]
 
 [[tool.mypy.overrides]]
 module = "tests/*"
@@ -87,3 +89,20 @@ ignore_errors = true
 [[tool.mypy.overrides]]
 module = "plugins.memory.cashew.sleep_cron_script"
 ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "plugins.memory.cashew"
+disable_error_code = ["type-arg", "index"]
+
+[[tool.mypy.overrides]]
+module = "plugins.memory.cashew.sleep_refactor"
+disable_error_code = ["type-arg"]
+
+[tool.deptry]
+extend_exclude = ["tests", "__init__\\.py", "\\.venv"]
+known_first_party = ["plugins"]
+
+[tool.deptry.per_rule_ignores]
+DEP001 = ["cashew-brain", "sqlite-vec", "agent", "cron", "cashew_sleep_refactor", "_hermes_cashew_impl"]
+DEP002 = ["pytest", "pytest-cov", "pytest-asyncio", "pytest-mock", "build", "ruff", "mypy", "pre-commit", "vulture", "deptry", "jsonschema"]
+DEP003 = ["numpy", "sklearn", "sentence_transformers", "httpx", "yaml"]

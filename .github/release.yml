@@ -1,0 +1,22 @@
+# GitHub-native release notes generator configuration.
+# Categories map to PR labels; uncategorized PRs fall into "Other Changes".
+changelog:
+  categories:
+    - title: "Breaking Changes"
+      labels:
+        - "breaking"
+    - title: "Features"
+      labels:
+        - "enhancement"
+    - title: "Bug Fixes"
+      labels:
+        - "bug"
+    - title: "Documentation"
+      labels:
+        - "documentation"
+    - title: "Dependencies"
+      labels:
+        - "dependencies"
+    - title: "Other Changes"
+      labels:
+        - "*"

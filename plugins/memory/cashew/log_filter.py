@@ -1,14 +1,14 @@
-"""Log scrubbing processor for structlog.
+"""Log scrubbing filter for the cashew memory provider.
 
 Redacts sensitive values (API keys, tokens, user message content) from log
-output. Used as a structlog processor to sanitize log entries before they
-reach the renderer.
+output via a standard library logging.Filter.  Also provides a utility to
+install the filter on a logger instance.
 """
 
 from __future__ import annotations
 
+import logging
 import re
-from typing import Any
 
 # Patterns that look like API keys or tokens.
 _SECRET_PATTERNS: list[tuple[str, str]] = [
@@ -22,28 +22,25 @@ _SECRET_PATTERNS: list[tuple[str, str]] = [
 _MAX_CONTENT_LENGTH = 200
 
 
-def scrub_value(value: str) -> str:
+def _scrub(value: str) -> str:
     """Apply secret patterns to a string value."""
     for pattern, replacement in _SECRET_PATTERNS:
         value = re.sub(pattern, replacement, value, flags=re.IGNORECASE)
     return value
 
 
-def _scrub_event_dict(
-    _logger: Any, _method_name: str, event_dict: dict[str, Any]
-) -> dict[str, Any]:
-    """Structlog processor that scrubs sensitive values from the event dict."""
-    for key in ("user_content", "assistant_content", "message", "prompt"):
-        if key in event_dict and isinstance(event_dict[key], str):
-            if len(event_dict[key]) > _MAX_CONTENT_LENGTH:
-                event_dict[key] = event_dict[key][:_MAX_CONTENT_LENGTH] + "..."
-    # Scrub string values that may contain secrets
-    for key, value in event_dict.items():
-        if isinstance(value, str):
-            event_dict[key] = scrub_value(value)
-    return event_dict
+class ScrubFilter(logging.Filter):
+    """Logging filter that redacts sensitive values from log messages."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        # Truncate long content fields
+        if len(msg) > _MAX_CONTENT_LENGTH:
+            msg = msg[:_MAX_CONTENT_LENGTH] + "..."
+        record.msg = _scrub(msg)
+        return True
 
 
-def get_scrub_processor() -> Any:
-    """Return the structlog processor for log scrubbing."""
-    return _scrub_event_dict
+def add_scrub_filter(logger: logging.Logger) -> None:
+    """Install the scrub filter on a logger instance."""
+    logger.addFilter(ScrubFilter())

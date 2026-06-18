@@ -11,10 +11,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List
 
-import structlog
-from structlog.stdlib import LoggerFactory
-
-from .log_filter import get_scrub_processor
+from .log_filter import add_scrub_filter
 
 try:
     from agent.memory_provider import MemoryProvider
@@ -53,18 +50,10 @@ from .tools import (
     build_success_envelope,
 )
 
-# Configure structlog once at import time with log scrubbing.
-structlog.configure(
-    processors=[
-        get_scrub_processor(),
-    ],
-    context_class=dict,
-    logger_factory=LoggerFactory(),
-    wrapper_class=structlog.stdlib.BoundLogger,
-    cache_logger_on_first_use=True,
-)
+logger = logging.getLogger(__name__)
 
-logger = structlog.get_logger(__name__)
+# Install scrub filter on the cashew logger so all log output is sanitized.
+add_scrub_filter(logger)
 
 # Issue #18: sentence-transformers emits INFO-level progress bars and BertModel
 # load reports directly to the terminal during embedding. That noise leaks into

@@ -14,13 +14,12 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import os
 import pathlib
 from typing import Any, Callable
 
-import structlog
-
-logger = structlog.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 CONFIG_FILENAME: str = "cashew.json"
 """The flat-layout JSON file save_config writes under hermes_home."""

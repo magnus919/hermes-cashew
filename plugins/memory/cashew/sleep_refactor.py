@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import fcntl
+import logging
 import math
 import random
 import sqlite3
@@ -37,9 +38,8 @@ from collections import defaultdict
 from typing import Any, Optional
 
 import numpy as np
-import structlog
 
-logger = structlog.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # ── thresholds ──────────────────────────────────────────────────────────────
 CROSS_LINK_THRESHOLD = 0.78  # cosine similarity above which nodes get cross-linked

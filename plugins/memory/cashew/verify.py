@@ -26,13 +26,11 @@ import shutil
 import sys
 import tempfile
 
-import structlog
-
 _os.environ.setdefault("HF_HUB_OFFLINE", "1")
 _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 _os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 
-logger = structlog.get_logger(__name__)
+logger = logging.getLogger(__name__)
 _PROVIDER_NAME = "cashew"
 
 

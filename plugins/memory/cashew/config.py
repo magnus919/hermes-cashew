@@ -437,6 +437,16 @@ def get_config_schema() -> list[dict[str, Any]]:
             "default": DEFAULTS["sleep_max_nodes"],
             "env_var": _env_var_name("sleep_max_nodes"),
         },
+        {
+            "key": "_features",
+            "description": (
+                "Experimental feature flags as a boolean key-value object. "
+                "Flags are off by default; enable individually to opt into "
+                "new behavior. See README Feature Flags section for available keys."
+            ),
+            "default": DEFAULTS["_features"],
+            "env_var": "",
+        },
     ]
     return schema
 

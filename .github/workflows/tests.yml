@@ -52,6 +52,9 @@ jobs:
       - name: Duplicate code detection
         run: python scripts/check-duplicates.py
 
+      - name: Dead feature flag detection
+        run: python scripts/check-dead-flags.py
+
       - name: Unused dependency detection with deptry
         run: deptry .
 

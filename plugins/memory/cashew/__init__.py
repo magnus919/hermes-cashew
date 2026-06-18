@@ -11,6 +11,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List
 
+from .error_tracking import capture_exception, set_plugin_context
 from .log_filter import add_scrub_filter
 from .metrics import _METRICS
 from .tracing import trace_operation
@@ -508,7 +509,22 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     and _HAS_HERMES_CRON
                 ):
                     self._register_sleep_cron()
-            except Exception:
+                set_plugin_context(
+                    session_id=session_id,
+                    config={
+                        "recall_k": self._config.recall_k,
+                        "cashew_db_path": self._config.cashew_db_path,
+                        "embedding_model": self._config.embedding_model,
+                        "auto_extraction": self._config.auto_extraction,
+                        "sleep_cycles": self._config.sleep_cycles,
+                    },
+                )
+            except Exception as _exc:
+                capture_exception(
+                    _exc,
+                    operation="cashew.initialize",
+                    session_id=session_id,
+                )
                 logger.warning(
                     "cashew initialize failed at %s; provider will report unavailable until fixed",
                     resolve_config_path(self._hermes_home),
@@ -753,8 +769,14 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     with trace_operation("cashew.sync") as span:
                         span.set_attribute("user.length", len(turn[0]))
                         self._drain_once(turn)
-                except Exception:
+                except Exception as _exc:
                     _METRICS.record_sync_failure()
+                    capture_exception(
+                        _exc,
+                        operation="cashew.sync",
+                        session_id=self._session_id,
+                        extra={"turn_user_len": len(turn[0])},
+                    )
                     logger.warning("cashew sync worker: turn failed", exc_info=True)
                 finally:
                     q.task_done()
@@ -1308,6 +1330,51 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         self._last_assistant = ""
         logger.debug("cashew provider shutdown complete")
 
+    def _parallel_retrieve(
+        self,
+        query: str,
+        max_nodes: int,
+        domain: str | None,
+        tag: str | None,
+        exclude_tags: list[str] | None,
+    ) -> list[dict] | None:
+        """Parallel retrieval: run upstream + keyword search concurrently."""
+        from concurrent.futures import Future, ThreadPoolExecutor
+
+        def _upstream():
+            from core.retrieval import retrieve_recursive_bfs
+
+            results = retrieve_recursive_bfs(
+                db_path=str(self._db_path),
+                query=query,
+                top_k=max_nodes,
+                domain=domain,
+                tags=[tag] if tag else None,
+                exclude_tags=exclude_tags,
+            )
+            if results:
+                node_ids = [r.node_id for r in results]
+                self._update_access_metrics(node_ids)
+                return self._enrich_results(node_ids)
+            return None
+
+        def _keyword():
+            return self._keyword_search(query, max_nodes, domain, tag, exclude_tags)
+
+        with ThreadPoolExecutor(max_workers=2) as _pool:
+            futures: list[Future] = [
+                _pool.submit(_upstream),
+                _pool.submit(_keyword),
+            ]
+            for fut in futures:
+                try:
+                    nodes = fut.result(timeout=30)
+                except Exception:
+                    nodes = None
+                if nodes:
+                    return nodes
+        return None
+
     def prefetch(
         self,
         query: str,
@@ -1376,6 +1443,16 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             "cashew.prefetch",
             {"query.length": len(query)},
         ) as _span:
+            if self._config is not None and is_feature_enabled(
+                self._config, "experimental_parallel_retrieval"
+            ):
+                nodes = self._parallel_retrieve(
+                    query, max_nodes, domain, tag, exclude_tags
+                )
+                if nodes:
+                    return self._format_context(nodes)
+                return ""
+
             try:
                 from core.retrieval import retrieve_recursive_bfs
 
@@ -1671,7 +1748,13 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     context=context,
                     node_count=node_count,
                 )
-            except Exception:
+            except Exception as _exc:
+                capture_exception(
+                    _exc,
+                    operation="cashew.query",
+                    session_id=self._session_id,
+                    extra={"query": args.get("query", "")[:100]},
+                )
                 logger.warning(
                     "cashew tool call %r failed",
                     name,
@@ -1703,7 +1786,13 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     new_nodes=len(result.new_nodes),
                     new_edges=len(result.new_edges),
                 )
-            except Exception:
+            except Exception as _exc:
+                capture_exception(
+                    _exc,
+                    operation="cashew.extract",
+                    session_id=self._session_id,
+                    extra={"user_len": len(args.get("user_content", ""))},
+                )
                 logger.warning(
                     "cashew tool call %r failed",
                     name,

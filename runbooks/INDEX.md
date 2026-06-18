@@ -104,3 +104,85 @@ pip install --no-cache-dir hermes-cashew==<expected-version>
 2. Disable LLM extraction by removing `llm_aux_role` from `cashew.json`.
 3. Ensure the SQLite database is on fast storage (not network/NFS).
 4. The plugin gracefully drops oldest entries; no data corruption.
+
+## Alerting
+
+Recommended alerts based on the structured metrics emitted by the plugin
+(via `cashew_metrics` log events from `metrics.py`). Feed these log lines
+into your monitoring system (Datadog, Grafana Loki, Prometheus with mtail,
+or a log-based alerting pipeline).
+
+### Extracting Metrics from Logs
+
+```bash
+# Latest snapshot of all plugin metrics:
+grep "cashew_metrics" ~/.hermes/logs/agent.log | tail -1
+
+# Parse as key-value pairs for monitoring:
+grep "cashew_metrics" ~/.hermes/logs/agent.log | tail -1 \
+  | python3 -c "
+import re, sys
+line = sys.stdin.read()
+pairs = re.findall(r'(\w+)=([\d.]+)', line)
+print({k: float(v) if '.' in v else int(v) for k, v in pairs})
+"
+```
+
+### Recommended Alerts
+
+| Alert | Threshold | Severity | Rationale |
+|-------|-----------|----------|-----------|
+| `SyncQueueOverflow` | `sync_dropped > 0` in 5 min window | **WARNING** | Turns are being discarded. Check LLM extraction latency or DB I/O. |
+| `HighSyncFailureRate` | `sync_failed / (sync_extracted + sync_failed) > 0.1` | **CRITICAL** | More than 10% of sync turns are failing. DB may be corrupted or locked. |
+| `SlowQueryLatency` | `query_avg_ms > 1000` over 10 min | **WARNING** | Retrieval is slow. Check embedding model health or DB size. |
+| `SleepCycleStalled` | `sleep_cycle_count == 0` for 24h | **WARNING** | Sleep cycle cron job may not be running. Check `hermes cron list`. |
+| `HighQueueDepth` | `queue_depth > 12` for 10 min | **WARNING** | Sync worker can't keep up. Approaching queue capacity (16). |
+
+### Example: Prometheus Alert Rules
+
+```yaml
+groups:
+  - name: hermes_cashew
+    rules:
+      - alert: SyncQueueOverflow
+        expr: rate(cashew_sync_dropped_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cashew sync queue overflow ({{ $value }} drops in 5m)"
+          runbook: https://github.com/magnus919/hermes-cashew/runbooks/INDEX.md#sync-queue-overflow
+
+      - alert: HighSyncFailureRate
+        expr: |
+          rate(cashew_sync_failed_total[10m])
+          / (rate(cashew_sync_extracted_total[10m]) + rate(cashew_sync_failed_total[10m]))
+          > 0.1
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Cashew sync failure rate > 10%"
+```
+
+### Example: Datadog Monitor
+
+```json
+{
+  "name": "Cashew Sync Queue Overflow",
+  "type": "log alert",
+  "query": "logs(\"source:hermes @cashew_metrics:sync_dropped:>0\").index(\"main\").rollup(\"count\").last(\"5m\") > 0",
+  "message": "Cashew sync queue is dropping turns. Check: {{runbook}}",
+  "tags": ["service:hermes-cashew", "severity:warning"]
+}
+```
+
+### Error Tracking Alerts
+
+When Sentry is configured (`SENTRY_DSN` env var), set up alerts for:
+
+- **New issues** in the `cashew.sync` or `cashew.query` operations
+- **Spike in error rate** (> 5 events/minute) to catch cascading failures
+- **Session-scoped errors** — filter by `session_id` tag to trace a single user session
+
+See [Sentry Alert Rules](https://docs.sentry.io/product/alerts/) for setup.

@@ -66,7 +66,7 @@ jobs:
           pytest -xvs --cov=plugins/memory/cashew --cov-report=term --cov-report=xml --cov-fail-under=65 2>&1 | tee pytest.log
 
       - name: Upload coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: coverage.xml

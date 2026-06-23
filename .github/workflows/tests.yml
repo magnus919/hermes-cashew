@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, hermes-cashew, docker]
     env:
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
@@ -95,7 +95,7 @@ jobs:
           echo "Optimizations: uv resolver (10x faster than pip), pytest-xvs (fail-fast)"
 
   wheel-smoke:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, hermes-cashew, docker]
     needs: test
     env:
       HF_HUB_OFFLINE: "1"

@@ -15,7 +15,9 @@ concurrency:
 
 jobs:
   test:
-    runs-on: [self-hosted, linux, x64, hermes-cashew, docker]
+    # Use self-hosted runner for same-repo PRs and pushes; GitHub-hosted for fork PRs
+    # (fork PRs on self-hosted runners are a security risk — arbitrary code execution)
+    runs-on: ${{ fromJSON(github.event.pull_request.head.repo.fork && '["ubuntu-latest"]' || '["self-hosted","linux","x64","hermes-cashew","docker"]') }}
     env:
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
@@ -95,7 +97,8 @@ jobs:
           echo "Optimizations: uv resolver (10x faster than pip), pytest-xvs (fail-fast)"
 
   wheel-smoke:
-    runs-on: [self-hosted, linux, x64, hermes-cashew, docker]
+    # Same fork-conditional as test job above
+    runs-on: ${{ fromJSON(github.event.pull_request.head.repo.fork && '["ubuntu-latest"]' || '["self-hosted","linux","x64","hermes-cashew","docker"]') }}
     needs: test
     env:
       HF_HUB_OFFLINE: "1"

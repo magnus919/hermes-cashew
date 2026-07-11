@@ -46,21 +46,17 @@ def _read_config(hermes_home: Path) -> dict:
 
 
 def _resolve_db_path(hermes_home: Path, config: dict) -> str:
-    """Resolve db path: absolute stays, relative rooted at hermes_home."""
-    default_db = str(hermes_home / "cashew" / "brain.db")
-    raw = config.get("cashew_db_path", "")
-    if not raw:
-        return default_db
-    if Path(raw).is_absolute():
-        return raw
-    return str(hermes_home / raw)
+    """Resolve the DB path through the provider's profile-isolation guard."""
+    from plugins.memory.cashew.config import resolve_db_path
+
+    raw = config.get("cashew_db_path") or "cashew/brain.db"
+    return str(resolve_db_path(hermes_home, raw))
 
 
 def main() -> None:
     """Discover config, import sleep_refactor, run one cycle, print JSON."""
     hermes_home = _find_hermes_home()
     config = _read_config(hermes_home)
-    db_path = _resolve_db_path(hermes_home, config)
     limit = config.get("sleep_max_nodes", 2000)
     embedding_model = config.get("embedding_model", "thenlper/gte-large")
 
@@ -78,6 +74,8 @@ def main() -> None:
             sys.path.insert(0, str(candidate.resolve()))
             break
 
+    db_path = _resolve_db_path(hermes_home, config)
+
     try:
         from plugins.memory.cashew.sleep_refactor import run_sleep_cycle
     except ImportError:
@@ -88,6 +86,7 @@ def main() -> None:
 
     # Resolve the LLM callable from auxiliary config for dream generation.
     from plugins.memory.cashew.config import resolve_model_fn as _resolve_model_fn
+
     model_fn = _resolve_model_fn(hermes_home=hermes_home)
 
     result = run_sleep_cycle(

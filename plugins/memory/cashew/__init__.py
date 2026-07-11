@@ -156,7 +156,7 @@ def _ensure_auxiliary_memory(hermes_home: pathlib.Path) -> None:
         return
 
     try:
-        import yaml  # type: ignore[import-untyped]
+        import yaml  # type: ignore[import-untyped, unused-ignore]
 
         raw = config_path.read_text(encoding="utf-8")
         data = yaml.safe_load(raw) or {}

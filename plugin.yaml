@@ -6,7 +6,7 @@ name: cashew
 version: 0.10.2
 description: "Cashew — persistent thought-graph memory with local embeddings, organic decay, and autonomous think cycles."
 pip_dependencies:
-  - "cashew-brain"
+  - "cashew-brain>=1.1.0,<2.0.0"
   - "sqlite-vec"
 requires_env: []
 hooks:

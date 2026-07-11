@@ -1284,6 +1284,23 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         if self._sync_queue is None:
             return  # not initialized or silent-degraded
 
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """Rebind session identity and discard ephemeral context from the old session."""
+        del parent_session_id, reset, rewound, kwargs
+        with self._sync_state_lock:
+            self._session_id = str(new_session_id)
+            self._warm_cache.clear()
+            self._prefetch_pending = None
+            self._last_assistant = ""
+
     def shutdown(self) -> None:
         """Post sentinel, bounded-join worker, clear references.
 

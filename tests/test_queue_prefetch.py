@@ -1,4 +1,5 @@
 """Tests for CashewMemoryProvider.queue_prefetch and its supporting machinery."""
+
 from __future__ import annotations
 
 import threading
@@ -93,12 +94,49 @@ def test_prefetch_cache_miss_falls_through():
 
 
 def test_prefetch_swaps_pending_into_warm_cache():
-    """prefetch() must atomically swap _prefetch_pending into _warm_cache."""
+    """Pending context retains its cue and uses normal relevance matching."""
     provider = _provider_with_mock_config()
-    provider._prefetch_pending = "staged context"
-    result = provider.prefetch("anything")
+    provider._prefetch_generation = 1
+    provider._prefetch_pending = (
+        1,
+        "test-session",
+        ["database migration"],
+        "staged context",
+    )
+    result = provider.prefetch("database migration plan")
     assert result == "staged context"
     assert provider._prefetch_pending is None
+
+
+def test_prefetch_does_not_relabel_unrelated_pending_context():
+    provider = _provider_with_mock_config()
+    provider._prefetch_generation = 1
+    provider._prefetch_pending = (
+        1,
+        "test-session",
+        ["pizza preferences"],
+        "cached pizza context",
+    )
+
+    result = provider.prefetch("production database migration")
+
+    assert result != "cached pizza context"
+
+
+def test_stale_prefetch_worker_cannot_replace_newer_generation():
+    provider = _provider_with_mock_config()
+    provider._prefetch_generation = 2
+
+    provider._stage_prefetch_result(1, "test-session", ["old"], "old context")
+    assert provider._prefetch_pending is None
+
+    provider._stage_prefetch_result(2, "test-session", ["new"], "new context")
+    assert provider._prefetch_pending == (
+        2,
+        "test-session",
+        ["new"],
+        "new context",
+    )
 
 
 def test_prefetch_half_state_skips_warm_cache():
@@ -116,7 +154,10 @@ def test_queue_prefetch_dispatches_background_thread():
     """queue_prefetch must start a daemon thread."""
     provider = _provider_with_mock_config()
     provider.queue_prefetch("test query")
-    threads = [t for t in threading.enumerate()
-               if t.name and t.name.startswith("cashew-prefetch-")]
+    threads = [
+        t
+        for t in threading.enumerate()
+        if t.name and t.name.startswith("cashew-prefetch-")
+    ]
     assert len(threads) >= 1
     assert all(t.daemon for t in threads)

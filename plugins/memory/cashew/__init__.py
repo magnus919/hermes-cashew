@@ -395,7 +395,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         # background thread writes here; prefetch() atomically swaps it into
         # _warm_cache at the start of its call. This avoids concurrent access
         # between the daemon thread and the main agent loop.
-        self._prefetch_pending: str | None = None
+        self._prefetch_pending: tuple[int, str, list[str], str] | None = None
+        self._prefetch_generation: int = 0
         # Last assistant response, buffered from sync_turn for use by
         # queue_prefetch's LLM cue extraction.
         self._last_assistant: str = ""
@@ -1288,6 +1289,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         del parent_session_id, reset, rewound, kwargs
         with self._sync_state_lock:
             self._session_id = str(new_session_id)
+            self._prefetch_generation += 1
             self._warm_cache.clear()
             self._prefetch_pending = None
             self._last_assistant = ""
@@ -1371,6 +1373,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._retriever = None
             self._model_fn = None
             self._warm_cache.clear()
+            self._prefetch_generation += 1
             self._prefetch_pending = None
             self._last_assistant = ""
         logger.debug("cashew provider shutdown complete")
@@ -1450,12 +1453,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         """
         if self._config is None:
             return ""
-        # Atomically swap in any background-prefetched results
-        pending = self._prefetch_pending
-        if pending is not None:
-            self._prefetch_pending = None
-            # Store under the raw query so the matching logic below can find it
-            self._warm_cache[query] = pending
+        requested_session = str(kwargs.get("session_id") or self._session_id)
+        self._warm_cache.update(self._consume_prefetch_pending(requested_session))
         # Warm cache fast path: check if a cached cue matches the query.
         if self._warm_cache:
             query_lower = query.lower()
@@ -1551,7 +1550,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         """
         if self._config is None:
             return
-        self._prefetch_pending = None  # clear any stale results
+        effective_session = str(session_id or self._session_id)
+        with self._sync_state_lock:
+            self._prefetch_generation += 1
+            generation = self._prefetch_generation
+            self._prefetch_pending = None
         if not query:
             logger.debug("queue_prefetch: empty query, no warmup")
             return
@@ -1604,8 +1607,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
                 if all_nodes:
                     ctx = self._format_context(all_nodes)
-                    # Stage results for the next prefetch to pick up
-                    self._prefetch_pending = ctx
+                    self._stage_prefetch_result(
+                        generation, effective_session, cues, ctx
+                    )
                     logger.info(
                         "queue_prefetch: cached %d result(s) from %d cue(s) for next turn",
                         len(all_nodes),
@@ -1622,6 +1626,31 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             name=f"cashew-prefetch-{self._session_id}",
         )
         t.start()
+
+    def _stage_prefetch_result(
+        self, generation: int, session_id: str, cues: list[str], context: str
+    ) -> None:
+        """Publish a warmup result only if its request is still current."""
+        with self._sync_state_lock:
+            if (
+                generation != self._prefetch_generation
+                or session_id != self._session_id
+            ):
+                return
+            self._prefetch_pending = (generation, session_id, list(cues), context)
+
+    def _consume_prefetch_pending(self, session_id: str) -> dict[str, str]:
+        """Atomically consume a current result, retaining its source cues."""
+        with self._sync_state_lock:
+            pending = self._prefetch_pending
+            self._prefetch_pending = None
+            current_generation = self._prefetch_generation
+        if pending is None:
+            return {}
+        generation, result_session, cues, context = pending
+        if generation != current_generation or result_session != session_id:
+            return {}
+        return {cue: context for cue in cues}
 
     def _extract_prefetch_cues(self, query: str) -> list[str]:
         """Use the auxiliary LLM to extract concrete search cues from the turn.

@@ -1463,16 +1463,20 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     continue
                 cue_lower = cue.lower()
                 if cue_lower in query_lower or query_lower in cue_lower:
-                    logger.info("prefetch warm cache HIT: cue=%r query=%r", cue, query)
+                    logger.info(
+                        "prefetch warm cache HIT: cue_len=%d query_len=%d",
+                        len(cue),
+                        len(query),
+                    )
                     self._warm_cache.clear()
                     return ctx
                 cue_words = set(w for w in cue_lower.split() if len(w) > 3)
                 query_words = set(w for w in query_lower.split() if len(w) > 3)
                 if len(cue_words & query_words) >= 2:
                     logger.info(
-                        "prefetch warm cache HIT: cue=%r query=%r (word overlap)",
-                        cue,
-                        query,
+                        "prefetch warm cache HIT: cue_len=%d query_len=%d (word overlap)",
+                        len(cue),
+                        len(query),
                     )
                     self._warm_cache.clear()
                     return ctx
@@ -1526,7 +1530,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     return self._format_context(nodes)
             except Exception:
                 logger.warning(
-                    "cashew recall failed for query=%r", query, exc_info=True
+                    "cashew recall failed (query_len=%d)", len(query), exc_info=True
                 )
         return ""
 

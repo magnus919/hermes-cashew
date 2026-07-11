@@ -5,16 +5,15 @@ that stores conversation context in a local [Cashew](https://github.com/rajkripa
 thought graph with semantic search and automatic context recall. Get from zero to
 a working install in under five minutes.
 
-**v0.9.0** auto-generates `cashew.json` with defaults on first load, enables
-LLM-powered extraction by default (no manual `auxiliary.memory` setup), and
-adds forest-level insight extraction via `on_pre_compress`. **v0.8.0**
-re-enabled the sleep cycle with a ground-up refactored implementation —
-vectorized cross-linking, batched DB writes, ~4s at 7K nodes.
+The plugin auto-generates `cashew.json` with defaults on first load, enables
+LLM-powered extraction by default (no manual `auxiliary.memory` setup), adds
+forest-level insight extraction via `on_pre_compress`, and runs graph
+consolidation on a persistent Hermes cron schedule.
 
 ## Prerequisites
 
 - [Hermes Agent](https://github.com/nousresearch/hermes-agent) installed
-- `cashew-brain>=1.0.0` — installed automatically by `hermes plugins install`
+- `cashew-brain>=1.1.0,<2.0.0` — installed automatically by `hermes plugins install`
 - `sqlite-vec` — enables vector similarity search. Installed automatically.
 
 ## Install
@@ -47,8 +46,10 @@ hermes memory setup
 
 ## Zero-Config Startup
 
-hermes-cashew works out of the box — all 32 configuration keys have sane
-defaults. On first agent startup, the plugin auto-generates `~/.hermes/cashew.json`
+hermes-cashew works out of the box — all 37 persisted configuration fields have
+sane defaults. The interactive setup advertises the 16 fields backed by current
+runtime behavior; legacy tuning fields remain readable for compatibility. On
+first agent startup, the plugin auto-generates `~/.hermes/cashew.json`
 with the full default configuration and auto-populates `auxiliary.memory` in
 Hermes `config.yaml` from the main model config, so LLM-powered extraction
 is active without any manual setup.

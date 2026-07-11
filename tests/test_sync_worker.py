@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import time
 import types
@@ -114,9 +115,9 @@ def test_worker_processes_single_turn(tmp_path, monkeypatch):
     p = make_initialized_provider(tmp_path)
     try:
         p.sync_turn("hi", "hello")
-        assert drain_queue(
-            p, budget_s=2.0
-        ), f"drain timeout; unfinished={p._sync_queue.unfinished_tasks}"
+        assert drain_queue(p, budget_s=2.0), (
+            f"drain timeout; unfinished={p._sync_queue.unfinished_tasks}"
+        )
         assert len(calls) == 1
         assert calls[0]["session_id"] == "test-sync"
         assert calls[0]["conversation_text"] == "User: hi\nAssistant: hello"
@@ -160,9 +161,7 @@ def test_poisoned_turn_does_not_break_worker(tmp_path, monkeypatch, caplog):
             for i in range(16):
                 p.sync_turn(f"u{i}", f"a{i}")
             assert drain_queue(p, budget_s=3.0)
-        assert (
-            len(calls) == 16
-        ), f"expected all 16 turns attempted; got {len(calls)}"
+        assert len(calls) == 16, f"expected all 16 turns attempted; got {len(calls)}"
         # ONE WARNING from the poisoned turn
         worker_warnings = [
             r
@@ -193,13 +192,45 @@ def test_shutdown_posts_sentinel_and_joins(tmp_path, monkeypatch):
     baseline = threading.active_count()
     p = make_initialized_provider(tmp_path)
     p.shutdown()
-    assert wait_for_thread_exit(
-        baseline
-    ), f"thread leak: {threading.active_count()} vs {baseline}"
+    assert wait_for_thread_exit(baseline), (
+        f"thread leak: {threading.active_count()} vs {baseline}"
+    )
     assert p._sync_worker is None
     assert p._sync_queue is None
     assert p._config is None
     assert p._db_path is None
+
+
+def test_shutdown_drains_accepted_turns_and_rejects_new_ones(tmp_path, monkeypatch):
+    """Turns ahead of the sentinel persist; producers stop at shutdown start."""
+    first_started = threading.Event()
+    release_first = threading.Event()
+    calls: list[str] = []
+
+    def controlled_end_session(**kwargs):
+        calls.append(kwargs["conversation_text"])
+        if len(calls) == 1:
+            first_started.set()
+            assert release_first.wait(timeout=2.0)
+        return types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[])
+
+    monkeypatch.setattr(
+        "core.session.end_session", controlled_end_session, raising=False
+    )
+    p = make_initialized_provider(tmp_path)
+    p.sync_turn("u1", "a1")
+    assert first_started.wait(timeout=1.0)
+    p.sync_turn("u2", "a2")
+
+    shutdown_thread = threading.Thread(target=p.shutdown)
+    shutdown_thread.start()
+    assert p._shutdown_started.wait(timeout=1.0)
+    p.sync_turn("u3", "a3")
+    release_first.set()
+    shutdown_thread.join(timeout=2.0)
+
+    assert not shutdown_thread.is_alive()
+    assert calls == ["User: u1\nAssistant: a1", "User: u2\nAssistant: a2"]
 
 
 def test_shutdown_hung_worker_logs_warning_no_raise(tmp_path, monkeypatch, caplog):
@@ -229,6 +260,8 @@ def test_shutdown_hung_worker_logs_warning_no_raise(tmp_path, monkeypatch, caplo
             if r.levelname == "WARNING" and "did not exit within" in r.getMessage()
         ]
         assert len(hang_warnings) == 1
+        assert p._db_path is not None
+        assert p._config is not None
     finally:
         # Wait for the worker thread to exit (0.3s sleep completes, then
         # the worker returns to queue.get() and exits on sentinel). This
@@ -237,12 +270,35 @@ def test_shutdown_hung_worker_logs_warning_no_raise(tmp_path, monkeypatch, caplo
             f"hung worker did not exit within 1s budget: "
             f"active={threading.active_count()} baseline={baseline}"
         )
+        assert p._sync_worker is None
+        assert p._sync_queue is None
+        assert p._db_path is None
+        assert p._config is None
+
+
+def test_sync_turn_does_not_block_behind_full_queue_shutdown():
+    """A blocking sentinel fallback must not hold the producer lock."""
+    p = CashewMemoryProvider()
+    p._sync_queue = queue.Queue(maxsize=1)
+    p._sync_queue.put_nowait(("queued", "turn", "session"))
+
+    shutdown_thread = threading.Thread(target=p.shutdown)
+    shutdown_thread.start()
+    assert p._shutdown_started.wait(timeout=1.0)
+
+    start = time.monotonic()
+    p.sync_turn("late", "turn")
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 0.01
+    shutdown_thread.join(timeout=2.0)
+    assert not shutdown_thread.is_alive()
 
 
 def test_on_session_end_returns_without_draining_queue(tmp_path, monkeypatch):
     """on_session_end returns promptly without draining the sync queue.
 
-    The sync worker is non-daemon and keeps running across session boundaries.
+    The sync worker keeps running across session boundaries.
     Data-loss protection is handled by dispose(), not on_session_end.
     """
     monkeypatch.setattr(

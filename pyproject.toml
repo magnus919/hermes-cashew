@@ -109,6 +109,6 @@ known_first_party = ["plugins"]
 package_module_name_map = { "opentelemetry-api" = "opentelemetry" }
 
 [tool.deptry.per_rule_ignores]
-DEP001 = ["cashew-brain", "sqlite-vec", "agent", "cron", "cashew_sleep_refactor", "_hermes_cashew_impl", "opentelemetry-api", "sentry-sdk"]
+DEP001 = ["cashew-brain", "sqlite-vec", "agent", "cron", "utils", "cashew_sleep_refactor", "_hermes_cashew_impl", "opentelemetry-api", "sentry-sdk"]
 DEP002 = ["pytest", "pytest-cov", "pytest-asyncio", "pytest-mock", "build", "ruff", "mypy", "pre-commit", "vulture", "deptry", "jsonschema", "opentelemetry-api", "sentry-sdk"]
 DEP003 = ["numpy", "sklearn", "sentence_transformers", "httpx", "yaml"]

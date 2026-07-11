@@ -514,12 +514,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 # Runs AFTER the sync worker so the provider is fully initialized
                 # before any background work begins. Silently skips when the
                 # Hermes cron module is not available (e.g. CI, standalone tests).
-                if (
-                    self._write_enabled
-                    and self._config.sleep_cycles
-                    and self._config.sleep_schedule
-                    and _HAS_HERMES_CRON
-                ):
+                if self._write_enabled and _HAS_HERMES_CRON:
                     self._register_sleep_cron()
                 set_plugin_context(
                     session_id=session_id,
@@ -564,64 +559,48 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
     # ── Sleep cycle cron scheduling ──────────────────────────────────────
 
     def _register_sleep_cron(self) -> None:
-        """Install the cron script and register a no_agent cron job.
-
-        Called from initialize() only on the happy path.  Safe to call
-        multiple times — if a job is already registered for this provider
-        instance, the call is a no-op.
-
-        The cron job persists across session boundaries (survives shutdown)
-        so the 12h schedule isn't reset on every session start.
-        """
-        if self._sleep_cron_job_id is not None:
-            return  # already registered for this instance
-
+        """Reconcile the persistent cron job and managed script with config."""
         if self._hermes_home is None or self._config is None:
             return
-
-        # Scan for an existing sleep cron job by name.
-        # If one exists, adopt its ID and skip registration so the
-        # original 12h timer isn't reset. Without this, every session
-        # start would remove-and-re-register the job, resetting the
-        # schedule and preventing it from ever firing.
         try:
-            from cron.jobs import list_jobs
+            from cron.jobs import create_job, list_jobs, remove_job
 
-            for job in list_jobs():
-                if job.get("name") == "cashew-sleep-cycle":
-                    self._sleep_cron_job_id = job["id"]
-                    logger.info(
-                        "sleep: adopted existing cron job %s (preserving schedule)",
-                        job["id"],
-                    )
-                    return  # keep the existing job running
-        except ImportError:
-            logger.debug("sleep: cron module not available — cannot adopt")
-        except Exception:
-            logger.warning("sleep: failed to adopt existing cron job", exc_info=True)
+            existing = [
+                job for job in list_jobs() if job.get("name") == "cashew-sleep-cycle"
+            ]
+            desired_schedule = self._config.sleep_schedule
+            enabled = self._config.sleep_cycles and bool(desired_schedule)
+            if not enabled:
+                for job in existing:
+                    remove_job(job["id"])
+                self._sleep_cron_job_id = None
+                return
 
-        try:
-            # Read the cron script source from disk and install it.
             script_source = (
                 pathlib.Path(__file__).parent / "sleep_cron_script.py"
             ).read_text()
-
-            # Install the script to $HERMES_HOME/scripts/
             script_dest = self._hermes_home / "scripts" / "cashew-sleep-cycle.py"
             script_dest.parent.mkdir(parents=True, exist_ok=True)
-            if not script_dest.exists():
-                script_dest.write_text(script_source)
-                script_dest.chmod(0o755)
-                logger.info("sleep: installed cron script to %s", script_dest)
-            else:
-                logger.debug("sleep: cron script already exists at %s", script_dest)
+            if not script_dest.exists() or script_dest.read_text() != script_source:
+                staged = script_dest.with_suffix(".py.tmp")
+                staged.write_text(script_source)
+                staged.chmod(0o755)
+                staged.replace(script_dest)
+                logger.info("sleep: refreshed cron script at %s", script_dest)
 
-            # Register via the Hermes cron API.
-            from cron.jobs import create_job
+            matching = [
+                job for job in existing if job.get("schedule") == desired_schedule
+            ]
+            if len(existing) == 1 and len(matching) == 1:
+                self._sleep_cron_job_id = matching[0]["id"]
+                return
+
+            for job in existing:
+                remove_job(job["id"])
 
             job = create_job(
                 prompt="hermes-cashew sleep cycle",
-                schedule=self._config.sleep_schedule,
+                schedule=desired_schedule,
                 name="cashew-sleep-cycle",
                 script="cashew-sleep-cycle.py",
                 no_agent=True,
@@ -631,7 +610,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             logger.info(
                 "sleep: registered cron job %s (schedule=%s)",
                 job["id"],
-                self._config.sleep_schedule,
+                desired_schedule,
             )
         except ImportError:
             logger.warning(

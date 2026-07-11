@@ -552,7 +552,7 @@ def resolve_model_fn(
         return None
 
     try:
-        import yaml  # type: ignore[import-untyped]
+        import yaml  # type: ignore[import-untyped, unused-ignore]
 
         raw = yaml.safe_load(config_yaml_path.read_text(encoding="utf-8"))
         aux_config = (raw or {}).get("auxiliary", {}).get(role, {})

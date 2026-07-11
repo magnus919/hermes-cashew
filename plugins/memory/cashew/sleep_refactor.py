@@ -721,6 +721,7 @@ def _run_dream_async(
 def run_sleep_cycle(
     db_path: str,
     limit: int = MAX_NODES_PER_CYCLE,
+    max_edges: int = MAX_EDGES_PER_CYCLE,
     model_fn: Any = None,
     background_dream: bool = False,
     embedding_model: str = "thenlper/gte-large",
@@ -730,6 +731,7 @@ def run_sleep_cycle(
     Args:
         db_path: Path to the Cashew SQLite database.
         limit: Maximum number of nodes to cross-link this cycle.
+        max_edges: Maximum cross-links to create in this cycle.
         model_fn: Optional callable(str) -> str for LLM-powered dream generation.
         background_dream: When True, Phase 8 (dream) and Phase 9 (orphan
             embedding) run in a daemon thread instead of blocking the caller.
@@ -803,6 +805,7 @@ def run_sleep_cycle(
             cross_pairs,
             sim,
             source_files=source_files or None,
+            max_edges=max_edges,
         )
         if model_fn is not None:
             for i, j in cross_pairs:

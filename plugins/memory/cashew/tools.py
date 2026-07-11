@@ -19,6 +19,7 @@ Contract:
   - Extract envelopes do NOT echo user/assistant content — the LLM already has
     both strings in its context.
 """
+
 from __future__ import annotations
 
 import json
@@ -60,6 +61,16 @@ CASHEW_QUERY_SCHEMA: dict[str, Any] = {
                 "minimum": 1,
                 "maximum": 20,
             },
+            "domain": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Optional node domain to include (for example, 'work').",
+            },
+            "tag": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Optional tag that returned nodes must contain.",
+            },
             "exclude_tags": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -92,13 +103,15 @@ def build_success_envelope(query: str, context: str, node_count: int) -> str:
     Shape:
         {"ok": true, "tool": "cashew_query", "query": ..., "context": ..., "node_count": N}
     """
-    return json.dumps({
-        "ok": True,
-        "tool": TOOL_NAME,
-        "query": query,
-        "context": context,
-        "node_count": node_count,
-    })
+    return json.dumps(
+        {
+            "ok": True,
+            "tool": TOOL_NAME,
+            "query": query,
+            "context": context,
+            "node_count": node_count,
+        }
+    )
 
 
 def build_error_envelope(
@@ -121,12 +134,14 @@ def build_error_envelope(
     Shape:
         {"ok": false, "tool": "cashew_query", "error": ..., "query": ...}
     """
-    return json.dumps({
-        "ok": False,
-        "tool": TOOL_NAME,
-        "error": error_message,
-        "query": query,
-    })
+    return json.dumps(
+        {
+            "ok": False,
+            "tool": TOOL_NAME,
+            "error": error_message,
+            "query": query,
+        }
+    )
 
 
 EXTRACT_TOOL_NAME: str = "cashew_extract"
@@ -181,12 +196,14 @@ def build_extract_success_envelope(new_nodes: int, new_edges: int) -> str:
     Shape:
         {"ok": true, "tool": "cashew_extract", "new_nodes": N, "new_edges": M}
     """
-    return json.dumps({
-        "ok": True,
-        "tool": EXTRACT_TOOL_NAME,
-        "new_nodes": new_nodes,
-        "new_edges": new_edges,
-    })
+    return json.dumps(
+        {
+            "ok": True,
+            "tool": EXTRACT_TOOL_NAME,
+            "new_nodes": new_nodes,
+            "new_edges": new_edges,
+        }
+    )
 
 
 def build_extract_error_envelope(error_message: str = "cashew extract failed") -> str:
@@ -209,8 +226,10 @@ def build_extract_error_envelope(error_message: str = "cashew extract failed") -
     echo user/assistant content — the LLM already has both strings in its
     context.
     """
-    return json.dumps({
-        "ok": False,
-        "tool": EXTRACT_TOOL_NAME,
-        "error": error_message,
-    })
+    return json.dumps(
+        {
+            "ok": False,
+            "tool": EXTRACT_TOOL_NAME,
+            "error": error_message,
+        }
+    )

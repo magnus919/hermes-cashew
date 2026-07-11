@@ -151,6 +151,29 @@ def test_resolve_db_path_rejects_absolute_paths(tmp_path):
     assert "/etc/passwd" in str(exc.value)
 
 
+def test_resolve_db_path_rejects_parent_traversal(tmp_path):
+    """CONF-04: relative paths must not traverse above hermes_home."""
+    with pytest.raises(ValueError, match="must stay within hermes_home"):
+        resolve_db_path(tmp_path, "../outside.db")
+
+
+def test_resolve_db_path_rejects_symlink_escape(tmp_path):
+    """CONF-04: an in-profile symlink must not redirect the DB outside."""
+    outside = tmp_path.parent / "outside"
+    outside.mkdir(exist_ok=True)
+    (tmp_path / "linked").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="must stay within hermes_home"):
+        resolve_db_path(tmp_path, "linked/brain.db")
+
+
+def test_resolve_db_path_allows_nested_profile_path(tmp_path):
+    """CONF-03: ordinary nested paths still resolve below hermes_home."""
+    expected = tmp_path / "nested" / "cashew" / "brain.db"
+
+    assert resolve_db_path(tmp_path, "nested/cashew/brain.db") == expected
+
+
 def test_load_config_returns_defaults_when_file_absent(tmp_path):
     """No cashew.json → defaults for all 30 keys. No exception."""
     cfg = load_config(tmp_path)

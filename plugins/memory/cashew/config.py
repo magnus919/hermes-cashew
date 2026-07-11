@@ -654,7 +654,17 @@ def resolve_db_path(
             f"cashew_db_path must be relative to hermes_home; got absolute path {db_path_value!r}. "
             "Configure a relative path (e.g. 'cashew/brain.db') instead."
         )
-    return pathlib.Path(hermes_home) / db_path_value
+
+    home = pathlib.Path(hermes_home).resolve()
+    candidate = (home / db_path_value).resolve()
+    try:
+        candidate.relative_to(home)
+    except ValueError as exc:
+        raise ValueError(
+            "cashew_db_path must stay within hermes_home; "
+            f"got path {db_path_value!r} which resolves outside {str(home)!r}."
+        ) from exc
+    return candidate
 
 
 def load_config(hermes_home: str | os.PathLike[str]) -> CashewConfig:

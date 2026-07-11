@@ -317,6 +317,30 @@ def test_ensure_auxiliary_memory_populates_from_main_model(tmp_path):
     assert aux_memory["base_url"] == "https://openrouter.ai/api/v1"
 
 
+def test_ensure_auxiliary_memory_preserves_user_yaml_text_and_mode(tmp_path):
+    from plugins.memory.cashew import _ensure_auxiliary_memory
+
+    config_yaml = tmp_path / "config.yaml"
+    original = (
+        "# keep this comment\n"
+        "model:\n"
+        "  provider: 'openrouter'  # preserve quotes\n"
+        "  default: &chosen 'openrouter/auto'\n"
+        "display:\n"
+        "  selected: *chosen\n"
+    )
+    config_yaml.write_text(original)
+    config_yaml.chmod(0o640)
+
+    _ensure_auxiliary_memory(tmp_path)
+
+    updated = config_yaml.read_text()
+    assert updated.startswith(original)
+    assert "# keep this comment" in updated
+    assert "&chosen 'openrouter/auto'" in updated
+    assert config_yaml.stat().st_mode & 0o777 == 0o640
+
+
 def test_ensure_auxiliary_memory_does_not_overwrite_existing(tmp_path):
     """_ensure_auxiliary_memory never overwrites existing auxiliary.memory."""
     from plugins.memory.cashew import _ensure_auxiliary_memory

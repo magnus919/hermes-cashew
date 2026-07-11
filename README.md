@@ -142,7 +142,8 @@ Expected output shows `Provider: cashew` with `Plugin: installed` and `Status: a
 `hermes-cashew` provides two LLM-accessible tools:
 
 - **`cashew_query`** — searches the local thought graph for context relevant to
-  the current conversation. Uses sqlite-vec for semantic search.
+  the current conversation. Uses sqlite-vec for semantic search; optional
+  `domain`, `tag`, and `exclude_tags` filters narrow the result set.
 - **`cashew_extract`** — explicitly persists a conversation turn into the graph.
   The agent can call this when it judges a turn contains worth-remembering knowledge.
 

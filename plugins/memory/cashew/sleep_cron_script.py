@@ -93,7 +93,10 @@ def main() -> None:
         db_path=db_path,
         limit=limit,
         model_fn=model_fn,
-        background_dream=True,
+        # This process owns the scheduled cycle and exits immediately after
+        # printing the result. Keep dream generation and orphan embedding
+        # synchronous so they complete before interpreter shutdown.
+        background_dream=False,
         embedding_model=embedding_model,
     )
     print(json.dumps(result, indent=2))

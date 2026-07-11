@@ -3,6 +3,7 @@
 # Covers SYNC-02, SYNC-05, SYNC-06, ABC-05, ABC-06.
 from __future__ import annotations
 
+import dataclasses
 import logging
 import queue
 import threading
@@ -140,6 +141,41 @@ def test_worker_processes_multiple_turns_fifo(tmp_path, monkeypatch):
         assert len(calls) == 5
         for i, call in enumerate(calls):
             assert f"User: u{i}" in call["conversation_text"]
+    finally:
+        p.shutdown()
+
+
+def test_auto_extraction_false_does_not_enqueue_turn(tmp_path, monkeypatch):
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        "core.session.end_session", fake_end_session_ok(calls), raising=False
+    )
+    p = make_initialized_provider(tmp_path)
+    try:
+        p._config = dataclasses.replace(p._config, auto_extraction=False)
+        p.sync_turn("private system input", "private system output")
+        assert p._sync_queue.unfinished_tasks == 0
+        assert calls == []
+    finally:
+        p.shutdown()
+
+
+def test_think_cycles_false_skips_periodic_think(tmp_path, monkeypatch):
+    think_calls: list[dict] = []
+    monkeypatch.setattr(
+        "core.session.end_session", fake_end_session_ok([]), raising=False
+    )
+    monkeypatch.setattr(
+        "core.session.think_cycle",
+        lambda **kwargs: think_calls.append(kwargs),
+        raising=False,
+    )
+    p = make_initialized_provider(tmp_path)
+    try:
+        p._config = dataclasses.replace(p._config, think_cycles=False, think_interval=1)
+        p._model_fn = lambda prompt: prompt
+        p._drain_once(("user", "assistant", "session"))
+        assert think_calls == []
     finally:
         p.shutdown()
 

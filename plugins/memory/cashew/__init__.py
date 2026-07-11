@@ -701,7 +701,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         Half-state (_sync_queue is None) is a silent no-op.
         """
-        if not self._write_enabled:
+        if (
+            not self._write_enabled
+            or self._config is None
+            or not self._config.auto_extraction
+        ):
             return
         with self._sync_state_lock:
             if self._shutdown_started.is_set() or self._sync_queue is None:
@@ -1064,6 +1068,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         if (
             self._model_fn is not None
             and self._config
+            and self._config.think_cycles
             and self._config.think_interval > 0
         ):
             counter = self._load_think_counter() + 1

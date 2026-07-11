@@ -55,6 +55,17 @@ def fake_end_session_slow(sleep_s: float) -> Any:
     return _fake
 
 
+def fake_end_session_blocked(started: threading.Event, release: threading.Event) -> Any:
+    """Block one worker call until the test explicitly releases it."""
+
+    def _fake(*args: Any, **kwargs: Any) -> Any:
+        started.set()
+        assert release.wait(timeout=2.0)
+        return types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[])
+
+    return _fake
+
+
 def make_initialized_provider(tmp_path) -> CashewMemoryProvider:
     p = CashewMemoryProvider()
     p.save_config({}, str(tmp_path))
@@ -68,25 +79,27 @@ def make_initialized_provider(tmp_path) -> CashewMemoryProvider:
 def test_sync_turn_enqueues_tuple(tmp_path, monkeypatch):
     """Pause the worker (slow mock); after sync_turn the queue contains one item."""
     # Use a very slow mock so the worker picks up the turn but stays busy
+    started = threading.Event()
+    release = threading.Event()
     monkeypatch.setattr(
-        "core.session.end_session", fake_end_session_slow(5.0), raising=False
+        "core.session.end_session",
+        fake_end_session_blocked(started, release),
+        raising=False,
     )
     p = make_initialized_provider(tmp_path)
     try:
         # First sync_turn — worker will pick it up (qsize goes to 0, but unfinished_tasks=1)
         # Use a second turn so qsize > 0
         p.sync_turn("u0", "a0")
-        time.sleep(0.05)  # let worker pick up the first turn
+        assert started.wait(timeout=1.0)
         p.sync_turn("u1", "a1")
         # Now the second turn is waiting in the queue (worker busy with first)
         assert p._sync_queue.qsize() == 1
     finally:
-        # Shrink shutdown budget so the 5s slow call doesn't block teardown
-        if p._config is not None:
-            p._config = dataclasses.replace(p._config, sync_queue_timeout=0.1)
         monkeypatch.setattr(
             "core.session.end_session", fake_end_session_ok([]), raising=False
         )
+        release.set()
         p.shutdown()
 
 
@@ -100,7 +113,7 @@ def test_sync_turn_fast_on_empty_queue(tmp_path, monkeypatch):
         start = time.monotonic()
         p.sync_turn("u", "a")
         elapsed = time.monotonic() - start
-        assert elapsed < 0.05, f"sync_turn blocked for {elapsed*1000:.1f}ms"
+        assert elapsed < 0.05, f"sync_turn blocked for {elapsed * 1000:.1f}ms"
     finally:
         p.shutdown()
 
@@ -134,7 +147,7 @@ def test_sync_turn_empty_queue_strict_15ms(tmp_path, monkeypatch):
         p.sync_turn("u", "a")
         elapsed = time.monotonic() - start
         assert elapsed < 0.015, (
-            f"sync_turn blocked for {elapsed*1000:.1f}ms; strict bound 15ms"
+            f"sync_turn blocked for {elapsed * 1000:.1f}ms; strict bound 15ms"
         )
     finally:
         p.shutdown()
@@ -142,29 +155,32 @@ def test_sync_turn_empty_queue_strict_15ms(tmp_path, monkeypatch):
 
 def test_sync_turn_fast_even_on_full_queue(tmp_path, monkeypatch):
     """Pitfall 5: sync_turn stays fast even when the queue is full (drop-oldest path)."""
+    started = threading.Event()
+    release = threading.Event()
     monkeypatch.setattr(
-        "core.session.end_session", fake_end_session_slow(100.0), raising=False
+        "core.session.end_session",
+        fake_end_session_blocked(started, release),
+        raising=False,
     )
     p = make_initialized_provider(tmp_path)
     try:
         # Fill to 16 — first turn picked up by worker (stuck), next 15 sit in queue
-        for i in range(16):
+        p.sync_turn("u0", "a0")
+        assert started.wait(timeout=1.0)
+        for i in range(1, 16):
             p.sync_turn(f"u{i}", f"a{i}")
         # Queue now likely full; next call must still be fast (drop-oldest path)
         start = time.monotonic()
         p.sync_turn("u17", "a17")
         elapsed = time.monotonic() - start
         assert elapsed < 0.05, (
-            f"sync_turn blocked for {elapsed*1000:.1f}ms on full queue — hot path violation"
+            f"sync_turn blocked for {elapsed * 1000:.1f}ms on full queue — hot path violation"
         )
     finally:
-        # Swap fake for fast so shutdown doesn't hang on the 100s sleep
         monkeypatch.setattr(
             "core.session.end_session", fake_end_session_ok([]), raising=False
         )
-        # Override config to cut shutdown timeout before join
-        if p._config is not None:
-            p._config = dataclasses.replace(p._config, sync_queue_timeout=0.1)
+        release.set()
         p.shutdown()
 
 
@@ -194,7 +210,7 @@ def test_drop_oldest_logs_warning_and_preserves_newest(tmp_path, monkeypatch, ca
             "core.session.end_session", fake_end_session_ok(calls), raising=False
         )
         if p._config is not None:
-            p._config = dataclasses.replace(p._config, sync_queue_timeout=0.2)
+            p._config = dataclasses.replace(p._config, sync_queue_timeout=1.0)
         p.shutdown()
 
 
@@ -232,8 +248,7 @@ def test_sync_turn_silent_noop_on_fresh_provider(caplog):
         p.sync_turn("u", "a")  # must not raise
     # No records at any level from sync_turn itself
     assert not caplog.records, (
-        f"fresh provider sync_turn logged: "
-        f"{[r.getMessage() for r in caplog.records]}"
+        f"fresh provider sync_turn logged: {[r.getMessage() for r in caplog.records]}"
     )
 
 

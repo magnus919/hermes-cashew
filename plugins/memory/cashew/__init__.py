@@ -377,9 +377,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         # Serializes producer admission with sentinel insertion so no turn can
         # race behind the shutdown sentinel and remain unprocessed.
         self._sync_state_lock = threading.Lock()
-        # Non-daemon worker that drains _sync_queue. Started in
-        # initialize() only on happy path. Joined in shutdown()
-        # with bounded timeout.
+        # Daemon worker that drains _sync_queue. Started in initialize() only
+        # on the happy path and given a bounded drain during shutdown().
         self._dropped_turn_count: int = 0
         # Monotonic counter of drop-oldest events on the sync queue.
         # Incremented inside sync_turn's overflow branch each time a queued
@@ -1293,7 +1292,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
           2. Post _SHUTDOWN sentinel to the queue. put_nowait first; fallback to
              a 1s blocking put if the queue is full (worker is draining fast).
           3. Bounded-join the worker using sync_queue_timeout. WARNING on timeout.
-          4. Clear _sync_queue, _sync_worker, _config, _db_path, _retriever.
+          4. Clear runtime state after the worker exits. If the bounded join
+             times out, a daemon cleanup watcher retains that state until the
+             worker actually finishes.
 
         _hermes_home is intentionally NOT reset — is_available() must keep
         reflecting on-disk reality.
@@ -1302,42 +1303,68 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             return  # safe no-op: initialize() was never called
         _METRICS.emit()
         timeout = self._config.sync_queue_timeout if self._config is not None else 30.0
-        # Atomically stop new producers and post the sentinel. Items already in
-        # the queue remain ahead of it and receive a bounded opportunity to
-        # persist before the worker exits.
+        # Atomically stop new producers and capture the queue. Release the lock
+        # before the potentially blocking sentinel fallback: producers will see
+        # _shutdown_started and return without waiting on a full queue.
         with self._sync_state_lock:
             self._shutdown_started.set()
+            q = self._sync_queue
+            assert q is not None
+        # Items already in the queue remain ahead of the sentinel and receive a
+        # bounded opportunity to persist before the worker exits.
+        try:
+            q.put_nowait(_SHUTDOWN)
+        except queue.Full:
             try:
-                self._sync_queue.put_nowait(_SHUTDOWN)
+                q.put(_SHUTDOWN, block=True, timeout=1.0)
             except queue.Full:
-                try:
-                    self._sync_queue.put(_SHUTDOWN, block=True, timeout=1.0)
-                except queue.Full:
-                    logger.warning(
-                        "cashew shutdown: could not post sentinel; worker may leak"
-                    )
+                logger.warning(
+                    "cashew shutdown: could not post sentinel; worker may leak"
+                )
         # Bounded join. Never raise.
-        if self._sync_worker is not None:
-            self._sync_worker.join(timeout=timeout)
-            if self._sync_worker.is_alive():
+        worker = self._sync_worker
+        if worker is not None:
+            worker.join(timeout=timeout)
+            if worker.is_alive():
                 logger.warning(
                     "cashew sync worker did not exit within %ss; abandoning",
                     timeout,
                 )
-        # Sleep cycle cron job is intentionally NOT removed here.
-        # It persists across session boundaries so the 12h schedule
-        # isn't reset on every session start. The next initialize()
-        # will adopt the existing job if one exists.
-        self._sleep_cron_job_id = None  # clear instance tracking only
-        # Clear state. _hermes_home persists (see is_available() contract).
-        self._sync_queue = None
-        self._sync_worker = None
-        self._config = None
-        self._db_path = None
-        self._retriever = None
-        self._warm_cache.clear()
-        self._prefetch_pending = None
-        self._last_assistant = ""
+                cleanup = threading.Thread(
+                    target=self._clear_state_after_worker_exit,
+                    args=(worker,),
+                    daemon=True,
+                    name=f"cashew-shutdown-{self._session_id}",
+                )
+                cleanup.start()
+                return
+        self._clear_runtime_state(worker)
+
+    def _clear_state_after_worker_exit(self, worker: threading.Thread) -> None:
+        """Keep worker dependencies alive until a timed-out drain completes."""
+        worker.join()
+        self._clear_runtime_state(worker)
+
+    def _clear_runtime_state(self, worker: threading.Thread | None) -> None:
+        """Clear provider state if it still belongs to the exiting worker."""
+        with self._sync_state_lock:
+            if worker is not None and self._sync_worker is not worker:
+                return
+            # Sleep cycle cron job is intentionally NOT removed here.
+            # It persists across session boundaries so the 12h schedule
+            # isn't reset on every session start. The next initialize()
+            # will adopt the existing job if one exists.
+            self._sleep_cron_job_id = None  # clear instance tracking only
+            # Clear state. _hermes_home persists (see is_available() contract).
+            self._sync_queue = None
+            self._sync_worker = None
+            self._config = None
+            self._db_path = None
+            self._retriever = None
+            self._model_fn = None
+            self._warm_cache.clear()
+            self._prefetch_pending = None
+            self._last_assistant = ""
         logger.debug("cashew provider shutdown complete")
 
     def _parallel_retrieve(

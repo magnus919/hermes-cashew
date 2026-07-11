@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import time
 import types
@@ -259,6 +260,8 @@ def test_shutdown_hung_worker_logs_warning_no_raise(tmp_path, monkeypatch, caplo
             if r.levelname == "WARNING" and "did not exit within" in r.getMessage()
         ]
         assert len(hang_warnings) == 1
+        assert p._db_path is not None
+        assert p._config is not None
     finally:
         # Wait for the worker thread to exit (0.3s sleep completes, then
         # the worker returns to queue.get() and exits on sentinel). This
@@ -267,6 +270,29 @@ def test_shutdown_hung_worker_logs_warning_no_raise(tmp_path, monkeypatch, caplo
             f"hung worker did not exit within 1s budget: "
             f"active={threading.active_count()} baseline={baseline}"
         )
+        assert p._sync_worker is None
+        assert p._sync_queue is None
+        assert p._db_path is None
+        assert p._config is None
+
+
+def test_sync_turn_does_not_block_behind_full_queue_shutdown():
+    """A blocking sentinel fallback must not hold the producer lock."""
+    p = CashewMemoryProvider()
+    p._sync_queue = queue.Queue(maxsize=1)
+    p._sync_queue.put_nowait(("queued", "turn", "session"))
+
+    shutdown_thread = threading.Thread(target=p.shutdown)
+    shutdown_thread.start()
+    assert p._shutdown_started.wait(timeout=1.0)
+
+    start = time.monotonic()
+    p.sync_turn("late", "turn")
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 0.01
+    shutdown_thread.join(timeout=2.0)
+    assert not shutdown_thread.is_alive()
 
 
 def test_on_session_end_returns_without_draining_queue(tmp_path, monkeypatch):

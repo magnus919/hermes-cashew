@@ -6,13 +6,12 @@ Hermes Agent memory provider plugin backed by Cashew (local SQLite knowledge gra
 
 Thin adapter around upstream [cashew-brain](https://github.com/rajkripal/cashew) — the plugin delegates retrieval, schema management, and LLM operations to upstream. Custom code is limited to Hermes integration surface (config, tools, threading).
 
-## Current State (v0.8.2)
+## Current State
 
 - **LLM integration**: `llm_aux_role` config key references `auxiliary.<role>` in Hermes `config.yaml`. Plugin reads Hermes config, resolves credentials, wires `model_fn` callable to upstream. No API keys in plugin config.
 - **Retrieval**: Three-tier (sqlite-vec → BFS → keyword), delegated to upstream `retrieve_recursive_bfs()`.
 - **Schema**: Upstream `core.db.ensure_schema()` — no custom migration layer.
-- **Threading**: Bounded `queue.Queue(maxsize=16)` + single non-daemon worker. Sentinel is `_SHADOW = object()`.
-- **Open issues**: 0 remaining. #15 (privacy / exclude_tags), #35 (spec compliance), #36 (on_pre_compress), and #38 (sleep cycle redesign) all resolved.
+- **Threading**: Bounded `queue.Queue(maxsize=16)` + single daemon worker. Shutdown rejects new producers, drains accepted turns ahead of `_SHUTDOWN = object()`, and defers cleanup if the bounded join times out.
 
 ## Project Conventions
 
@@ -58,7 +57,7 @@ The `auxiliary.memory` convention is designed for any Hermes memory provider. Wh
 
 - `__init__.py` (root) — thin re-export shim; flat-entry loader path. **Do not import Cashew dependencies here.**
 - `plugins/memory/cashew/__init__.py` — provider implementation (CashewMemoryProvider + register).
-- `plugins/memory/cashew/config.py` — CashewConfig dataclass, DEFAULTS, load/save, schema (31 keys).
+- `plugins/memory/cashew/config.py` — CashewConfig dataclass, load/save, 37 compatibility defaults, and a 16-field runtime-backed setup schema.
 - `plugins/memory/cashew/tools.py` — JSON envelope builders for tool call responses.
 - `plugins/memory/cashew/plugin.yaml` — bundled-loader hook manifest (hooks: [on_session_end, on_pre_compress]). Must match `plugin.yaml` (root).
 - `plugin.yaml` (root) — `hermes plugins install` manifest. CI auto-syncs version from `pyproject.toml` on release.
@@ -81,6 +80,10 @@ Hermes-cashew has **three** version-bearing files, and they must all agree:
 
 **The rule:** you only bump `pyproject.toml` when cutting a release. CI reads the version from `pyproject.toml` and patches both `plugin.yaml` files with `sed` before building the wheel and sdist. This happens in the `Sync plugin.yaml versions to pyproject.toml` step of the release workflow, immediately after version-tag validation.
 
+`pyproject.toml` is the source of truth for the current package version;
+`CHANGELOG.md` owns release history. Do not add a separate "current version"
+claim to prose documentation.
+
 If you ever need to check that all three are in sync locally:
 ```bash
 PYPROJ="$(grep -Po '^version = \"\K[^\"]+' pyproject.toml)"
@@ -95,7 +98,7 @@ done
 ## Key Constraints
 
 - **No `~/.hermes` writes.** All paths scope under `hermes_home`. Tests use `tmp_path` fixture.
-- **`sync_turn` must return <10 ms.** Bounded queue + non-daemon worker.
+- **`sync_turn` must return <10 ms.** Bounded queue + daemon worker; shutdown gives already-accepted turns a bounded opportunity to drain.
 - **Cashew dependency**: `cashew-brain>=1.1.0,<2.0.0` on PyPI.
 - **sqlite-vec** enables vector similarity search. It's a standard dependency
   (not optional) — the plugin requires it. If your platform doesn't support
@@ -142,10 +145,9 @@ See README.md for setup guide, CHANGELOG.md for release history, and CONTRIBUTIN
 
 ## graphify
 
-This project has a graphify knowledge graph at graphify-out/.
+Graphify output is a local, generated aid and is not committed to the repository.
 
 Rules:
-- Before answering architecture or codebase questions, read graphify-out/GRAPH_REPORT.md for god nodes and community structure
-- If graphify-out/wiki/index.md exists, navigate it instead of reading raw files
-- For cross-module "how does X relate to Y" questions, prefer `graphify query "<question>"`, `graphify path "<A>" "<B>"`, or `graphify explain "<concept>"` over grep — these traverse the graph's EXTRACTED + INFERRED edges instead of scanning files
-- After modifying code files in this session, run `graphify update .` to keep the graph current (AST-only, no API cost)
+- If `graphify-out/GRAPH_REPORT.md` exists locally, read it before architecture work; if `graphify-out/wiki/index.md` exists, navigate it instead of raw generated files.
+- When Graphify is installed, prefer `graphify query`, `graphify path`, or `graphify explain` for cross-module questions.
+- After modifying code, run `graphify update .` when Graphify is available. A fresh clone must remain usable without Graphify or generated output.

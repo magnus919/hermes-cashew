@@ -373,6 +373,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         self._db_path: pathlib.Path | None = None
         self._sync_queue: queue.Queue | None = None
         self._session_id: str = ""
+        # Hermes permits user-memory writes only from the primary agent context.
+        # Unknown future contexts fail closed.
+        self._write_enabled: bool = True
         self._sync_worker: "threading.Thread | None" = None
         # Serializes producer admission with sentinel insertion so no turn can
         # race behind the shutdown sentinel and remain unprocessed.
@@ -462,6 +465,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             )
         self._session_id = session_id
         self._hermes_home = pathlib.Path(kwargs["hermes_home"])
+        self._write_enabled = kwargs.get("agent_context", "primary") == "primary"
         # Queue is created here so config-driven sizing/timeout values are wired in.
         # The daemon worker thread drains it and receives a bounded flush during
         # provider shutdown.
@@ -511,7 +515,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 # before any background work begins. Silently skips when the
                 # Hermes cron module is not available (e.g. CI, standalone tests).
                 if (
-                    self._config.sleep_cycles
+                    self._write_enabled
+                    and self._config.sleep_cycles
                     and self._config.sleep_schedule
                     and _HAS_HERMES_CRON
                 ):
@@ -696,6 +701,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         Half-state (_sync_queue is None) is a silent no-op.
         """
+        if not self._write_enabled:
+            return
         with self._sync_state_lock:
             if self._shutdown_started.is_set() or self._sync_queue is None:
                 return
@@ -974,7 +981,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         return "\n".join(lines)
 
     def _update_access_metrics(self, node_ids: list[str]) -> None:
-        if not node_ids:
+        if not self._write_enabled or not node_ids:
             return
         try:
             import sqlite3
@@ -1126,7 +1133,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         Silent-degrades to "" when no LLM is wired, insufficient exchanges,
         or any failure (never raises).
         """
-        if self._model_fn is None or self._db_path is None:
+        if not self._write_enabled or self._model_fn is None or self._db_path is None:
             return ""
 
         import json as _json
@@ -1825,7 +1832,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         elif name == "cashew_extract":
             # Half-state guard. No log — initialize() already warned when it
             # set _db_path / _config to None.
-            if self._db_path is None or self._config is None:
+            if not self._write_enabled or self._db_path is None or self._config is None:
                 return build_extract_error_envelope()
             try:
                 user = args["user_content"]  # KeyError caught below — tool-call failure

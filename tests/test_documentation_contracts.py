@@ -5,27 +5,16 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import tomllib
-
 from plugins.memory.cashew.config import DEFAULTS, get_config_schema
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _manifest_version(path: Path) -> str:
-    match = re.search(r"^version:\s*(\S+)$", path.read_text(), re.MULTILINE)
-    assert match is not None
-    return match.group(1)
-
-
-def test_version_source_of_truth_matches_both_manifests() -> None:
-    package_version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"][
-        "version"
-    ]
-    assert _manifest_version(ROOT / "plugin.yaml") == package_version
-    assert (
-        _manifest_version(ROOT / "plugins/memory/cashew/plugin.yaml") == package_version
-    )
+def test_release_workflow_syncs_both_manifests_from_pyproject() -> None:
+    release = (ROOT / ".github/workflows/release.yml").read_text()
+    assert re.search(r"VERSION=.*\^version = .*pyproject\.toml", release, re.MULTILINE)
+    assert "for f in plugin.yaml plugins/memory/cashew/plugin.yaml" in release
+    assert 'sed -i "s/^version: .*/version: ${VERSION}/" "$f"' in release
 
 
 def test_documented_config_surface_matches_runtime() -> None:

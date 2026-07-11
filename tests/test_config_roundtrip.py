@@ -174,6 +174,16 @@ def test_resolve_db_path_allows_nested_profile_path(tmp_path):
     assert resolve_db_path(tmp_path, "nested/cashew/brain.db") == expected
 
 
+def test_cron_script_db_path_uses_profile_isolation_guard(tmp_path):
+    """The standalone cron path must reject the same escapes as the provider."""
+    from plugins.memory.cashew.sleep_cron_script import _resolve_db_path
+
+    with pytest.raises(ValueError, match="must stay within hermes_home"):
+        _resolve_db_path(tmp_path, {"cashew_db_path": "../outside.db"})
+
+    assert _resolve_db_path(tmp_path, {}) == str(tmp_path / "cashew" / "brain.db")
+
+
 def test_load_config_returns_defaults_when_file_absent(tmp_path):
     """No cashew.json → defaults for all 30 keys. No exception."""
     cfg = load_config(tmp_path)

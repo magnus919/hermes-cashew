@@ -374,6 +374,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         self._sync_queue: queue.Queue | None = None
         self._session_id: str = ""
         self._sync_worker: "threading.Thread | None" = None
+        # Serializes producer admission with sentinel insertion so no turn can
+        # race behind the shutdown sentinel and remain unprocessed.
+        self._sync_state_lock = threading.Lock()
         # Non-daemon worker that drains _sync_queue. Started in
         # initialize() only on happy path. Joined in shutdown()
         # with bounded timeout.
@@ -398,10 +401,12 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         # _register_sleep_cron(), cleared in shutdown(). None when
         # sleep scheduling is disabled or registration failed.
         self._sleep_cron_job_id: str | None = None
-        # Shutdown flag: set by shutdown() before the sentinel is posted, and
-        # checked by _drain_once to abort early if the interpreter is shutting
-        # down (avoids RuntimeError from sentence-transformers' atexit handler
-        # racing with Python's shutdown sequence).
+        # Stop accepting new turns once shutdown begins while allowing turns
+        # already ahead of the sentinel to drain normally.
+        self._shutdown_started = threading.Event()
+        # Interpreter-finalization flag: set only after sentence-transformers
+        # reports that Python's atexit sequence has begun. Unlike normal
+        # shutdown, this is unrecoverable and remaining queued turns must stop.
         self._shutdown_flag = threading.Event()
 
     @property
@@ -459,9 +464,12 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         self._session_id = session_id
         self._hermes_home = pathlib.Path(kwargs["hermes_home"])
         # Queue is created here so config-driven sizing/timeout values are wired in.
-        # The non-daemon worker thread drains it (see CLAUDE.md ### Threading Rule).
+        # The daemon worker thread drains it and receives a bounded flush during
+        # provider shutdown.
         self._sync_queue = queue.Queue(maxsize=16)
-        # Reset shutdown flag — a prior shutdown() may have set it.
+        # Reset lifecycle flags — a provider instance may be initialized again
+        # after a prior shutdown.
+        self._shutdown_started.clear()
         self._shutdown_flag.clear()
         with trace_operation("cashew.initialize") as span:
             span.set_attribute("session_id", session_id)
@@ -536,10 +544,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._sync_worker = None
 
     def _start_sync_worker(self) -> None:
-        """Launch the non-daemon worker. Called from initialize() only on happy path.
+        """Launch the daemon worker. Called from initialize() only on happy path.
 
         MUST run AFTER self._db_path / self._session_id / self._sync_queue are set.
-        daemon=False is load-bearing (see CLAUDE.md Threading Rule).
+        The shutdown sentinel and bounded join provide the normal drain path;
+        daemon=True prevents a wedged dependency from blocking interpreter exit.
         """
         self._sync_worker = threading.Thread(
             target=self._worker_loop,
@@ -688,35 +697,37 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         Half-state (_sync_queue is None) is a silent no-op.
         """
-        # Buffer assistant content for queue_prefetch cue extraction.
-        # Must happen BEFORE the half-state guard so the most recent turn's
-        # assistant content is always available, even if the queue is not.
-        if assistant_content:
-            self._last_assistant = assistant_content
-        if self._sync_queue is None:
-            return  # not initialized or silent-degraded; no worker to feed
-        turn = (user_content, assistant_content, session_id)
-        try:
-            self._sync_queue.put_nowait(turn)
-        except queue.Full:
-            # Drop-oldest policy.
+        with self._sync_state_lock:
+            if self._shutdown_started.is_set() or self._sync_queue is None:
+                return
+            # Buffer assistant content for queue_prefetch cue extraction only
+            # after the turn has been admitted.
+            if assistant_content:
+                self._last_assistant = assistant_content
+            q = self._sync_queue
+            turn = (user_content, assistant_content, session_id)
             try:
-                self._sync_queue.get_nowait()
-                self._sync_queue.task_done()  # balance the drop (exactly once)
-            except queue.Empty:
-                pass  # worker drained between Full and get_nowait — rare race; no-op
-            self._dropped_turn_count += 1
-            _METRICS.record_sync_dropped()
-            logger.warning(
-                "cashew sync queue overflow (maxsize=%d); dropped oldest turn",
-                self._sync_queue.maxsize,
-            )
-            try:
-                self._sync_queue.put_nowait(turn)
+                q.put_nowait(turn)
             except queue.Full:
+                # Drop-oldest policy.
+                try:
+                    q.get_nowait()
+                    q.task_done()  # balance the drop (exactly once)
+                except queue.Empty:
+                    pass  # worker drained between Full and get_nowait — rare race
+                self._dropped_turn_count += 1
+                _METRICS.record_sync_dropped()
                 logger.warning(
-                    "cashew sync queue still full after drop-oldest; dropping new turn"
+                    "cashew sync queue overflow (maxsize=%d); dropped oldest turn",
+                    q.maxsize,
                 )
+                try:
+                    q.put_nowait(turn)
+                except queue.Full:
+                    logger.warning(
+                        "cashew sync queue still full after drop-oldest; "
+                        "dropping new turn"
+                    )
 
     def _worker_loop(self) -> None:
         """Background drain loop. Entry point for self._sync_worker.
@@ -1002,11 +1013,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         user, assistant, session_id = turn
 
-        # Short-circuit if shutdown is in progress — the interpreter's atexit
-        # handlers may have already finalized the embedding model's thread pool,
-        # and calling end_session would raise RuntimeError from sentence-transformers.
+        # Short-circuit only after Python interpreter finalization has been
+        # observed. Normal provider shutdown must drain accepted turns.
         if self._shutdown_flag.is_set():
-            logger.debug("cashew sync: shutdown flag set, dropping turn")
+            logger.debug("cashew sync: interpreter shutdown flag set, dropping turn")
             return
 
         import sqlite3
@@ -1265,9 +1275,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
     def on_session_end(self, messages: list) -> None:
         """Session boundary notification.
 
-        Does NOT drain the sync queue — the background worker is non-daemon and
-        keeps running across session boundaries. Data-loss protection is handled
-        by shutdown(), which posts a sentinel and bounded-joins the worker.
+        Does NOT drain the sync queue — the background worker keeps running across
+        session boundaries. Data-loss protection is handled by shutdown(), which
+        stops producers, posts a sentinel, and bounded-joins the worker.
 
         Sleep cycle processing is handled by a Hermes cron job.
         See ``sleep_schedule`` in cashew.json.
@@ -1292,19 +1302,20 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             return  # safe no-op: initialize() was never called
         _METRICS.emit()
         timeout = self._config.sync_queue_timeout if self._config is not None else 30.0
-        # Signal shutdown BEFORE the sentinel so _drain_once can short-circuit
-        # even if the sentinel is still queued behind pending turns.
-        self._shutdown_flag.set()
-        # Post sentinel. put_nowait first; if somehow full, try a brief blocking put.
-        try:
-            self._sync_queue.put_nowait(_SHUTDOWN)
-        except queue.Full:
+        # Atomically stop new producers and post the sentinel. Items already in
+        # the queue remain ahead of it and receive a bounded opportunity to
+        # persist before the worker exits.
+        with self._sync_state_lock:
+            self._shutdown_started.set()
             try:
-                self._sync_queue.put(_SHUTDOWN, block=True, timeout=1.0)
+                self._sync_queue.put_nowait(_SHUTDOWN)
             except queue.Full:
-                logger.warning(
-                    "cashew shutdown: could not post sentinel; worker may leak"
-                )
+                try:
+                    self._sync_queue.put(_SHUTDOWN, block=True, timeout=1.0)
+                except queue.Full:
+                    logger.warning(
+                        "cashew shutdown: could not post sentinel; worker may leak"
+                    )
         # Bounded join. Never raise.
         if self._sync_worker is not None:
             self._sync_worker.join(timeout=timeout)

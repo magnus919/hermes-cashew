@@ -80,6 +80,36 @@ DEFAULTS: dict[str, Any] = {
     },
 }
 
+# Retained for backwards-compatible parsing only. cashew-brain 1.x exposes no
+# supported per-call or service configuration contract for these historical
+# adapter knobs, so advertising them would imply behavior the plugin cannot
+# deliver. Non-default legacy values produce a startup warning.
+UNSUPPORTED_TUNING_KEYS: frozenset[str] = frozenset(
+    {
+        "default_domain",
+        "auto_classify",
+        "domain_classifications",
+        "domain_separation_enabled",
+        "token_budget",
+        "walk_depth",
+        "similarity_threshold",
+        "access_weight",
+        "temporal_weight",
+        "clustering_eps",
+        "clustering_min_samples",
+        "novelty_threshold",
+        "max_think_iterations",
+        "think_cycle_nodes",
+        "gc_mode",
+        "gc_threshold",
+        "gc_grace_days",
+        "gc_protect_types",
+        "gc_think_cycle_penalty",
+        "decay_pruning",
+        "pattern_detection",
+    }
+)
+
 
 @dataclasses.dataclass(frozen=True)
 class CashewConfig:
@@ -448,7 +478,7 @@ def get_config_schema() -> list[dict[str, Any]]:
             "env_var": "",
         },
     ]
-    return schema
+    return [field for field in schema if field["key"] not in UNSUPPORTED_TUNING_KEYS]
 
 
 _PROVIDER_ENV_MAP: dict[str, str] = {
@@ -728,6 +758,16 @@ def load_config(hermes_home: str | os.PathLike[str]) -> CashewConfig:
                 logger.warning(
                     "Invalid value for %s (%s), skipping: %r", key, env_name, env_val
                 )
+
+    unsupported_overrides = sorted(
+        key for key in UNSUPPORTED_TUNING_KEYS if merged.get(key) != DEFAULTS[key]
+    )
+    if unsupported_overrides:
+        logger.warning(
+            "Ignoring unsupported legacy Cashew settings: %s. "
+            "These keys are retained only for config-file compatibility.",
+            ", ".join(unsupported_overrides),
+        )
 
     known = {f.name for f in dataclasses.fields(CashewConfig)}
     filtered = {k: v for k, v in merged.items() if k in known}

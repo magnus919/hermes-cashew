@@ -18,6 +18,7 @@ from plugins.memory.cashew.config import (
     _PROVIDER_ENV_MAP,
     DEFAULTS,
     ENV_VAR_MAP,
+    UNSUPPORTED_TUNING_KEYS,
     CashewConfig,
     _env_var_name,
     get_ai_domain,
@@ -88,9 +89,9 @@ def test_get_config_schema_shape_is_list_of_field_descriptors():
     """CONF-01 + CONFIG-07: schema returns ~30 field descriptors for hermes memory setup."""
     schema = get_config_schema()
     assert isinstance(schema, list)
-    assert len(schema) == EXPECTED_KEY_COUNT
+    assert len(schema) == EXPECTED_KEY_COUNT - len(UNSUPPORTED_TUNING_KEYS)
     keys = {f["key"] for f in schema}
-    assert keys == set(DEFAULTS.keys())
+    assert keys == set(DEFAULTS) - UNSUPPORTED_TUNING_KEYS
     for field in schema:
         assert "key" in field
         assert "description" in field and len(field["description"]) >= 20, (
@@ -601,3 +602,24 @@ def test_resolve_model_fn_missing_base_url_uses_provider_map(tmp_path, monkeypat
     assert "https://opencode.ai/zen/v1" in captured, (
         f"Expected opencode-zen base_url in closure, got: {captured}"
     )
+
+
+def test_setup_schema_excludes_unsupported_legacy_tuning_keys():
+    from plugins.memory.cashew.config import UNSUPPORTED_TUNING_KEYS, get_config_schema
+
+    advertised = {field["key"] for field in get_config_schema()}
+    assert advertised.isdisjoint(UNSUPPORTED_TUNING_KEYS)
+
+
+def test_non_default_legacy_tuning_value_warns(tmp_path, caplog):
+    import json
+    import logging
+
+    from plugins.memory.cashew.config import load_config
+
+    (tmp_path / "cashew.json").write_text(json.dumps({"walk_depth": 99}))
+    with caplog.at_level(logging.WARNING, logger="plugins.memory.cashew.config"):
+        config = load_config(tmp_path)
+
+    assert config.walk_depth == 99
+    assert "Ignoring unsupported legacy Cashew settings: walk_depth" in caplog.text

@@ -7,6 +7,7 @@ import os
 import pathlib
 import queue
 import sqlite3
+import tempfile
 import threading
 import time
 from typing import Any, Callable, Dict, List
@@ -194,17 +195,37 @@ def _ensure_auxiliary_memory(hermes_home: pathlib.Path) -> None:
     if base_url:
         memory_config["base_url"] = base_url
 
-    if "auxiliary" not in data:
-        data["auxiliary"] = {}
-    data["auxiliary"]["memory"] = memory_config
-
     try:
-        config_path.write_text(
-            yaml.safe_dump(
-                data, default_flow_style=False, sort_keys=False, allow_unicode=True
-            ),
-            encoding="utf-8",
-        )
+        if "auxiliary" in data:
+            from utils import atomic_roundtrip_yaml_update
+
+            atomic_roundtrip_yaml_update(config_path, "auxiliary.memory", memory_config)
+        else:
+            fragment = yaml.safe_dump(
+                {"auxiliary": {"memory": memory_config}},
+                default_flow_style=False,
+                sort_keys=False,
+                allow_unicode=True,
+            )
+            separator = "" if not raw or raw.endswith("\n\n") else "\n"
+            updated = raw + separator + fragment
+            mode = config_path.stat().st_mode
+            fd, staged_name = tempfile.mkstemp(
+                dir=config_path.parent,
+                prefix=".config_",
+                suffix=".yaml.tmp",
+            )
+            staged = pathlib.Path(staged_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(updated)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                staged.chmod(mode)
+                staged.replace(config_path)
+            except BaseException:
+                staged.unlink(missing_ok=True)
+                raise
         logger.info(
             "auto-populated auxiliary.memory from main model config: "
             "provider=%s model=%s",

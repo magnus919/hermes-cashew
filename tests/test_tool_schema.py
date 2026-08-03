@@ -79,9 +79,15 @@ def test_valid_args_pass_jsonschema_validation():
     jsonschema = pytest.importorskip("jsonschema")
     jsonschema.validate({"query": "hello"}, CASHEW_QUERY_SCHEMA["parameters"])
     jsonschema.validate(
-        {"query": "hello", "max_nodes": 5},
+        {"query": "hello", "max_nodes": 5, "domain": "work", "tag": "project:x"},
         CASHEW_QUERY_SCHEMA["parameters"],
     )
+
+
+def test_schema_exposes_implemented_positive_filters():
+    props = CASHEW_QUERY_SCHEMA["parameters"]["properties"]
+    assert props["domain"]["type"] == "string"
+    assert props["tag"]["type"] == "string"
 
 
 def test_missing_query_fails_jsonschema_validation():
@@ -121,5 +127,9 @@ def test_provider_get_tool_schemas_returns_single_cashew_query_schema():
     callers must not mutate them.
     """
     schemas = CashewMemoryProvider().get_tool_schemas()
-    assert len(schemas) == 2, "Phase 4 expects two schemas: cashew_query + cashew_extract"
-    assert schemas[0] is CASHEW_QUERY_SCHEMA, "get_tool_schemas must return the module constant, not a copy"
+    assert len(schemas) == 2, (
+        "Phase 4 expects two schemas: cashew_query + cashew_extract"
+    )
+    assert schemas[0] is CASHEW_QUERY_SCHEMA, (
+        "get_tool_schemas must return the module constant, not a copy"
+    )

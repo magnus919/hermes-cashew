@@ -5,16 +5,15 @@ that stores conversation context in a local [Cashew](https://github.com/rajkripa
 thought graph with semantic search and automatic context recall. Get from zero to
 a working install in under five minutes.
 
-**v0.9.0** auto-generates `cashew.json` with defaults on first load, enables
-LLM-powered extraction by default (no manual `auxiliary.memory` setup), and
-adds forest-level insight extraction via `on_pre_compress`. **v0.8.0**
-re-enabled the sleep cycle with a ground-up refactored implementation —
-vectorized cross-linking, batched DB writes, ~4s at 7K nodes.
+The plugin auto-generates `cashew.json` with defaults on first load, enables
+LLM-powered extraction by default (no manual `auxiliary.memory` setup), adds
+forest-level insight extraction via `on_pre_compress`, and runs graph
+consolidation on a persistent Hermes cron schedule.
 
 ## Prerequisites
 
 - [Hermes Agent](https://github.com/nousresearch/hermes-agent) installed
-- `cashew-brain>=1.0.0` — installed automatically by `hermes plugins install`
+- `cashew-brain>=1.1.0,<2.0.0` — installed automatically by `hermes plugins install`
 - `sqlite-vec` — enables vector similarity search. Installed automatically.
 
 ## Install
@@ -47,8 +46,10 @@ hermes memory setup
 
 ## Zero-Config Startup
 
-hermes-cashew works out of the box — all 32 configuration keys have sane
-defaults. On first agent startup, the plugin auto-generates `~/.hermes/cashew.json`
+hermes-cashew works out of the box — all 37 persisted configuration fields have
+sane defaults. The interactive setup advertises the 16 fields backed by current
+runtime behavior; legacy tuning fields remain readable for compatibility. On
+first agent startup, the plugin auto-generates `~/.hermes/cashew.json`
 with the full default configuration and auto-populates `auxiliary.memory` in
 Hermes `config.yaml` from the main model config, so LLM-powered extraction
 is active without any manual setup.
@@ -84,9 +85,6 @@ EOF
 | Key | Default | Description |
 |-----|---------|-------------|
 | `recall_k` | `5` | Context fragments returned per query |
-| `similarity_threshold` | `0.3` | Minimum similarity for BFS graph walk |
-| `walk_depth` | `2` | Graph BFS traversal depth |
-| `token_budget` | `2000` | Max tokens per context injection |
 | `prefetch_k` | `3` | Nodes to pre-warm into context on each turn |
 | `prefetch_cues` | `3` | Cue phrases to send to LLM for prefetch generation |
 
@@ -96,10 +94,6 @@ EOF
 |-----|---------|-------------|
 | `user_domain` | `user` | Domain label for user messages |
 | `ai_domain` | `ai` | Domain label for AI messages |
-| `default_domain` | `general` | Fallback domain for unclassified content |
-| `auto_classify` | `true` | Auto-classify nodes into domains |
-| `domain_classifications` | `["personal", "work", "projects", "learning", "system"]` | Available domain labels |
-| `domain_separation_enabled` | `true` | Enforce domain boundaries in retrieval |
 
 #### Sleep Cycle
 
@@ -110,30 +104,13 @@ EOF
 | `sleep_max_nodes` | `2000` | Max nodes per sleep cycle tick |
 | `think_cycles` | `true` | Enable periodic insight generation (think cycle) |
 | `think_interval` | `10` | Turns between think cycle runs (0 = disable) |
-| `think_cycle_nodes` | `5` | Node clusters per think cycle |
-| `max_think_iterations` | `3` | Max iterative refinements per think cycle |
-| `novelty_threshold` | `0.82` | Minimum novelty score to surface an insight |
 
-#### Garbage Collection
+#### Legacy settings
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `gc_mode` | `soft` | `"soft"` or `"hard"` decay |
-| `gc_threshold` | `0.05` | Minimum importance score before decay |
-| `gc_grace_days` | `7` | Days before a node can be decayed |
-| `gc_protect_types` | `["seed", "core_memory"]` | Node types exempt from decay |
-| `gc_think_cycle_penalty` | `1.5` | Importance penalty multiplier for think-cycle nodes |
-| `decay_pruning` | `true` | Prune low-value nodes over time |
-| `pattern_detection` | `true` | Detect recurring patterns in extracted knowledge |
-
-#### Tuning
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `access_weight` | `0.2` | Weight of access count in importance scoring |
-| `temporal_weight` | `0.1` | Weight of recency in importance scoring |
-| `clustering_eps` | `0.35` | DBSCAN epsilon for think-cycle clustering |
-| `clustering_min_samples` | `3` | Minimum samples per cluster in think cycle |
+Older releases accepted additional retrieval, classification, clustering, and
+garbage-collection tuning keys that cashew-brain 1.x cannot consume through a
+supported API. They remain readable for file compatibility, but are no longer
+offered by `hermes memory setup`; non-default legacy values emit a startup warning.
 
 #### Feature Flags
 
@@ -166,7 +143,8 @@ Expected output shows `Provider: cashew` with `Plugin: installed` and `Status: a
 `hermes-cashew` provides two LLM-accessible tools:
 
 - **`cashew_query`** — searches the local thought graph for context relevant to
-  the current conversation. Uses sqlite-vec for semantic search.
+  the current conversation. Uses sqlite-vec for semantic search; optional
+  `domain`, `tag`, and `exclude_tags` filters narrow the result set.
 - **`cashew_extract`** — explicitly persists a conversation turn into the graph.
   The agent can call this when it judges a turn contains worth-remembering knowledge.
 

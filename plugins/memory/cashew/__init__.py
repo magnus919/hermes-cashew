@@ -7,6 +7,7 @@ import os
 import pathlib
 import queue
 import sqlite3
+import tempfile
 import threading
 import time
 from typing import Any, Callable, Dict, List
@@ -156,7 +157,7 @@ def _ensure_auxiliary_memory(hermes_home: pathlib.Path) -> None:
         return
 
     try:
-        import yaml  # type: ignore[import-untyped]
+        import yaml  # type: ignore[import-untyped, unused-ignore]
 
         raw = config_path.read_text(encoding="utf-8")
         data = yaml.safe_load(raw) or {}
@@ -194,17 +195,37 @@ def _ensure_auxiliary_memory(hermes_home: pathlib.Path) -> None:
     if base_url:
         memory_config["base_url"] = base_url
 
-    if "auxiliary" not in data:
-        data["auxiliary"] = {}
-    data["auxiliary"]["memory"] = memory_config
-
     try:
-        config_path.write_text(
-            yaml.safe_dump(
-                data, default_flow_style=False, sort_keys=False, allow_unicode=True
-            ),
-            encoding="utf-8",
-        )
+        if "auxiliary" in data:
+            from utils import atomic_roundtrip_yaml_update
+
+            atomic_roundtrip_yaml_update(config_path, "auxiliary.memory", memory_config)
+        else:
+            fragment = yaml.safe_dump(
+                {"auxiliary": {"memory": memory_config}},
+                default_flow_style=False,
+                sort_keys=False,
+                allow_unicode=True,
+            )
+            separator = "" if not raw or raw.endswith("\n\n") else "\n"
+            updated = raw + separator + fragment
+            mode = config_path.stat().st_mode
+            fd, staged_name = tempfile.mkstemp(
+                dir=config_path.parent,
+                prefix=".config_",
+                suffix=".yaml.tmp",
+            )
+            staged = pathlib.Path(staged_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(updated)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                staged.chmod(mode)
+                staged.replace(config_path)
+            except BaseException:
+                staged.unlink(missing_ok=True)
+                raise
         logger.info(
             "auto-populated auxiliary.memory from main model config: "
             "provider=%s model=%s",
@@ -373,10 +394,15 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         self._db_path: pathlib.Path | None = None
         self._sync_queue: queue.Queue | None = None
         self._session_id: str = ""
+        # Hermes permits user-memory writes only from the primary agent context.
+        # Unknown future contexts fail closed.
+        self._write_enabled: bool = True
         self._sync_worker: "threading.Thread | None" = None
-        # Non-daemon worker that drains _sync_queue. Started in
-        # initialize() only on happy path. Joined in shutdown()
-        # with bounded timeout.
+        # Serializes producer admission with sentinel insertion so no turn can
+        # race behind the shutdown sentinel and remain unprocessed.
+        self._sync_state_lock = threading.Lock()
+        # Daemon worker that drains _sync_queue. Started in initialize() only
+        # on the happy path and given a bounded drain during shutdown().
         self._dropped_turn_count: int = 0
         # Monotonic counter of drop-oldest events on the sync queue.
         # Incremented inside sync_turn's overflow branch each time a queued
@@ -390,7 +416,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         # background thread writes here; prefetch() atomically swaps it into
         # _warm_cache at the start of its call. This avoids concurrent access
         # between the daemon thread and the main agent loop.
-        self._prefetch_pending: str | None = None
+        self._prefetch_pending: tuple[int, str, list[str], str] | None = None
+        self._prefetch_generation: int = 0
         # Last assistant response, buffered from sync_turn for use by
         # queue_prefetch's LLM cue extraction.
         self._last_assistant: str = ""
@@ -398,10 +425,12 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         # _register_sleep_cron(), cleared in shutdown(). None when
         # sleep scheduling is disabled or registration failed.
         self._sleep_cron_job_id: str | None = None
-        # Shutdown flag: set by shutdown() before the sentinel is posted, and
-        # checked by _drain_once to abort early if the interpreter is shutting
-        # down (avoids RuntimeError from sentence-transformers' atexit handler
-        # racing with Python's shutdown sequence).
+        # Stop accepting new turns once shutdown begins while allowing turns
+        # already ahead of the sentinel to drain normally.
+        self._shutdown_started = threading.Event()
+        # Interpreter-finalization flag: set only after sentence-transformers
+        # reports that Python's atexit sequence has begun. Unlike normal
+        # shutdown, this is unrecoverable and remaining queued turns must stop.
         self._shutdown_flag = threading.Event()
 
     @property
@@ -458,10 +487,14 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             )
         self._session_id = session_id
         self._hermes_home = pathlib.Path(kwargs["hermes_home"])
+        self._write_enabled = kwargs.get("agent_context", "primary") == "primary"
         # Queue is created here so config-driven sizing/timeout values are wired in.
-        # The non-daemon worker thread drains it (see CLAUDE.md ### Threading Rule).
+        # The daemon worker thread drains it and receives a bounded flush during
+        # provider shutdown.
         self._sync_queue = queue.Queue(maxsize=16)
-        # Reset shutdown flag — a prior shutdown() may have set it.
+        # Reset lifecycle flags — a provider instance may be initialized again
+        # after a prior shutdown.
+        self._shutdown_started.clear()
         self._shutdown_flag.clear()
         with trace_operation("cashew.initialize") as span:
             span.set_attribute("session_id", session_id)
@@ -503,11 +536,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 # Runs AFTER the sync worker so the provider is fully initialized
                 # before any background work begins. Silently skips when the
                 # Hermes cron module is not available (e.g. CI, standalone tests).
-                if (
-                    self._config.sleep_cycles
-                    and self._config.sleep_schedule
-                    and _HAS_HERMES_CRON
-                ):
+                if self._write_enabled and _HAS_HERMES_CRON:
                     self._register_sleep_cron()
                 set_plugin_context(
                     session_id=session_id,
@@ -536,10 +565,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._sync_worker = None
 
     def _start_sync_worker(self) -> None:
-        """Launch the non-daemon worker. Called from initialize() only on happy path.
+        """Launch the daemon worker. Called from initialize() only on happy path.
 
         MUST run AFTER self._db_path / self._session_id / self._sync_queue are set.
-        daemon=False is load-bearing (see CLAUDE.md Threading Rule).
+        The shutdown sentinel and bounded join provide the normal drain path;
+        daemon=True prevents a wedged dependency from blocking interpreter exit.
         """
         self._sync_worker = threading.Thread(
             target=self._worker_loop,
@@ -551,64 +581,48 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
     # ── Sleep cycle cron scheduling ──────────────────────────────────────
 
     def _register_sleep_cron(self) -> None:
-        """Install the cron script and register a no_agent cron job.
-
-        Called from initialize() only on the happy path.  Safe to call
-        multiple times — if a job is already registered for this provider
-        instance, the call is a no-op.
-
-        The cron job persists across session boundaries (survives shutdown)
-        so the 12h schedule isn't reset on every session start.
-        """
-        if self._sleep_cron_job_id is not None:
-            return  # already registered for this instance
-
+        """Reconcile the persistent cron job and managed script with config."""
         if self._hermes_home is None or self._config is None:
             return
-
-        # Scan for an existing sleep cron job by name.
-        # If one exists, adopt its ID and skip registration so the
-        # original 12h timer isn't reset. Without this, every session
-        # start would remove-and-re-register the job, resetting the
-        # schedule and preventing it from ever firing.
         try:
-            from cron.jobs import list_jobs
+            from cron.jobs import create_job, list_jobs, remove_job
 
-            for job in list_jobs():
-                if job.get("name") == "cashew-sleep-cycle":
-                    self._sleep_cron_job_id = job["id"]
-                    logger.info(
-                        "sleep: adopted existing cron job %s (preserving schedule)",
-                        job["id"],
-                    )
-                    return  # keep the existing job running
-        except ImportError:
-            logger.debug("sleep: cron module not available — cannot adopt")
-        except Exception:
-            logger.warning("sleep: failed to adopt existing cron job", exc_info=True)
+            existing = [
+                job for job in list_jobs() if job.get("name") == "cashew-sleep-cycle"
+            ]
+            desired_schedule = self._config.sleep_schedule
+            enabled = self._config.sleep_cycles and bool(desired_schedule)
+            if not enabled:
+                for job in existing:
+                    remove_job(job["id"])
+                self._sleep_cron_job_id = None
+                return
 
-        try:
-            # Read the cron script source from disk and install it.
             script_source = (
                 pathlib.Path(__file__).parent / "sleep_cron_script.py"
             ).read_text()
-
-            # Install the script to $HERMES_HOME/scripts/
             script_dest = self._hermes_home / "scripts" / "cashew-sleep-cycle.py"
             script_dest.parent.mkdir(parents=True, exist_ok=True)
-            if not script_dest.exists():
-                script_dest.write_text(script_source)
-                script_dest.chmod(0o755)
-                logger.info("sleep: installed cron script to %s", script_dest)
-            else:
-                logger.debug("sleep: cron script already exists at %s", script_dest)
+            if not script_dest.exists() or script_dest.read_text() != script_source:
+                staged = script_dest.with_suffix(".py.tmp")
+                staged.write_text(script_source)
+                staged.chmod(0o755)
+                staged.replace(script_dest)
+                logger.info("sleep: refreshed cron script at %s", script_dest)
 
-            # Register via the Hermes cron API.
-            from cron.jobs import create_job
+            matching = [
+                job for job in existing if job.get("schedule") == desired_schedule
+            ]
+            if len(existing) == 1 and len(matching) == 1:
+                self._sleep_cron_job_id = matching[0]["id"]
+                return
+
+            for job in existing:
+                remove_job(job["id"])
 
             job = create_job(
                 prompt="hermes-cashew sleep cycle",
-                schedule=self._config.sleep_schedule,
+                schedule=desired_schedule,
                 name="cashew-sleep-cycle",
                 script="cashew-sleep-cycle.py",
                 no_agent=True,
@@ -618,7 +632,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             logger.info(
                 "sleep: registered cron job %s (schedule=%s)",
                 job["id"],
-                self._config.sleep_schedule,
+                desired_schedule,
             )
         except ImportError:
             logger.warning(
@@ -688,35 +702,43 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         Half-state (_sync_queue is None) is a silent no-op.
         """
-        # Buffer assistant content for queue_prefetch cue extraction.
-        # Must happen BEFORE the half-state guard so the most recent turn's
-        # assistant content is always available, even if the queue is not.
-        if assistant_content:
-            self._last_assistant = assistant_content
-        if self._sync_queue is None:
-            return  # not initialized or silent-degraded; no worker to feed
-        turn = (user_content, assistant_content, session_id)
-        try:
-            self._sync_queue.put_nowait(turn)
-        except queue.Full:
-            # Drop-oldest policy.
+        if (
+            not self._write_enabled
+            or self._config is None
+            or not self._config.auto_extraction
+        ):
+            return
+        with self._sync_state_lock:
+            if self._shutdown_started.is_set() or self._sync_queue is None:
+                return
+            # Buffer assistant content for queue_prefetch cue extraction only
+            # after the turn has been admitted.
+            if assistant_content:
+                self._last_assistant = assistant_content
+            q = self._sync_queue
+            turn = (user_content, assistant_content, session_id)
             try:
-                self._sync_queue.get_nowait()
-                self._sync_queue.task_done()  # balance the drop (exactly once)
-            except queue.Empty:
-                pass  # worker drained between Full and get_nowait — rare race; no-op
-            self._dropped_turn_count += 1
-            _METRICS.record_sync_dropped()
-            logger.warning(
-                "cashew sync queue overflow (maxsize=%d); dropped oldest turn",
-                self._sync_queue.maxsize,
-            )
-            try:
-                self._sync_queue.put_nowait(turn)
+                q.put_nowait(turn)
             except queue.Full:
+                # Drop-oldest policy.
+                try:
+                    q.get_nowait()
+                    q.task_done()  # balance the drop (exactly once)
+                except queue.Empty:
+                    pass  # worker drained between Full and get_nowait — rare race
+                self._dropped_turn_count += 1
+                _METRICS.record_sync_dropped()
                 logger.warning(
-                    "cashew sync queue still full after drop-oldest; dropping new turn"
+                    "cashew sync queue overflow (maxsize=%d); dropped oldest turn",
+                    q.maxsize,
                 )
+                try:
+                    q.put_nowait(turn)
+                except queue.Full:
+                    logger.warning(
+                        "cashew sync queue still full after drop-oldest; "
+                        "dropping new turn"
+                    )
 
     def _worker_loop(self) -> None:
         """Background drain loop. Entry point for self._sync_worker.
@@ -964,7 +986,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         return "\n".join(lines)
 
     def _update_access_metrics(self, node_ids: list[str]) -> None:
-        if not node_ids:
+        if not self._write_enabled or not node_ids:
             return
         try:
             import sqlite3
@@ -1002,11 +1024,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         user, assistant, session_id = turn
 
-        # Short-circuit if shutdown is in progress — the interpreter's atexit
-        # handlers may have already finalized the embedding model's thread pool,
-        # and calling end_session would raise RuntimeError from sentence-transformers.
+        # Short-circuit only after Python interpreter finalization has been
+        # observed. Normal provider shutdown must drain accepted turns.
         if self._shutdown_flag.is_set():
-            logger.debug("cashew sync: shutdown flag set, dropping turn")
+            logger.debug("cashew sync: interpreter shutdown flag set, dropping turn")
             return
 
         import sqlite3
@@ -1048,6 +1069,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         if (
             self._model_fn is not None
             and self._config
+            and self._config.think_cycles
             and self._config.think_interval > 0
         ):
             counter = self._load_think_counter() + 1
@@ -1117,7 +1139,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         Silent-degrades to "" when no LLM is wired, insufficient exchanges,
         or any failure (never raises).
         """
-        if self._model_fn is None or self._db_path is None:
+        if not self._write_enabled or self._model_fn is None or self._db_path is None:
             return ""
 
         import json as _json
@@ -1265,15 +1287,33 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
     def on_session_end(self, messages: list) -> None:
         """Session boundary notification.
 
-        Does NOT drain the sync queue — the background worker is non-daemon and
-        keeps running across session boundaries. Data-loss protection is handled
-        by shutdown(), which posts a sentinel and bounded-joins the worker.
+        Does NOT drain the sync queue — the background worker keeps running across
+        session boundaries. Data-loss protection is handled by shutdown(), which
+        stops producers, posts a sentinel, and bounded-joins the worker.
 
         Sleep cycle processing is handled by a Hermes cron job.
         See ``sleep_schedule`` in cashew.json.
         """
         if self._sync_queue is None:
             return  # not initialized or silent-degraded
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """Rebind session identity and discard ephemeral context from the old session."""
+        del parent_session_id, reset, rewound, kwargs
+        with self._sync_state_lock:
+            self._session_id = str(new_session_id)
+            self._prefetch_generation += 1
+            self._warm_cache.clear()
+            self._prefetch_pending = None
+            self._last_assistant = ""
 
     def shutdown(self) -> None:
         """Post sentinel, bounded-join worker, clear references.
@@ -1283,7 +1323,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
           2. Post _SHUTDOWN sentinel to the queue. put_nowait first; fallback to
              a 1s blocking put if the queue is full (worker is draining fast).
           3. Bounded-join the worker using sync_queue_timeout. WARNING on timeout.
-          4. Clear _sync_queue, _sync_worker, _config, _db_path, _retriever.
+          4. Clear runtime state after the worker exits. If the bounded join
+             times out, a daemon cleanup watcher retains that state until the
+             worker actually finishes.
 
         _hermes_home is intentionally NOT reset — is_available() must keep
         reflecting on-disk reality.
@@ -1292,41 +1334,69 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             return  # safe no-op: initialize() was never called
         _METRICS.emit()
         timeout = self._config.sync_queue_timeout if self._config is not None else 30.0
-        # Signal shutdown BEFORE the sentinel so _drain_once can short-circuit
-        # even if the sentinel is still queued behind pending turns.
-        self._shutdown_flag.set()
-        # Post sentinel. put_nowait first; if somehow full, try a brief blocking put.
+        # Atomically stop new producers and capture the queue. Release the lock
+        # before the potentially blocking sentinel fallback: producers will see
+        # _shutdown_started and return without waiting on a full queue.
+        with self._sync_state_lock:
+            self._shutdown_started.set()
+            q = self._sync_queue
+            assert q is not None
+        # Items already in the queue remain ahead of the sentinel and receive a
+        # bounded opportunity to persist before the worker exits.
         try:
-            self._sync_queue.put_nowait(_SHUTDOWN)
+            q.put_nowait(_SHUTDOWN)
         except queue.Full:
             try:
-                self._sync_queue.put(_SHUTDOWN, block=True, timeout=1.0)
+                q.put(_SHUTDOWN, block=True, timeout=1.0)
             except queue.Full:
                 logger.warning(
                     "cashew shutdown: could not post sentinel; worker may leak"
                 )
         # Bounded join. Never raise.
-        if self._sync_worker is not None:
-            self._sync_worker.join(timeout=timeout)
-            if self._sync_worker.is_alive():
+        worker = self._sync_worker
+        if worker is not None:
+            worker.join(timeout=timeout)
+            if worker.is_alive():
                 logger.warning(
                     "cashew sync worker did not exit within %ss; abandoning",
                     timeout,
                 )
-        # Sleep cycle cron job is intentionally NOT removed here.
-        # It persists across session boundaries so the 12h schedule
-        # isn't reset on every session start. The next initialize()
-        # will adopt the existing job if one exists.
-        self._sleep_cron_job_id = None  # clear instance tracking only
-        # Clear state. _hermes_home persists (see is_available() contract).
-        self._sync_queue = None
-        self._sync_worker = None
-        self._config = None
-        self._db_path = None
-        self._retriever = None
-        self._warm_cache.clear()
-        self._prefetch_pending = None
-        self._last_assistant = ""
+                cleanup = threading.Thread(
+                    target=self._clear_state_after_worker_exit,
+                    args=(worker,),
+                    daemon=True,
+                    name=f"cashew-shutdown-{self._session_id}",
+                )
+                cleanup.start()
+                return
+        self._clear_runtime_state(worker)
+
+    def _clear_state_after_worker_exit(self, worker: threading.Thread) -> None:
+        """Keep worker dependencies alive until a timed-out drain completes."""
+        worker.join()
+        self._clear_runtime_state(worker)
+
+    def _clear_runtime_state(self, worker: threading.Thread | None) -> None:
+        """Clear provider state if it still belongs to the exiting worker."""
+        with self._sync_state_lock:
+            if worker is not None and self._sync_worker is not worker:
+                return
+            # Sleep cycle cron job is intentionally NOT removed here.
+            # It persists across session boundaries so the 12h schedule
+            # isn't reset on every session start. The next initialize()
+            # will adopt the existing job if one exists.
+            self._sleep_cron_job_id = None  # clear instance tracking only
+            # Clear state. _hermes_home persists (see is_available() contract).
+            self._sync_queue = None
+            self._sync_worker = None
+            self._config = None
+            self._db_path = None
+            self._retriever = None
+            self._model_fn = None
+            self._warm_cache.clear()
+            self._prefetch_generation += 1
+            self._prefetch_pending = None
+            self._last_assistant = ""
         logger.debug("cashew provider shutdown complete")
 
     def _parallel_retrieve(
@@ -1404,12 +1474,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         """
         if self._config is None:
             return ""
-        # Atomically swap in any background-prefetched results
-        pending = self._prefetch_pending
-        if pending is not None:
-            self._prefetch_pending = None
-            # Store under the raw query so the matching logic below can find it
-            self._warm_cache[query] = pending
+        requested_session = str(kwargs.get("session_id") or self._session_id)
+        self._warm_cache.update(self._consume_prefetch_pending(requested_session))
         # Warm cache fast path: check if a cached cue matches the query.
         if self._warm_cache:
             query_lower = query.lower()
@@ -1418,16 +1484,20 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     continue
                 cue_lower = cue.lower()
                 if cue_lower in query_lower or query_lower in cue_lower:
-                    logger.info("prefetch warm cache HIT: cue=%r query=%r", cue, query)
+                    logger.info(
+                        "prefetch warm cache HIT: cue_len=%d query_len=%d",
+                        len(cue),
+                        len(query),
+                    )
                     self._warm_cache.clear()
                     return ctx
                 cue_words = set(w for w in cue_lower.split() if len(w) > 3)
                 query_words = set(w for w in query_lower.split() if len(w) > 3)
                 if len(cue_words & query_words) >= 2:
                     logger.info(
-                        "prefetch warm cache HIT: cue=%r query=%r (word overlap)",
-                        cue,
-                        query,
+                        "prefetch warm cache HIT: cue_len=%d query_len=%d (word overlap)",
+                        len(cue),
+                        len(query),
                     )
                     self._warm_cache.clear()
                     return ctx
@@ -1481,7 +1551,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     return self._format_context(nodes)
             except Exception:
                 logger.warning(
-                    "cashew recall failed for query=%r", query, exc_info=True
+                    "cashew recall failed (query_len=%d)", len(query), exc_info=True
                 )
         return ""
 
@@ -1505,7 +1575,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         """
         if self._config is None:
             return
-        self._prefetch_pending = None  # clear any stale results
+        effective_session = str(session_id or self._session_id)
+        with self._sync_state_lock:
+            self._prefetch_generation += 1
+            generation = self._prefetch_generation
+            self._prefetch_pending = None
         if not query:
             logger.debug("queue_prefetch: empty query, no warmup")
             return
@@ -1558,8 +1632,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
                 if all_nodes:
                     ctx = self._format_context(all_nodes)
-                    # Stage results for the next prefetch to pick up
-                    self._prefetch_pending = ctx
+                    self._stage_prefetch_result(
+                        generation, effective_session, cues, ctx
+                    )
                     logger.info(
                         "queue_prefetch: cached %d result(s) from %d cue(s) for next turn",
                         len(all_nodes),
@@ -1576,6 +1651,31 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             name=f"cashew-prefetch-{self._session_id}",
         )
         t.start()
+
+    def _stage_prefetch_result(
+        self, generation: int, session_id: str, cues: list[str], context: str
+    ) -> None:
+        """Publish a warmup result only if its request is still current."""
+        with self._sync_state_lock:
+            if (
+                generation != self._prefetch_generation
+                or session_id != self._session_id
+            ):
+                return
+            self._prefetch_pending = (generation, session_id, list(cues), context)
+
+    def _consume_prefetch_pending(self, session_id: str) -> dict[str, str]:
+        """Atomically consume a current result, retaining its source cues."""
+        with self._sync_state_lock:
+            pending = self._prefetch_pending
+            self._prefetch_pending = None
+            current_generation = self._prefetch_generation
+        if pending is None:
+            return {}
+        generation, result_session, cues, context = pending
+        if generation != current_generation or result_session != session_id:
+            return {}
+        return {cue: context for cue in cues}
 
     def _extract_prefetch_cues(self, query: str) -> list[str]:
         """Use the auxiliary LLM to extract concrete search cues from the turn.
@@ -1770,7 +1870,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         elif name == "cashew_extract":
             # Half-state guard. No log — initialize() already warned when it
             # set _db_path / _config to None.
-            if self._db_path is None or self._config is None:
+            if not self._write_enabled or self._db_path is None or self._config is None:
                 return build_extract_error_envelope()
             try:
                 user = args["user_content"]  # KeyError caught below — tool-call failure

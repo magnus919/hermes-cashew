@@ -18,6 +18,7 @@ from plugins.memory.cashew.config import (
     _PROVIDER_ENV_MAP,
     DEFAULTS,
     ENV_VAR_MAP,
+    UNSUPPORTED_TUNING_KEYS,
     CashewConfig,
     _env_var_name,
     get_ai_domain,
@@ -88,9 +89,9 @@ def test_get_config_schema_shape_is_list_of_field_descriptors():
     """CONF-01 + CONFIG-07: schema returns ~30 field descriptors for hermes memory setup."""
     schema = get_config_schema()
     assert isinstance(schema, list)
-    assert len(schema) == EXPECTED_KEY_COUNT
+    assert len(schema) == EXPECTED_KEY_COUNT - len(UNSUPPORTED_TUNING_KEYS)
     keys = {f["key"] for f in schema}
-    assert keys == set(DEFAULTS.keys())
+    assert keys == set(DEFAULTS) - UNSUPPORTED_TUNING_KEYS
     for field in schema:
         assert "key" in field
         assert "description" in field and len(field["description"]) >= 20, (
@@ -149,6 +150,39 @@ def test_resolve_db_path_rejects_absolute_paths(tmp_path):
     with pytest.raises(ValueError) as exc:
         resolve_db_path(tmp_path, "/etc/passwd")
     assert "/etc/passwd" in str(exc.value)
+
+
+def test_resolve_db_path_rejects_parent_traversal(tmp_path):
+    """CONF-04: relative paths must not traverse above hermes_home."""
+    with pytest.raises(ValueError, match="must stay within hermes_home"):
+        resolve_db_path(tmp_path, "../outside.db")
+
+
+def test_resolve_db_path_rejects_symlink_escape(tmp_path):
+    """CONF-04: an in-profile symlink must not redirect the DB outside."""
+    outside = tmp_path.parent / "outside"
+    outside.mkdir(exist_ok=True)
+    (tmp_path / "linked").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="must stay within hermes_home"):
+        resolve_db_path(tmp_path, "linked/brain.db")
+
+
+def test_resolve_db_path_allows_nested_profile_path(tmp_path):
+    """CONF-03: ordinary nested paths still resolve below hermes_home."""
+    expected = tmp_path / "nested" / "cashew" / "brain.db"
+
+    assert resolve_db_path(tmp_path, "nested/cashew/brain.db") == expected
+
+
+def test_cron_script_db_path_uses_profile_isolation_guard(tmp_path):
+    """The standalone cron path must reject the same escapes as the provider."""
+    from plugins.memory.cashew.sleep_cron_script import _resolve_db_path
+
+    with pytest.raises(ValueError, match="must stay within hermes_home"):
+        _resolve_db_path(tmp_path, {"cashew_db_path": "../outside.db"})
+
+    assert _resolve_db_path(tmp_path, {}) == str(tmp_path / "cashew" / "brain.db")
 
 
 def test_load_config_returns_defaults_when_file_absent(tmp_path):
@@ -568,3 +602,24 @@ def test_resolve_model_fn_missing_base_url_uses_provider_map(tmp_path, monkeypat
     assert "https://opencode.ai/zen/v1" in captured, (
         f"Expected opencode-zen base_url in closure, got: {captured}"
     )
+
+
+def test_setup_schema_excludes_unsupported_legacy_tuning_keys():
+    from plugins.memory.cashew.config import UNSUPPORTED_TUNING_KEYS, get_config_schema
+
+    advertised = {field["key"] for field in get_config_schema()}
+    assert advertised.isdisjoint(UNSUPPORTED_TUNING_KEYS)
+
+
+def test_non_default_legacy_tuning_value_warns(tmp_path, caplog):
+    import json
+    import logging
+
+    from plugins.memory.cashew.config import load_config
+
+    (tmp_path / "cashew.json").write_text(json.dumps({"walk_depth": 99}))
+    with caplog.at_level(logging.WARNING, logger="plugins.memory.cashew.config"):
+        config = load_config(tmp_path)
+
+    assert config.walk_depth == 99
+    assert "Ignoring unsupported legacy Cashew settings: walk_depth" in caplog.text

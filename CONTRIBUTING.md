@@ -71,10 +71,13 @@ Tests require **no network access**. The embedding model is mocked automatically
 
 ### Understanding the Architecture
 
-This project has a **graphify** knowledge graph in `graphify-out/` that can help you understand code structure and cross-module relationships. After cloning:
+Graphify is an optional local aid. Its generated `graphify-out/` directory is
+not committed, so a fresh clone does not require it. If Graphify is installed,
+generate or refresh the graph before using it:
 
 ```bash
-# View the high-level report
+# Generate local output, then view the high-level report
+graphify update .
 cat graphify-out/GRAPH_REPORT.md
 
 # Query the graph for relationships
@@ -85,7 +88,7 @@ graphify path "ModuleA" "ModuleB"
 Key architectural points:
 - **Dual layout**: root `__init__.py` (re-export shim) + `plugins/memory/cashew/__init__.py` (real implementation)
 - **PEP 420 namespace packages**: `plugins/` and `plugins/memory/` intentionally have **no** `__init__.py`
-- **Threading**: `sync_turn()` enqueues onto `queue.Queue(maxsize=16)` drained by a single **non-daemon** worker thread. Sentinel is `_SHUTDOWN = object()`, not `None`.
+- **Threading**: `sync_turn()` enqueues onto `queue.Queue(maxsize=16)` drained by a single **daemon** worker thread. Shutdown rejects new producers, drains accepted turns ahead of `_SHUTDOWN = object()`, and defers cleanup if its bounded join times out.
 - **Silent degrade**: all Cashew failures log `WARNING` with `exc_info=True` and return neutral values — never raise into Hermes.
 
 ## How to Contribute
@@ -228,8 +231,8 @@ Maintainers handle releases. The process is:
 
 1. Version is bumped in `pyproject.toml` and `CHANGELOG.md` is updated
 2. A tag is pushed (`vX.Y.Z`)
-3. CI publishes to PyPI via OIDC trusted publishing
-4. `v*-rc*` tags publish to TestPyPI first (dry-run); production tags publish to PyPI directly
+3. For non-RC tags, CI publishes to PyPI via OIDC trusted publishing
+4. `v*-rc*` tags run tests and build uploadable artifacts, but skip publication; non-RC tags publish to PyPI directly. There is no TestPyPI publication job.
 
 ## License
 

@@ -1,8 +1,8 @@
 """Log scrubbing filter for the cashew memory provider.
 
-Redacts sensitive values (API keys, tokens, user message content) from log
-output via a standard library logging.Filter.  Also provides a utility to
-install the filter on a logger instance.
+Redacts credential-shaped values and bounds log-message length via a standard
+library logging.Filter. Call sites must never pass ordinary user content: a
+generic logging filter cannot reliably distinguish it from operational text.
 """
 
 from __future__ import annotations

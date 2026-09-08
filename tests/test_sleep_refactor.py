@@ -7,8 +7,10 @@ Mocks sklearn, SentenceTransformer, and model_fn to keep tests offline.
 
 from __future__ import annotations
 
+import datetime
 import math
 import sqlite3
+import warnings
 
 import numpy as np
 import pytest
@@ -529,6 +531,41 @@ def test_garbage_collect_empty_metrics(empty_graph):
     conn = sqlite3.connect(empty_graph)
     assert _garbage_collect(conn, {}) == 0
     conn.close()
+
+
+def test_garbage_collect_uses_naive_utc_grace_period(empty_graph):
+    """GC keeps naive UTC storage semantics without deprecated utcnow()."""
+    conn = sqlite3.connect(empty_graph)
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    _insert_node(
+        conn,
+        "old",
+        "eligible for decay",
+        timestamp=(now - datetime.timedelta(days=8)).isoformat(),
+    )
+    _insert_node(
+        conn,
+        "young",
+        "inside grace period",
+        timestamp=(now - datetime.timedelta(days=6)).isoformat(),
+    )
+    conn.commit()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        count = _garbage_collect(
+            conn,
+            {
+                "old": {"fitness": 0.0},
+                "young": {"fitness": 0.0},
+            },
+        )
+
+    rows = dict(conn.execute("SELECT id, decayed FROM thought_nodes").fetchall())
+    conn.close()
+
+    assert count == 1
+    assert rows == {"old": 1, "young": 0}
 
 
 # ──────────────────────────────────────────────────────────────────────────────

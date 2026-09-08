@@ -59,6 +59,7 @@ def main() -> None:
     config = _read_config(hermes_home)
     limit = config.get("sleep_max_nodes", 2000)
     embedding_model = config.get("embedding_model", "thenlper/gte-large")
+    embedding_device = config.get("embedding_device", "cpu")
 
     # Ensure the Hermes agent root is on sys.path so imports like
     # plugins.memory.cashew.sleep_refactor resolve correctly.
@@ -98,6 +99,7 @@ def main() -> None:
         # synchronous so they complete before interpreter shutdown.
         background_dream=False,
         embedding_model=embedding_model,
+        embedding_device=embedding_device,
     )
     print(json.dumps(result, indent=2))
 

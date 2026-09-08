@@ -771,6 +771,35 @@ def test_embed_orphans_regression_not_null_schema(db_path):
     conn.close()
 
 
+def test_embed_orphans_uses_configured_device(db_path, monkeypatch):
+    import plugins.memory.cashew.sleep_refactor as sleep
+
+    calls: list[tuple[str, str]] = []
+
+    class FakeModel:
+        def encode(self, content, normalize_embeddings=True):
+            return np.ones(384, dtype=np.float32)
+
+    def load_model(model_name, device):
+        calls.append((model_name, device))
+        return FakeModel()
+
+    monkeypatch.setattr(sleep, "load_sentence_transformer", load_model)
+    conn = sqlite3.connect(db_path)
+    _insert_node(conn, "device_orphan", "embedding device check")
+    conn.commit()
+
+    count = _embed_orphans(
+        conn,
+        embedding_model="example/model",
+        embedding_device="mps",
+    )
+
+    assert count == 1
+    assert calls == [("example/model", "mps")]
+    conn.close()
+
+
 def test_embed_orphans_mixed_orphans(db_path):
     """Embedding gap closure works with a mix of orphaned and already-embedded nodes."""
     conn = sqlite3.connect(db_path)

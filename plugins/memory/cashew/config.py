@@ -25,9 +25,10 @@ CONFIG_FILENAME: str = "cashew.json"
 """The flat-layout JSON file save_config writes under hermes_home."""
 
 DEFAULTS: dict[str, Any] = {
-    # Core paths and models (4 existing)
+    # Core paths, models, and device selection
     "cashew_db_path": "cashew/brain.db",
     "embedding_model": "thenlper/gte-large",
+    "embedding_device": "cpu",
     "recall_k": 5,
     "sync_queue_timeout": 30.0,
     # Domains (6)
@@ -117,6 +118,7 @@ class CashewConfig:
 
     cashew_db_path: str = DEFAULTS["cashew_db_path"]
     embedding_model: str = DEFAULTS["embedding_model"]
+    embedding_device: str = DEFAULTS["embedding_device"]
     recall_k: int = DEFAULTS["recall_k"]
     sync_queue_timeout: float = DEFAULTS["sync_queue_timeout"]
     # Domains
@@ -230,6 +232,16 @@ def get_config_schema() -> list[dict[str, Any]]:
             "description": "Sentence-transformers model identifier Cashew loads on first use.",
             "default": DEFAULTS["embedding_model"],
             "env_var": _env_var_name("embedding_model"),
+        },
+        {
+            "key": "embedding_device",
+            "description": (
+                "Sentence-transformers device. Defaults to 'cpu' for process "
+                "stability; use 'auto', 'mps', 'cuda', or a device index only "
+                "after validating that backend in your environment."
+            ),
+            "default": DEFAULTS["embedding_device"],
+            "env_var": _env_var_name("embedding_device"),
         },
         {
             "key": "recall_k",

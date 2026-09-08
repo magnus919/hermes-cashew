@@ -92,6 +92,7 @@ def test_main_uses_profile_config_and_prints_cycle_result(
                 "cashew_db_path": "data/brain.db",
                 "sleep_max_nodes": 321,
                 "embedding_model": "example/model",
+                "embedding_device": "mps",
             }
         )
     )
@@ -128,6 +129,7 @@ def test_main_uses_profile_config_and_prints_cycle_result(
             "model_fn": model_fn,
             "background_dream": False,
             "embedding_model": "example/model",
+            "embedding_device": "mps",
         }
     ]
 

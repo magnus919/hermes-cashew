@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 from plugins.memory.cashew.config import DEFAULTS, get_config_schema
@@ -64,7 +65,14 @@ def test_ci_and_contributor_docs_use_frozen_uv_lock() -> None:
     contributing = (ROOT / "CONTRIBUTING.md").read_text()
 
     assert (ROOT / "uv.lock").is_file()
-    assert "\nuv.lock\n" not in f"\n{gitignore}"
+    ignore_check = subprocess.run(
+        ["git", "check-ignore", "--no-index", "-q", "uv.lock"],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert ignore_check.returncode == 1, ignore_check.stderr or gitignore
     for workflow in (tests_workflow, release_workflow):
         assert 'python -m pip install "uv==0.11.18"' in workflow
         assert "uv sync --frozen --extra dev" in workflow

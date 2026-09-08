@@ -8,6 +8,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+from plugins.memory.cashew import sleep_cron_script
+
 
 def test_cron_process_waits_for_owned_sleep_phases(tmp_path: Path) -> None:
     """The cron process must not delegate work to a disposable daemon thread."""
@@ -73,3 +77,66 @@ def test_cron_process_waits_for_owned_sleep_phases(tmp_path: Path) -> None:
         "dream_pending": False,
         "dream_generation": "ran",
     }
+
+
+def test_main_uses_profile_config_and_prints_cycle_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "cashew.json").write_text(
+        json.dumps(
+            {
+                "cashew_db_path": "data/brain.db",
+                "sleep_max_nodes": 321,
+                "embedding_model": "example/model",
+            }
+        )
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    calls: list[dict] = []
+    model_fn = object()
+
+    import plugins.memory.cashew.config as config_module
+    import plugins.memory.cashew.sleep_refactor as refactor_module
+
+    monkeypatch.setattr(
+        config_module,
+        "resolve_model_fn",
+        lambda *, hermes_home: model_fn,
+    )
+
+    def run_sleep_cycle(**kwargs):
+        calls.append(kwargs)
+        return {"processed": 4, "dream_pending": False}
+
+    monkeypatch.setattr(refactor_module, "run_sleep_cycle", run_sleep_cycle)
+
+    sleep_cron_script.main()
+
+    assert json.loads(capsys.readouterr().out) == {
+        "processed": 4,
+        "dream_pending": False,
+    }
+    assert calls == [
+        {
+            "db_path": str(hermes_home / "data" / "brain.db"),
+            "limit": 321,
+            "model_fn": model_fn,
+            "background_dream": False,
+            "embedding_model": "example/model",
+        }
+    ]
+
+
+def test_helpers_require_home_and_default_missing_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    with pytest.raises(RuntimeError, match="HERMES_HOME is not set"):
+        sleep_cron_script._find_hermes_home()
+
+    assert sleep_cron_script._read_config(tmp_path) == {}

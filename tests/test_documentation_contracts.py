@@ -81,3 +81,4 @@ def test_ci_and_contributor_docs_use_frozen_uv_lock() -> None:
         assert "uv pip install --system" not in workflow
     assert "uv sync --frozen --extra dev" in readme
     assert "uv sync --frozen --extra dev" in contributing
+    assert "--cov-fail-under=75" in tests_workflow

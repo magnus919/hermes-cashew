@@ -10,6 +10,7 @@ Thank you for considering contributing to **hermes-cashew** — a Hermes Agent m
   - [Running Tests](#running-tests)
   - [Understanding the Architecture](#understanding-the-architecture)
 - [How to Contribute](#how-to-contribute)
+  - [Your First Pull Request](#your-first-pull-request)
   - [Reporting Bugs](#reporting-bugs)
   - [Suggesting Features](#suggesting-features)
   - [Pull Requests](#pull-requests)
@@ -94,6 +95,29 @@ Key architectural points:
 - **Silent degrade**: all Cashew failures log `WARNING` with `exc_info=True` and return neutral values — never raise into Hermes.
 
 ## How to Contribute
+
+### Your First Pull Request
+
+If this is your first contribution here, start with an issue labeled
+[`good first issue`](https://github.com/magnus919/hermes-cashew/labels/good%20first%20issue)
+or ask on an existing issue whether it is ready for implementation. Comment on
+the issue before coding so contributors do not duplicate work.
+
+1. Fork the repository and create a focused branch from the latest `main`.
+2. Install the locked development environment with
+   `uv sync --frozen --extra dev`.
+3. Make one logical change, including a regression test for behavior changes.
+4. Run `uv run --frozen --extra dev pytest` locally and correct every new
+   failure before opening the PR.
+5. Sign every commit for the DCO with `git commit -s` and use a Conventional
+   Commit subject.
+6. Open a ready-for-review PR, link the issue with `Closes #N` or `Fixes #N`,
+   and describe both the change and its verification.
+
+Review happens on the GitHub pull request. CI must pass, review conversations
+must be resolved, and a maintainer may ask for focused follow-up commits before
+merging. Please keep the branch current with `main` and avoid force-pushing
+after review has begun.
 
 ### Reporting Bugs
 
@@ -209,7 +233,8 @@ By signing off, you certify that:
 - **No network in tests**: All tests run in offline mode. Embedding models must be mocked.
 - **Logging, not print**: Use `logging.getLogger(__name__)` — Hermes manages log handlers
 
-There is no automated linter enforced in CI (yet), but keeping the codebase consistent is appreciated.
+CI enforces Ruff, mypy, Vulture, duplicate-code, dead-feature-flag, and unused-
+dependency checks in addition to the full pytest suite.
 
 ## Testing
 

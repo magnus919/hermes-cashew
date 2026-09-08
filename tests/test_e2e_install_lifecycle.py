@@ -45,7 +45,7 @@ def test_e2e_install_lifecycle_saves_config_and_reports_available(tmp_path):
 def test_e2e_install_lifecycle_schema_returns_field_descriptors(tmp_path):
     r"""INSTALL-04 Success Criterion #3:
     E2E test verifies get_config_schema() returns list-of-field-descriptors format.
-    Phase 10: schema expanded to 31 keys.
+    The schema exposes the 16 runtime-backed settings.
     """
     t0 = time.monotonic()
 
@@ -56,9 +56,9 @@ def test_e2e_install_lifecycle_schema_returns_field_descriptors(tmp_path):
         f"get_config_schema() must return list, got {type(schema).__name__}"
     )
 
-    from plugins.memory.cashew.config import DEFAULTS, UNSUPPORTED_TUNING_KEYS
+    from plugins.memory.cashew.config import DEFAULTS
 
-    expected = len(DEFAULTS) - len(UNSUPPORTED_TUNING_KEYS)
+    expected = len(DEFAULTS)
     assert len(schema) == expected, (
         f"Expected {expected} field descriptors, got {len(schema)}"
     )

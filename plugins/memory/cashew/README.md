@@ -52,9 +52,12 @@ recover. Explicit non-CPU devices retry initialization once on CPU.
 |-----|---------|-------------|
 | `recall_k` | `5` | Context fragments returned per query |
 
-Legacy tuning keys from older releases remain readable for compatibility, but
-are not advertised because cashew-brain 1.x has no supported API to consume
-them. Non-default legacy values emit a startup warning.
+Starting with v0.11.0, the deprecated retrieval, classification, clustering,
+and garbage-collection tuning keys are removed because cashew-brain 1.x has no
+supported API to consume them. They never changed provider behavior. Existing
+files continue to load; removed keys are ignored and pruned the next time
+`hermes memory setup` saves the provider configuration. Remove matching
+`CASHEW_*` environment variables as part of the upgrade.
 
 ## Tools
 

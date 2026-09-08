@@ -46,9 +46,8 @@ hermes memory setup
 
 ## Zero-Config Startup
 
-hermes-cashew works out of the box — all 38 persisted configuration fields have
-sane defaults. The interactive setup advertises the 17 fields backed by current
-runtime behavior; legacy tuning fields remain readable for compatibility. On
+hermes-cashew works out of the box — all 17 persisted configuration fields have
+sane defaults and are backed by current runtime behavior. On
 first agent startup, the plugin auto-generates `~/.hermes/cashew.json`
 with the full default configuration and auto-populates `auxiliary.memory` in
 Hermes `config.yaml` from the main model config, so LLM-powered extraction
@@ -115,10 +114,21 @@ on a non-CPU device retry once on CPU.
 
 #### Legacy settings
 
-Older releases accepted additional retrieval, classification, clustering, and
-garbage-collection tuning keys that cashew-brain 1.x cannot consume through a
-supported API. They remain readable for file compatibility, but are no longer
-offered by `hermes memory setup`; non-default legacy values emit a startup warning.
+Starting with v0.11.0, the following deprecated parse-only settings are removed
+because cashew-brain 1.x has no supported runtime contract for them:
+
+`default_domain`, `auto_classify`, `domain_classifications`,
+`domain_separation_enabled`, `token_budget`, `walk_depth`,
+`similarity_threshold`, `access_weight`, `temporal_weight`, `clustering_eps`,
+`clustering_min_samples`, `novelty_threshold`, `max_think_iterations`,
+`think_cycle_nodes`, `gc_mode`, `gc_threshold`, `gc_grace_days`,
+`gc_protect_types`, `gc_think_cycle_penalty`, `decay_pruning`, and
+`pattern_detection`.
+
+These keys never changed provider behavior. Existing files continue to load;
+removed keys are ignored and pruned the next time `hermes memory setup` saves
+the provider configuration. Remove matching `CASHEW_*` environment variables,
+because they are no longer part of the adapter's configuration surface.
 
 #### Feature Flags
 

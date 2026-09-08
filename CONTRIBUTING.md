@@ -107,7 +107,8 @@ If the bug is new, use the [bug report template](./.github/ISSUE_TEMPLATE/bug_re
 - Your environment (OS, Python version, Hermes version, hermes-cashew version/commit)
 - Full error output or logs
 
-**Security vulnerabilities** should not be reported via public issues. See the Security section below.
+**Security vulnerabilities** should not be reported via public issues. Follow
+the private disclosure process in the [security policy](./SECURITY.md).
 
 ### Suggesting Features
 

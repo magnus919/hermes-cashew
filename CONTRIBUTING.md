@@ -38,13 +38,15 @@ This project is governed by the [Apache 2.0 License](./LICENSE) and the followin
 
 hermes-cashew depends on `cashew-brain` (available on PyPI) and Hermes Agent. For development:
 
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then:
+
 ```bash
 # Clone the repo
 git clone https://github.com/magnus919/hermes-cashew
 cd hermes-cashew
 
-# Install with dev dependencies
-pip install -e ".[dev]"
+# Install the locked development environment
+uv sync --frozen --extra dev
 ```
 
 **If you're developing with a local Hermes Agent install** (the typical use case when testing the plugin as your active memory provider), Hermes runs from its own virtual environment at `~/.hermes/hermes-agent/venv/`. A dev install must be done in *that* venv, and a symlink is required because Hermes inserts `~/.hermes/hermes-agent/` at the front of `sys.path`, making its `plugins/__init__.py` a regular package that blocks PEP 420 namespace resolution.
@@ -63,8 +65,8 @@ Without the symlink, the entry-point loader fails with `ModuleNotFoundError`. En
 ### Running Tests
 
 ```bash
-pytest                          # full suite
-pytest tests/test_name.py -xvs  # single file, verbose, no capture
+uv run --frozen --extra dev pytest                          # full suite
+uv run --frozen --extra dev pytest tests/test_name.py -xvs  # single file
 ```
 
 Tests require **no network access**. The embedding model is mocked automatically — `conftest.py` sets `HF_HUB_OFFLINE=1` before any Cashew import. CI enforces this with a log-scan step that fails if `Downloading.*MiniLM` appears.

@@ -111,12 +111,10 @@ done
 ## Developer Commands
 
 ```bash
-pip install -e ".[dev]"                # install with dev deps
-pip install -e ".[dev]"                 # install with dev deps
-pip install -e .                        # minimal install
-pytest                                 # full suite
-pytest tests/test_name.py -xvs          # single file
-python3 -m pytest                       # macOS fallback
+uv sync --frozen --extra dev            # install locked dev dependencies
+uv run --frozen --extra dev pytest      # full suite
+uv run --frozen --extra dev pytest tests/test_name.py -xvs
+pip install -e .                        # minimal install fallback
 ```
 
 ### Dev Install Quirks

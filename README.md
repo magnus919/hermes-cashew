@@ -342,12 +342,14 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 hermes ...
 
 ## Development
 
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then use
+the committed lockfile for a reproducible development environment:
+
 ```bash
 git clone https://github.com/magnus919/hermes-cashew
 cd hermes-cashew
-pip install -e ".[dev]"   # macOS
-python3 -m pip install -e ".[dev]"   # Linux
-pytest                      # run the test suite
+uv sync --frozen --extra dev
+uv run --frozen --extra dev pytest
 ```
 
 Tests require no network access and mock the embedding model automatically

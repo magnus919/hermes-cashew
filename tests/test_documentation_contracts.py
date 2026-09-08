@@ -54,3 +54,21 @@ def test_security_policy_provides_private_reporting_path() -> None:
     assert "five business days" in policy
     assert "[security policy](./SECURITY.md)" in contributing
     assert "See the Security section below" not in contributing
+
+
+def test_ci_and_contributor_docs_use_frozen_uv_lock() -> None:
+    gitignore = (ROOT / ".gitignore").read_text()
+    tests_workflow = (ROOT / ".github/workflows/tests.yml").read_text()
+    release_workflow = (ROOT / ".github/workflows/release.yml").read_text()
+    readme = (ROOT / "README.md").read_text()
+    contributing = (ROOT / "CONTRIBUTING.md").read_text()
+
+    assert (ROOT / "uv.lock").is_file()
+    assert "\nuv.lock\n" not in f"\n{gitignore}"
+    for workflow in (tests_workflow, release_workflow):
+        assert 'python -m pip install "uv==0.11.18"' in workflow
+        assert "uv sync --frozen --extra dev" in workflow
+        assert ".venv/bin/pytest" in workflow
+        assert "uv pip install --system" not in workflow
+    assert "uv sync --frozen --extra dev" in readme
+    assert "uv sync --frozen --extra dev" in contributing

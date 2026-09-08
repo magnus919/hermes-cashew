@@ -42,3 +42,15 @@ def test_contributor_docs_match_threading_and_release_workflows() -> None:
     assert "not committed" in agents
     assert "not committed" in contributing
     assert "single source of truth" in claude
+
+
+def test_security_policy_provides_private_reporting_path() -> None:
+    policy = (ROOT / "SECURITY.md").read_text()
+    contributing = (ROOT / "CONTRIBUTING.md").read_text()
+
+    assert "security/advisories/new" in policy
+    assert "latest published" in policy
+    assert "Older releases are not supported" in policy
+    assert "five business days" in policy
+    assert "[security policy](./SECURITY.md)" in contributing
+    assert "See the Security section below" not in contributing

@@ -418,6 +418,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         # between the daemon thread and the main agent loop.
         self._prefetch_pending: tuple[int, str, list[str], str] | None = None
         self._prefetch_generation: int = 0
+        # Background warmups accepted by queue_prefetch(). Shutdown joins
+        # these before clearing DB/config state so a worker cannot observe a
+        # half-torn-down provider.
+        self._prefetch_threads: set[threading.Thread] = set()
         # Last assistant response, buffered from sync_turn for use by
         # queue_prefetch's LLM cue extraction.
         self._last_assistant: str = ""
@@ -939,7 +943,12 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 "sqlite-vec extension failed to load; semantic search will use fallback"
             )
 
-    def _enrich_results(self, node_ids: list[str]) -> list[dict]:
+    def _enrich_results(
+        self,
+        node_ids: list[str],
+        *,
+        db_path: str | pathlib.Path | None = None,
+    ) -> list[dict]:
         """Fetch full node dicts from DB for upstream retrieval results.
 
         Upstream RetrievalResult carries core fields (id, content, type, domain),
@@ -950,7 +959,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             return []
         import sqlite3
 
-        conn = sqlite3.connect(str(self._db_path))
+        target_db = db_path if db_path is not None else self._db_path
+        if target_db is None:
+            return []
+        conn = sqlite3.connect(str(target_db))
         try:
             placeholders = ",".join("?" * len(node_ids))
             cursor = conn.execute(
@@ -1316,13 +1328,14 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._last_assistant = ""
 
     def shutdown(self) -> None:
-        """Post sentinel, bounded-join worker, clear references.
+        """Stop producers, bounded-join background work, clear references.
 
         Order is load-bearing:
           1. If not initialized, return.
           2. Post _SHUTDOWN sentinel to the queue. put_nowait first; fallback to
              a 1s blocking put if the queue is full (worker is draining fast).
-          3. Bounded-join the worker using sync_queue_timeout. WARNING on timeout.
+          3. Bounded-join the sync and prefetch workers using
+             sync_queue_timeout. WARNING on timeout.
           4. Clear runtime state after the worker exits. If the bounded join
              times out, a daemon cleanup watcher retains that state until the
              worker actually finishes.
@@ -1339,8 +1352,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         # _shutdown_started and return without waiting on a full queue.
         with self._sync_state_lock:
             self._shutdown_started.set()
+            self._prefetch_generation += 1
+            self._prefetch_pending = None
             q = self._sync_queue
             assert q is not None
+            prefetch_threads = tuple(self._prefetch_threads)
         # Items already in the queue remain ahead of the sentinel and receive a
         # bounded opportunity to persist before the worker exits.
         try:
@@ -1352,33 +1368,58 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 logger.warning(
                     "cashew shutdown: could not post sentinel; worker may leak"
                 )
-        # Bounded join. Never raise.
+        # One shared deadline bounds all joins. Never raise.
+        deadline = time.monotonic() + timeout
         worker = self._sync_worker
         if worker is not None:
-            worker.join(timeout=timeout)
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
             if worker.is_alive():
                 logger.warning(
                     "cashew sync worker did not exit within %ss; abandoning",
                     timeout,
                 )
-                cleanup = threading.Thread(
-                    target=self._clear_state_after_worker_exit,
-                    args=(worker,),
-                    daemon=True,
-                    name=f"cashew-shutdown-{self._session_id}",
-                )
-                cleanup.start()
-                return
-        self._clear_runtime_state(worker)
+        for prefetch_thread in prefetch_threads:
+            prefetch_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        alive_prefetch = tuple(t for t in prefetch_threads if t.is_alive())
+        if alive_prefetch:
+            logger.warning(
+                "cashew prefetch worker(s) did not exit within %ss; retaining state",
+                timeout,
+            )
+        alive_workers = tuple(
+            t
+            for t in ((worker,) if worker is not None else ()) + alive_prefetch
+            if t.is_alive()
+        )
+        if alive_workers:
+            cleanup = threading.Thread(
+                target=self._clear_state_after_workers_exit,
+                args=(worker, q, alive_workers),
+                daemon=True,
+                name=f"cashew-shutdown-{self._session_id}",
+            )
+            cleanup.start()
+            return
+        self._clear_runtime_state(worker, q)
 
-    def _clear_state_after_worker_exit(self, worker: threading.Thread) -> None:
-        """Keep worker dependencies alive until a timed-out drain completes."""
-        worker.join()
-        self._clear_runtime_state(worker)
+    def _clear_state_after_workers_exit(
+        self,
+        sync_worker: threading.Thread | None,
+        sync_queue: queue.Queue,
+        workers: tuple[threading.Thread, ...],
+    ) -> None:
+        """Keep worker dependencies alive until every timed-out worker exits."""
+        for worker in workers:
+            worker.join()
+        self._clear_runtime_state(sync_worker, sync_queue)
 
-    def _clear_runtime_state(self, worker: threading.Thread | None) -> None:
+    def _clear_runtime_state(
+        self, worker: threading.Thread | None, sync_queue: queue.Queue
+    ) -> None:
         """Clear provider state if it still belongs to the exiting worker."""
         with self._sync_state_lock:
+            if self._sync_queue is not sync_queue:
+                return
             if worker is not None and self._sync_worker is not worker:
                 return
             # Sleep cycle cron job is intentionally NOT removed here.
@@ -1396,6 +1437,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._warm_cache.clear()
             self._prefetch_generation += 1
             self._prefetch_pending = None
+            self._prefetch_threads.clear()
             self._last_assistant = ""
         logger.debug("cashew provider shutdown complete")
 
@@ -1573,21 +1615,19 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         - Never blocks — returns in <1ms.
         - Never raises into Hermes (caught in background thread).
         """
-        if self._config is None:
-            return
-        effective_session = str(session_id or self._session_id)
         with self._sync_state_lock:
+            if self._config is None or self._shutdown_started.is_set():
+                return
+            effective_session = str(session_id or self._session_id)
             self._prefetch_generation += 1
             generation = self._prefetch_generation
             self._prefetch_pending = None
+            db_path = str(self._db_path)
+            top_k = self._config.prefetch_k
+            use_llm = self._model_fn is not None and self._config.prefetch_cues > 0
         if not query:
             logger.debug("queue_prefetch: empty query, no warmup")
             return
-
-        # Capture the state the thread needs — these are stable after initialize()
-        db_path = str(self._db_path)
-        top_k = self._config.prefetch_k
-        use_llm = self._model_fn is not None and self._config.prefetch_cues > 0
 
         def _warmup_worker() -> None:
             """Background thread: retrieve + optionally refine with LLM."""
@@ -1623,7 +1663,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     )
                     if results:
                         node_ids = [r.node_id for r in results]
-                        nodes = self._enrich_results(node_ids)
+                        nodes = self._enrich_results(node_ids, db_path=db_path)
                         for n in nodes:
                             nid = n.get("id", "")
                             if nid not in seen_ids:
@@ -1644,13 +1684,24 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 logger.debug(
                     "queue_prefetch background worker failed (non-fatal)", exc_info=True
                 )
+            finally:
+                with self._sync_state_lock:
+                    self._prefetch_threads.discard(threading.current_thread())
 
         t = threading.Thread(
             target=_warmup_worker,
             daemon=True,
             name=f"cashew-prefetch-{self._session_id}",
         )
-        t.start()
+        with self._sync_state_lock:
+            if self._shutdown_started.is_set():
+                return
+            self._prefetch_threads.add(t)
+            try:
+                t.start()
+            except Exception:
+                self._prefetch_threads.discard(t)
+                logger.debug("queue_prefetch: failed to start warmup", exc_info=True)
 
     def _stage_prefetch_result(
         self, generation: int, session_id: str, cues: list[str], context: str

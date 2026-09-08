@@ -30,40 +30,42 @@ jobs:
           python-version: "3.11"
 
       - name: Install
-        run: pip install uv && uv pip install --system -e ".[dev]"
+        run: |
+          python -m pip install "uv==0.11.18"
+          uv sync --frozen --extra dev
         timeout-minutes: 5
 
       - name: AGENTS.md validation — verify install and test commands work
         run: |
           echo "::group::Validating AGENTS.md commands"
-          # Verify 'pip install -e .[dev]' works (just ran above, check import)
-          python -c "import plugins.memory.cashew; print('import OK')"
+          # Verify the frozen dev environment works (just synced above).
+          .venv/bin/python -c "import plugins.memory.cashew; print('import OK')"
           # Verify 'pytest' collect works
-          pytest --collect-only -q
+          .venv/bin/pytest --collect-only -q
           echo "::endgroup::"
 
       - name: Lint with ruff
-        run: ruff check plugins/memory/cashew/ tests/ --output-format=github
+        run: .venv/bin/ruff check plugins/memory/cashew/ tests/ --output-format=github
 
       - name: Type check with mypy
-        run: mypy --explicit-package-bases plugins/memory/cashew/
+        run: .venv/bin/mypy --explicit-package-bases plugins/memory/cashew/
 
       - name: Dead code detection with vulture
-        run: vulture plugins/memory/cashew/ --min-confidence 80
+        run: .venv/bin/vulture plugins/memory/cashew/ --min-confidence 80
 
       - name: Duplicate code detection
-        run: python scripts/check-duplicates.py
+        run: .venv/bin/python scripts/check-duplicates.py
 
       - name: Dead feature flag detection
-        run: python scripts/check-dead-flags.py
+        run: .venv/bin/python scripts/check-dead-flags.py
 
       - name: Unused dependency detection with deptry
-        run: deptry .
+        run: .venv/bin/deptry .
 
       - name: Run tests with coverage (capture log for offline-download scan)
         run: |
           set -o pipefail
-          pytest -xvs --cov=plugins/memory/cashew --cov-report=term --cov-report=xml --cov-fail-under=65 2>&1 | tee pytest.log
+          .venv/bin/pytest -xvs --cov=plugins/memory/cashew --cov-report=term --cov-report=xml --cov-fail-under=65 2>&1 | tee pytest.log
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v7
@@ -93,8 +95,8 @@ jobs:
           ELAPSED=$((NOW - START))
           echo "Workflow run started at: ${{ github.run_started_at }}"
           echo "Total elapsed time: ${ELAPSED}s (test job only)"
-          echo "Install: uv pip install (uv.lock cached)"
-          echo "Optimizations: uv resolver (10x faster than pip), pytest-xvs (fail-fast)"
+          echo "Install: uv sync --frozen --extra dev"
+          echo "Optimizations: locked uv environment, pytest-xvs (fail-fast)"
 
   wheel-smoke:
     # Same fork-conditional as test job above
@@ -112,7 +114,10 @@ jobs:
           python-version: "3.11"
 
       - name: Build wheel
-        run: pip install build && python -m build
+        run: |
+          python -m pip install "uv==0.11.18"
+          uv sync --frozen --extra dev
+          .venv/bin/python -m build
 
       - name: CI-02 — install wheel into clean venv and verify discovery
         run: |

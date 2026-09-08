@@ -128,7 +128,7 @@ ln -sf "$PWD/plugins/memory/cashew" ~/.hermes/hermes-agent/plugins/memory/cashew
 
 End users who install via `hermes plugins install` are not affected — directory-based loading bypasses the entry point.
 
-CI runs `pytest -xvs` with `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1`. Log-scan fails if `Downloading.*MiniLM` appears.
+CI runs the complete suite with `pytest -vs` and `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1`. Log-scan fails if `Downloading.*MiniLM` appears.
 
 ## LLM Integration
 

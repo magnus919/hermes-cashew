@@ -77,6 +77,7 @@ def test_ci_and_contributor_docs_use_frozen_uv_lock() -> None:
         assert 'python -m pip install "uv==0.11.18"' in workflow
         assert "uv sync --frozen --extra dev" in workflow
         assert ".venv/bin/pytest" in workflow
+        assert ".venv/bin/pytest -xvs" not in workflow
         assert "uv pip install --system" not in workflow
     assert "uv sync --frozen --extra dev" in readme
     assert "uv sync --frozen --extra dev" in contributing

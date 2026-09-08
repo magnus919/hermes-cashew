@@ -200,51 +200,28 @@ def _mock_heavy_imports(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
-def home_snapshot():
-    """Snapshot ~/.hermes file listing before/after a test.
+def isolated_user_home(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Guard against code falling back to the user's default Hermes profile.
 
-    Used by tests/test_no_home_leak.py to satisfy TEST-03: any plugin code path
-    that writes under the user's real $HOME during a tmp_path-scoped lifecycle
-    is a profile-isolation violation. Yields a dict with the pre-test snapshot;
-    the test calls `assert_unchanged()` (also yielded) to verify post-test state.
-
-    Tracks only file path existence (not mtime) so concurrent background
-    processes (gateway, MCP servers) appending to logs don't cause false
-    positives.
-
-    If ~/.hermes does not exist pre-test, asserts it does not exist post-test.
-    Never creates files under ~ — purely observational.
+    Point both Unix and Windows home-directory discovery at a small, disposable
+    directory. Tests can then prove that a tmp_path-scoped provider never
+    creates ``~/.hermes`` without recursively observing the developer's live
+    profile or racing unrelated Hermes processes.
     """
     import pathlib
 
-    home_hermes = pathlib.Path.home() / ".hermes"
+    user_home = tmp_path / "isolated-user-home"
+    user_home.mkdir()
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setenv("USERPROFILE", str(user_home))
+    home_hermes = user_home / ".hermes"
 
-    def _snapshot():
-        if not home_hermes.exists():
-            return {"exists": False, "files": frozenset()}
-        files = frozenset(
-            p.relative_to(home_hermes).as_posix()
-            for p in home_hermes.rglob("*")
-            if p.is_file() and not p.name.endswith((".db-wal", ".db-shm"))
+    assert pathlib.Path.home() == user_home
+
+    def assert_untouched() -> None:
+        assert not home_hermes.exists(), (
+            f"plugin wrote outside hermes_home and created {home_hermes}"
         )
-        return {"exists": True, "files": files}
 
-    pre = _snapshot()
-
-    def assert_unchanged():
-        post = _snapshot()
-        assert pre["exists"] == post["exists"], (
-            f"~/.hermes existence changed: pre={pre['exists']} post={post['exists']}"
-        )
-        if pre["exists"]:
-            new_files = post["files"] - pre["files"]
-            removed_files = pre["files"] - post["files"]
-            assert not new_files, (
-                f"~/.hermes gained files during test: {sorted(new_files)}"
-            )
-            assert not removed_files, (
-                f"~/.hermes lost files during test: {sorted(removed_files)}"
-            )
-
-    yield {"pre": pre, "assert_unchanged": assert_unchanged}
-    assert_unchanged()
+    yield assert_untouched
+    assert_untouched()

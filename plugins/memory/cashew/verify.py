@@ -1,8 +1,7 @@
 """Smoke test for hermes-cashew.
 
-Exercises the full CashewMemoryProvider lifecycle against a self-seeded temporary
-database so end users can verify their install is working without any external
-infrastructure.
+Exercises the full CashewMemoryProvider lifecycle against a temporary profile so
+end users can verify their install is working without any external infrastructure.
 
 Usage:
     python -m plugins.memory.cashew.verify
@@ -52,6 +51,8 @@ def main() -> int:
 
     tmp_dir = tempfile.mkdtemp(prefix="cashew-verify-")
     hermes_home = pathlib.Path(tmp_dir)
+    previous_embedding_cache = _os.environ.get("CASHEW_EMBD_CACHE")
+    _os.environ["CASHEW_EMBD_CACHE"] = str(hermes_home / "embedding-cache.db")
 
     try:
         from plugins.memory.cashew import CashewMemoryProvider
@@ -63,60 +64,11 @@ def main() -> int:
         save_config(
             {
                 "cashew_db_path": "cashew/brain.db",
-                "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
                 "recall_k": 5,
                 "sync_queue_timeout": 30,
             },
             hermes_home=str(hermes_home),
         )
-        (hermes_home / "cashew").mkdir(exist_ok=True)
-        db_path = hermes_home / "cashew" / "brain.db"
-        import sqlite3
-
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS thought_nodes (
-                id TEXT PRIMARY KEY,
-                content TEXT NOT NULL,
-                node_type TEXT NOT NULL,
-                domain TEXT,
-                timestamp TEXT,
-                access_count INTEGER DEFAULT 0,
-                last_accessed TEXT,
-                confidence REAL,
-                source_file TEXT,
-                decayed INTEGER DEFAULT 0,
-                metadata TEXT DEFAULT '{}',
-                last_updated TEXT,
-                mood_state TEXT,
-                permanent INTEGER DEFAULT 0,
-                tags TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS derivation_edges (
-                parent_id TEXT,
-                child_id TEXT,
-                weight REAL,
-                reasoning TEXT,
-                confidence REAL,
-                timestamp TEXT,
-                PRIMARY KEY (parent_id, child_id),
-                FOREIGN KEY (parent_id) REFERENCES thought_nodes(id),
-                FOREIGN KEY (child_id) REFERENCES thought_nodes(id)
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS embeddings (
-                node_id TEXT PRIMARY KEY,
-                vector BLOB NOT NULL,
-                model TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY (node_id) REFERENCES thought_nodes(id)
-            )
-        """)
-        conn.commit()
-        conn.close()
 
         try:
             provider.initialize(
@@ -138,7 +90,7 @@ def main() -> int:
         try:
             raw = provider.handle_tool_call(
                 "cashew_extract",
-                {"user_content": "hello", "assistant_content": "hi there"},
+                {"user_content": "", "assistant_content": ""},
             )
             envelope = json.loads(raw)
             if not envelope.get("ok"):
@@ -168,6 +120,10 @@ def main() -> int:
         _error(f"unexpected {type(exc).__name__}: {exc}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        if previous_embedding_cache is None:
+            _os.environ.pop("CASHEW_EMBD_CACHE", None)
+        else:
+            _os.environ["CASHEW_EMBD_CACHE"] = previous_embedding_cache
 
 
 if __name__ == "__main__":

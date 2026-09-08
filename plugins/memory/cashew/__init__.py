@@ -2,10 +2,12 @@
 # Source: Pattern mirrored from plugins/memory/hindsight/__init__.py (NousResearch/hermes-agent@main)
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
 import pathlib
 import queue
+import re
 import sqlite3
 import tempfile
 import threading
@@ -264,88 +266,28 @@ _IMPORT_TIME_EMBEDDING_MODEL = os.environ.get(
 
 
 def _patch_upstream_embedding(model_name: str) -> None:
-    """Patch cashew-brain's module-level constants so the right model is used.
+    """Apply the provider's model selection to cashew-brain's runtime.
 
-    PyPI cashew-brain v1.1.0 hardcodes ``DEFAULT_MODEL = "all-MiniLM-L6-v2"``
-    and ``EMBEDDING_DIM = 384`` in ``core.embedding_service``. The upstream
-    ``get_default_service()`` creates a **module-level singleton** with those
-    values, so setting env vars or calling with different arguments has no
-    effect — the singleton is already baked.
-
-    This function patches the constants **and** the ``__defaults__`` tuple of
-    ``EmbeddingService.__init__`` (Python evaluates default arguments at
-    function definition time, so changing the module constant alone doesn't
-    work) before the singleton is created, so all subsequent ``embed_nodes()``
-    / ``end_session()`` calls produce embeddings at the correct dimension.
-
-    Safe to call multiple times — resets the singleton on each call so a
-    config change mid-lifecycle takes effect.
+    cashew-brain 1.2.1 resolves its model through ``core.config`` and stores
+    the active model name itself. Updating that supported runtime object and
+    resetting the embedding-service singleton is sufficient; wrapping
+    ``embed_nodes`` repeatedly would stack wrappers across provider restarts.
     """
     try:
+        import core.config
         import core.embedding_service
     except ImportError:
         logger.warning("cashew-brain not installed; cannot patch embedding model")
         return
 
     dim = _UPSTREAM_KNOWN_DIMS.get(model_name, 1024)
-
-    # Patch module-level constants
+    core.config.config.embedding_model = model_name
+    # Retain the public compatibility constants for upstream consumers that
+    # still import them directly.
     core.embedding_service.DEFAULT_MODEL = model_name
     core.embedding_service.EMBEDDING_DIM = dim
-
-    # Patch __defaults__ — Python evalutes default arguments at function
-    # definition time, so changing DEFAULT_MODEL alone doesn't affect
-    # EmbeddingService() calls that omit the model parameter.
-    func = core.embedding_service.EmbeddingService.__init__
-    defaults = list(func.__defaults__)
-    defaults[0] = model_name
-    func.__defaults__ = tuple(defaults)
-
-    # Reset the singleton so next get_default_service() call creates one
-    # with our patched constants and defaults.
     core.embedding_service.reset_default_service()
-
-    # Patch hardcoded model label in core.embeddings.embed_nodes SQL INSERT.
-    # PyPI v1.1.0 writes "all-MiniLM-L6-v2" as the model tag regardless of
-    # which model was actually used. We replace the function with a wrapper
-    # that swaps the label — more robust than patching co_consts.
-    try:
-        import core.embeddings
-
-        _orig_embed_nodes = core.embeddings.embed_nodes
-
-        def _patched_embed_nodes(db_path: str, batch_size: int = 100) -> dict:
-            """Wrap embed_nodes, then fix model labels in the DB."""
-            result = _orig_embed_nodes(db_path, batch_size)
-            embedded = result.get("embedded", 0)
-            if embedded > 0:
-                try:
-                    import sqlite3
-
-                    conn = sqlite3.connect(db_path)
-                    conn.execute("PRAGMA busy_timeout=5000")
-                    conn.execute(
-                        "UPDATE embeddings SET model=? WHERE model='all-MiniLM-L6-v2' AND updated_at>=datetime('now', '-1 minute')",
-                        (model_name,),
-                    )
-                    conn.commit()
-                    conn.close()
-                except Exception:
-                    logger.warning(
-                        "could not fix model labels after embed", exc_info=True
-                    )
-            return result  # type: ignore[no-any-return]
-
-        core.embeddings.embed_nodes = _patched_embed_nodes
-        logger.info("patched embed_nodes model label: %s", model_name)
-    except (ImportError, AttributeError, ValueError):
-        logger.warning("could not patch core.embeddings model label", exc_info=True)
-
-    logger.info(
-        "patched upstream embedding: model=%s dim=%d",
-        model_name,
-        dim,
-    )
+    logger.info("configured upstream embedding: model=%s dim=%d", model_name, dim)
 
 
 # Apply the patch at import time — before any session initializes.
@@ -531,6 +473,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 # Self-healing — clean up stale state from prior crashes.
                 self._heal_stale_lock()
                 self._ensure_db_schema(self._db_path)
+                self._repair_embedding_dimension(self._db_path)
                 self._retriever = ContextRetriever(db_path=str(self._db_path))
                 self._model_fn = self._build_model_fn()
                 # Start the sync worker AFTER all worker-read state
@@ -876,6 +819,144 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             conn.commit()
         finally:
             conn.close()
+
+    @staticmethod
+    def _embedding_dimensions(db_path: pathlib.Path) -> tuple[set[int], int | None]:
+        """Return stored vector dimensions and the sqlite-vec table dimension."""
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT LENGTH(vector) / 4 FROM embeddings "
+                "WHERE vector IS NOT NULL"
+            ).fetchall()
+            stored_dims = {int(row[0]) for row in rows if row[0] is not None}
+            vec_row = conn.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='vec_embeddings'"
+            ).fetchone()
+        finally:
+            conn.close()
+        vec_match = (
+            re.search(r"float\[(\d+)\]", vec_row[0], re.IGNORECASE)
+            if vec_row and vec_row[0]
+            else None
+        )
+        return stored_dims, int(vec_match.group(1)) if vec_match else None
+
+    @staticmethod
+    def _restore_embedding_backup(
+        db_path: pathlib.Path, backup_path: pathlib.Path
+    ) -> None:
+        """Restore a pre-migration SQLite backup without copying live WAL files."""
+        source = sqlite3.connect(str(backup_path))
+        target = sqlite3.connect(str(db_path))
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+
+    def _repair_embedding_dimension(self, db_path: pathlib.Path) -> None:
+        """Back up and re-embed a brain whose stored dimensions are inconsistent.
+
+        Migration runs during initialization, before the provider starts its
+        worker or exposes a retriever. cashew-brain owns the destructive
+        re-embedding operation; this adapter adds detection, a mandatory
+        profile-scoped backup, postcondition validation, and rollback. It uses
+        the same advisory lock as the sleep cycle so separate Hermes processes
+        cannot mutate the graph during migration.
+        """
+        lock_path = pathlib.Path(f"{db_path}.sleep.lock")
+        lock_fd = lock_path.open("a+")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock_fd.close()
+            logger.warning(
+                "embedding dimension migration deferred; another Cashew process "
+                "holds %s",
+                lock_path,
+            )
+            return
+        try:
+            self._repair_embedding_dimension_locked(db_path)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+
+    def _repair_embedding_dimension_locked(self, db_path: pathlib.Path) -> None:
+        """Repair dimensions while the cross-process Cashew lock is held."""
+        if self._config is None:
+            return
+        try:
+            from core.embedding_service import resolve_embedding_dim
+
+            expected_dim = resolve_embedding_dim(self._config.embedding_model)
+            stored_dims, vec_dim = self._embedding_dimensions(db_path)
+        except Exception:
+            logger.warning(
+                "could not inspect embedding dimensions; migration skipped",
+                exc_info=True,
+            )
+            return
+
+        stored_mismatch = bool(stored_dims) and stored_dims != {expected_dim}
+        vec_mismatch = vec_dim is not None and vec_dim != expected_dim
+        if not stored_mismatch and not vec_mismatch:
+            return
+
+        from core.backup import create_backup
+
+        backup_dir = db_path.parent / "backups"
+        backup = create_backup(str(db_path), str(backup_dir))
+        if backup is None:
+            logger.warning(
+                "embedding dimension mismatch detected (stored=%s vec=%s expected=%s), "
+                "but backup failed; migration skipped",
+                sorted(stored_dims),
+                vec_dim,
+                expected_dim,
+            )
+            return
+
+        backup_path = pathlib.Path(backup)
+        try:
+            from scripts.migrate_embeddings import migrate_embeddings
+
+            summary = migrate_embeddings(str(db_path), confirm=True, quiet=True)
+            stored_after, vec_after = self._embedding_dimensions(db_path)
+            if stored_after and stored_after != {expected_dim}:
+                raise RuntimeError(
+                    f"stored embeddings remain at dimensions {sorted(stored_after)}"
+                )
+            if vec_after is not None and vec_after != expected_dim:
+                raise RuntimeError(f"vec_embeddings remains at dimension {vec_after}")
+        except Exception:
+            logger.warning(
+                "embedding migration failed; restoring pre-migration backup %s",
+                backup_path,
+                exc_info=True,
+            )
+            try:
+                self._restore_embedding_backup(db_path, backup_path)
+            except Exception:
+                logger.warning(
+                    "embedding migration rollback failed for %s",
+                    db_path,
+                    exc_info=True,
+                )
+            return
+
+        logger.info(
+            "embedding dimension migration complete: stored=%s vec=%s expected=%s "
+            "nodes_embedded=%s backup=%s",
+            sorted(stored_dims),
+            vec_dim,
+            expected_dim,
+            summary.get("nodes_embedded", 0),
+            backup_path,
+        )
 
     def _migrate_vec_embeddings(self, conn: sqlite3.Connection) -> None:
         """Migrate vec_embeddings from old schema (no node_id, no distance_metric)

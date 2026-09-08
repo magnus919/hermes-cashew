@@ -153,8 +153,9 @@ def _mock_heavy_imports(monkeypatch: pytest.MonkeyPatch):
     class _FakeSentenceTransformer:
         """No-op SentenceTransformer that returns deterministic embeddings."""
 
-        def __init__(self, model_name: str = ""):
+        def __init__(self, model_name: str = "", device: str | None = None):
             self.model_name = model_name
+            self.device = device
 
         def encode(
             self, texts, normalize_embeddings: bool = True, **kwargs

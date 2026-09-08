@@ -21,12 +21,12 @@ def test_release_workflow_syncs_both_manifests_from_pyproject() -> None:
 def test_documented_config_surface_matches_runtime() -> None:
     readme = (ROOT / "README.md").read_text()
     agents = (ROOT / "AGENTS.md").read_text()
-    assert len(DEFAULTS) == 37
-    assert len(get_config_schema()) == 16
-    assert "37 persisted configuration fields" in readme
-    assert "16 fields backed by current" in readme
-    assert "37 compatibility defaults" in agents
-    assert "16-field runtime-backed setup schema" in agents
+    assert len(DEFAULTS) == 38
+    assert len(get_config_schema()) == 17
+    assert "38 persisted configuration fields" in readme
+    assert "17 fields backed by current" in readme
+    assert "38 compatibility defaults" in agents
+    assert "17-field runtime-backed setup schema" in agents
 
 
 def test_contributor_docs_match_threading_and_release_workflows() -> None:

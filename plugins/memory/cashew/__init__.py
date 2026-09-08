@@ -14,6 +14,11 @@ import threading
 import time
 from typing import Any, Callable, Dict, List
 
+from .embedding import (
+    DEFAULT_EMBEDDING_DEVICE,
+    load_sentence_transformer,
+    normalize_embedding_device,
+)
 from .error_tracking import capture_exception, set_plugin_context
 from .log_filter import add_scrub_filter
 from .metrics import _METRICS
@@ -263,15 +268,21 @@ _UPSTREAM_KNOWN_DIMS: dict[str, int] = {
 _IMPORT_TIME_EMBEDDING_MODEL = os.environ.get(
     "CASHEW_EMBEDDING_MODEL", "thenlper/gte-large"
 )
+_IMPORT_TIME_EMBEDDING_DEVICE = os.environ.get(
+    "CASHEW_EMBEDDING_DEVICE", DEFAULT_EMBEDDING_DEVICE
+)
 
 
-def _patch_upstream_embedding(model_name: str) -> None:
-    """Apply the provider's model selection to cashew-brain's runtime.
+def _patch_upstream_embedding(
+    model_name: str, device: str = DEFAULT_EMBEDDING_DEVICE
+) -> None:
+    """Apply the provider's model and device selection to cashew-brain.
 
     cashew-brain 1.2.1 resolves its model through ``core.config`` and stores
-    the active model name itself. Updating that supported runtime object and
-    resetting the embedding-service singleton is sufficient; wrapping
-    ``embed_nodes`` repeatedly would stack wrappers across provider restarts.
+    the active model name itself, but its local backend otherwise delegates
+    device choice to SentenceTransformer. The class patches below are installed
+    once and read the current configured device from the upstream module, so
+    repeated provider initialization never stacks wrappers.
     """
     try:
         import core.config
@@ -280,20 +291,64 @@ def _patch_upstream_embedding(model_name: str) -> None:
         logger.warning("cashew-brain not installed; cannot patch embedding model")
         return
 
+    selected_device = normalize_embedding_device(device)
     dim = _UPSTREAM_KNOWN_DIMS.get(model_name, 1024)
     core.config.config.embedding_model = model_name
     # Retain the public compatibility constants for upstream consumers that
     # still import them directly.
     core.embedding_service.DEFAULT_MODEL = model_name
     core.embedding_service.EMBEDDING_DIM = dim
+    core.embedding_service._hermes_cashew_embedding_device = selected_device
+
+    local_backend = core.embedding_service.LocalBackend
+    if not getattr(local_backend._ensure_model, "_hermes_cashew_device_patch", False):
+
+        def _ensure_model(instance: Any) -> None:
+            if instance._model is None:
+                active_device = getattr(
+                    core.embedding_service,
+                    "_hermes_cashew_embedding_device",
+                    DEFAULT_EMBEDDING_DEVICE,
+                )
+                instance._model = load_sentence_transformer(
+                    instance.model_name, active_device
+                )
+
+        _ensure_model._hermes_cashew_device_patch = True  # type: ignore[attr-defined]
+        local_backend._ensure_model = _ensure_model
+
+    daemon_backend = core.embedding_service.DaemonBackend
+    if not getattr(daemon_backend.encode, "_hermes_cashew_device_patch", False):
+        upstream_daemon_encode = daemon_backend.encode
+
+        def _encode(instance: Any, texts: list[str]) -> Any:
+            active_device = getattr(
+                core.embedding_service,
+                "_hermes_cashew_embedding_device",
+                DEFAULT_EMBEDDING_DEVICE,
+            )
+            if active_device != "auto":
+                return core.embedding_service.np.zeros(
+                    (0, instance.dim), dtype=core.embedding_service.np.float32
+                )
+            return upstream_daemon_encode(instance, texts)
+
+        _encode._hermes_cashew_device_patch = True  # type: ignore[attr-defined]
+        daemon_backend.encode = _encode
+
     core.embedding_service.reset_default_service()
-    logger.info("configured upstream embedding: model=%s dim=%d", model_name, dim)
+    logger.info(
+        "configured upstream embedding: model=%s dim=%d device=%s",
+        model_name,
+        dim,
+        selected_device,
+    )
 
 
 # Apply the patch at import time — before any session initializes.
 # This covers gateway scenarios where the provider may already be
 # constructed by the time initialize() is called.
-_patch_upstream_embedding(_IMPORT_TIME_EMBEDDING_MODEL)
+_patch_upstream_embedding(_IMPORT_TIME_EMBEDDING_MODEL, _IMPORT_TIME_EMBEDDING_DEVICE)
 
 
 def _remove_existing_sleep_job(hermes_home: pathlib.Path | None) -> None:
@@ -446,13 +501,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             span.set_attribute("session_id", session_id)
             try:
                 self._config = load_config(self._hermes_home)
-                # Propagate embedding model to upstream cashew-brain.
-                # PyPI v1.1.0 hardcodes DEFAULT_MODEL = "all-MiniLM-L6-v2" and
-                # EMBEDDING_DIM = 384; the embedded get_default_service() singleton
-                # is created with those values. We patch the module-level constants
-                # before any end_session() / embed_nodes() call so the upstream
-                # creates 1024-dim embeddings matching our config.
-                _patch_upstream_embedding(self._config.embedding_model)
+                # Configure upstream model and device before any embedding work.
+                # The singleton is reset so the next use observes both values.
+                _patch_upstream_embedding(
+                    self._config.embedding_model, self._config.embedding_device
+                )
                 # First-load bootstrap: generate default cashew.json and
                 # auto-populate auxiliary.memory if absent. Safe to call
                 # on every initialize() — no-op after the first run.
@@ -491,6 +544,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         "recall_k": self._config.recall_k,
                         "cashew_db_path": self._config.cashew_db_path,
                         "embedding_model": self._config.embedding_model,
+                        "embedding_device": self._config.embedding_device,
                         "auto_extraction": self._config.auto_extraction,
                         "sleep_cycles": self._config.sleep_cycles,
                     },

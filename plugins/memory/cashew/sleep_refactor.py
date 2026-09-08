@@ -39,6 +39,8 @@ from typing import Any, Optional
 
 import numpy as np
 
+from .embedding import load_sentence_transformer
+
 logger = logging.getLogger(__name__)
 
 # ── thresholds ──────────────────────────────────────────────────────────────
@@ -627,7 +629,9 @@ def _generate_dream(
 
 
 def _embed_orphans(
-    conn: sqlite3.Connection, embedding_model: str = "thenlper/gte-large"
+    conn: sqlite3.Connection,
+    embedding_model: str = "thenlper/gte-large",
+    embedding_device: str = "cpu",
 ) -> int:
     """Embed any active nodes lacking an embedding row. Returns count."""
     rows = conn.execute(
@@ -645,9 +649,7 @@ def _embed_orphans(
         "sleep: embedding %d orphaned nodes with %s...", len(rows), embedding_model
     )
 
-    from sentence_transformers import SentenceTransformer
-
-    model = SentenceTransformer(embedding_model)
+    model = load_sentence_transformer(embedding_model, embedding_device)
 
     embedded = 0
     for nid, content in rows:
@@ -691,6 +693,7 @@ def _run_dream_async(
     cross_link_tuples: list[tuple[str, str, float]],
     model_fn: Any,
     embedding_model: str = "thenlper/gte-large",
+    embedding_device: str = "cpu",
 ) -> None:
     """Run Phase 8 (dream) + Phase 9 (orphan embedding) in a daemon thread.
 
@@ -704,7 +707,11 @@ def _run_dream_async(
             conn.execute("PRAGMA busy_timeout=5000")
             _set_wal(conn)
             dream_id = _generate_dream(conn, cross_link_tuples, model_fn=model_fn)
-            orphans = _embed_orphans(conn, embedding_model=embedding_model)
+            orphans = _embed_orphans(
+                conn,
+                embedding_model=embedding_model,
+                embedding_device=embedding_device,
+            )
             conn.close()
             logger.info(
                 "sleep: background dream complete (id=%s, orphans=%d)",
@@ -726,6 +733,7 @@ def run_sleep_cycle(
     model_fn: Any = None,
     background_dream: bool = False,
     embedding_model: str = "thenlper/gte-large",
+    embedding_device: str = "cpu",
 ) -> dict:
     """Run one complete refactored sleep cycle.
 
@@ -738,6 +746,8 @@ def run_sleep_cycle(
             embedding) run in a daemon thread instead of blocking the caller.
             The LLM call is the dominant latency (~60s); this lets the lifecycle
             hook return promptly after the ~20s synchronous path.
+        embedding_model: SentenceTransformer model used for orphan embeddings.
+        embedding_device: Device used for orphan embeddings. Defaults to CPU.
 
     Returns:
         Dict with statistics for each phase. When *background_dream* is True,
@@ -846,6 +856,7 @@ def run_sleep_cycle(
                 cross_link_tuples=cross_link_tuples,
                 model_fn=model_fn,
                 embedding_model=embedding_model,
+                embedding_device=embedding_device,
             )
             dream_pending = True
             dream_status = "pending"
@@ -859,7 +870,11 @@ def run_sleep_cycle(
     if background_dream:
         orphans = 0  # handled by background dream thread
     else:
-        orphans = _embed_orphans(conn, embedding_model=embedding_model)
+        orphans = _embed_orphans(
+            conn,
+            embedding_model=embedding_model,
+            embedding_device=embedding_device,
+        )
 
     conn.close()
     elapsed = round(time.perf_counter() - t_start, 1)

@@ -46,8 +46,8 @@ hermes memory setup
 
 ## Zero-Config Startup
 
-hermes-cashew works out of the box — all 37 persisted configuration fields have
-sane defaults. The interactive setup advertises the 16 fields backed by current
+hermes-cashew works out of the box — all 38 persisted configuration fields have
+sane defaults. The interactive setup advertises the 17 fields backed by current
 runtime behavior; legacy tuning fields remain readable for compatibility. On
 first agent startup, the plugin auto-generates `~/.hermes/cashew.json`
 with the full default configuration and auto-populates `auxiliary.memory` in
@@ -76,6 +76,7 @@ EOF
 |-----|---------|-------------|
 | `cashew_db_path` | `cashew/brain.db` | Path to SQLite DB, relative to `hermes_home` |
 | `embedding_model` | `thenlper/gte-large` | Sentence-transformers model for embeddings (1024-dim) |
+| `embedding_device` | `cpu` | Sentence-transformers device; `cpu` avoids unstable native accelerators |
 | `llm_aux_role` | `memory` | Hermes auxiliary role for LLM-powered extraction; requires `auxiliary.memory` in `config.yaml` |
 | `auto_extraction` | `true` | Auto-extract knowledge from conversation turns |
 | `sync_queue_timeout` | `30.0` | Seconds to wait for sync worker drain on shutdown |
@@ -104,6 +105,13 @@ EOF
 | `sleep_max_nodes` | `2000` | Max nodes per sleep cycle tick |
 | `think_cycles` | `true` | Enable periodic insight generation (think cycle) |
 | `think_interval` | `10` | Turns between think cycle runs (0 = disable) |
+
+`embedding_device` defaults to `cpu` because native MPS failures can terminate
+the Python process before the plugin can recover. Set it to `auto` to restore
+SentenceTransformer's automatic hardware selection, or to an explicit device
+such as `mps`, `cuda`, or `cuda:0` after validating that backend. An explicit
+device bypasses Cashew's device-opaque warm daemon, and initialization failures
+on a non-CPU device retry once on CPU.
 
 #### Legacy settings
 

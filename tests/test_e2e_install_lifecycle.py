@@ -77,6 +77,7 @@ def test_e2e_install_lifecycle_schema_returns_field_descriptors(tmp_path):
     expected_keys = {
         "cashew_db_path",
         "embedding_model",
+        "embedding_device",
         "recall_k",
         "sync_queue_timeout",
     }
@@ -86,6 +87,7 @@ def test_e2e_install_lifecycle_schema_returns_field_descriptors(tmp_path):
     defaults_by_key = {f["key"]: f["default"] for f in schema}
     assert defaults_by_key["cashew_db_path"] == "cashew/brain.db"
     assert defaults_by_key["embedding_model"] == "thenlper/gte-large"
+    assert defaults_by_key["embedding_device"] == "cpu"
     assert defaults_by_key["recall_k"] == 5
     assert defaults_by_key["sync_queue_timeout"] == 30.0
 

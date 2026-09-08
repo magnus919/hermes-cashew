@@ -31,7 +31,7 @@ from plugins.memory.cashew.config import (
     save_config,
 )
 
-EXPECTED_KEY_COUNT = 37
+EXPECTED_KEY_COUNT = 38
 
 
 def test_defaults_contains_exactly_32_keys_with_documented_values():
@@ -39,6 +39,7 @@ def test_defaults_contains_exactly_32_keys_with_documented_values():
     assert len(DEFAULTS) == EXPECTED_KEY_COUNT
     assert DEFAULTS["cashew_db_path"] == "cashew/brain.db"
     assert DEFAULTS["embedding_model"] == "thenlper/gte-large"
+    assert DEFAULTS["embedding_device"] == "cpu"
     assert DEFAULTS["recall_k"] == 5
     assert DEFAULTS["sync_queue_timeout"] == 30.0
     assert DEFAULTS["user_domain"] == "user"
@@ -121,6 +122,12 @@ def test_env_var_name_derivation():
     assert _env_var_name("recall_k") == "CASHEW_RECALL_K"
     assert _env_var_name("ai_domain") == "CASHEW_AI_DOMAIN"
     assert _env_var_name("gc_mode") == "CASHEW_GC_MODE"
+    assert _env_var_name("embedding_device") == "CASHEW_EMBEDDING_DEVICE"
+
+
+def test_load_config_env_override_embedding_device(monkeypatch, tmp_path):
+    monkeypatch.setenv("CASHEW_EMBEDDING_DEVICE", "mps")
+    assert load_config(tmp_path).embedding_device == "mps"
 
 
 def test_domain_helpers():

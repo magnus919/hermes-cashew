@@ -99,7 +99,7 @@ done
 
 - **No `~/.hermes` writes.** All paths scope under `hermes_home`. Tests use `tmp_path` fixture.
 - **`sync_turn` must return <10 ms.** Bounded queue + daemon worker; shutdown gives already-accepted turns a bounded opportunity to drain.
-- **Cashew dependency**: `cashew-brain>=1.1.0,<2.0.0` on PyPI.
+- **Cashew dependency**: `cashew-brain>=1.2.1,<2.0.0` on PyPI.
 - **sqlite-vec** enables vector similarity search. It's a standard dependency
   (not optional) — the plugin requires it. If your platform doesn't support
   sqlite-vec's native extension, the plugin degrades gracefully to keyword + BFS

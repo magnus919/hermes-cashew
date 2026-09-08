@@ -13,7 +13,7 @@ consolidation on a persistent Hermes cron schedule.
 ## Prerequisites
 
 - [Hermes Agent](https://github.com/nousresearch/hermes-agent) installed
-- `cashew-brain>=1.1.0,<2.0.0` — installed automatically by `hermes plugins install`
+- `cashew-brain>=1.2.1,<2.0.0` — installed automatically by `hermes plugins install`
 - `sqlite-vec` — enables vector similarity search. Installed automatically.
 
 ## Install
@@ -339,6 +339,22 @@ trigger a ~500 MB embedding model download. To avoid this in automated environme
 ```bash
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 hermes ...
 ```
+
+### Embedding dimension migration
+
+When `embedding_model` changes, the provider compares both stored embedding
+rows and the sqlite-vec table with the configured model's dimension during
+initialization. A mismatch is repaired before background workers start:
+
+1. a consistent SQLite backup is written under `cashew/backups/`;
+2. cashew-brain re-embeds active nodes and recreates `vec_embeddings` at the
+   configured dimension;
+3. the provider validates the new dimensions before enabling retrieval.
+
+If backup, migration, or validation fails, the provider logs a warning and
+restores the backup. Thought nodes are not discarded. Stop other Hermes or
+Cashew processes before deliberately changing `embedding_model`, then restart
+Hermes and allow the one-time migration to finish before issuing queries.
 
 ## Development
 

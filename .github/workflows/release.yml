@@ -35,7 +35,7 @@ jobs:
       - name: Run tests
         run: |
           set -o pipefail
-          .venv/bin/pytest -xvs 2>&1 | tee pytest.log
+          .venv/bin/pytest -vs 2>&1 | tee pytest.log
       - name: Fail if embedding model was downloaded
         run: |
           if grep -E 'Downloading.*MiniLM' pytest.log; then

@@ -65,7 +65,7 @@ jobs:
       - name: Run tests with coverage (capture log for offline-download scan)
         run: |
           set -o pipefail
-          .venv/bin/pytest -xvs --cov=plugins/memory/cashew --cov-report=term --cov-report=xml --cov-fail-under=65 2>&1 | tee pytest.log
+          .venv/bin/pytest -vs --cov=plugins/memory/cashew --cov-report=term --cov-report=xml --cov-fail-under=65 2>&1 | tee pytest.log
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v7
@@ -96,7 +96,7 @@ jobs:
           echo "Workflow run started at: ${{ github.run_started_at }}"
           echo "Total elapsed time: ${ELAPSED}s (test job only)"
           echo "Install: uv sync --frozen --extra dev"
-          echo "Optimizations: locked uv environment, pytest-xvs (fail-fast)"
+          echo "Optimizations: locked uv environment, complete pytest failure report"
 
   wheel-smoke:
     # Same fork-conditional as test job above

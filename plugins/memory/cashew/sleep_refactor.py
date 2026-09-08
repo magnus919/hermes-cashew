@@ -407,7 +407,8 @@ def _garbage_collect(
         import datetime
 
         cutoff = (
-            datetime.datetime.utcnow() - datetime.timedelta(days=GC_GRACE_DAYS)
+            datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+            - datetime.timedelta(days=GC_GRACE_DAYS)
         ).isoformat()
         ph = ",".join("?" * len(candidates))
         young = {

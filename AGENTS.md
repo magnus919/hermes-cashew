@@ -57,7 +57,7 @@ The `auxiliary.memory` convention is designed for any Hermes memory provider. Wh
 
 - `__init__.py` (root) — thin re-export shim; flat-entry loader path. **Do not import Cashew dependencies here.**
 - `plugins/memory/cashew/__init__.py` — provider implementation (CashewMemoryProvider + register).
-- `plugins/memory/cashew/config.py` — CashewConfig dataclass, load/save, 38 compatibility defaults, and a 17-field runtime-backed setup schema.
+- `plugins/memory/cashew/config.py` — CashewConfig dataclass and load/save helpers for the 17-field runtime-backed setup schema.
 - `plugins/memory/cashew/tools.py` — JSON envelope builders for tool call responses.
 - `plugins/memory/cashew/plugin.yaml` — bundled-loader hook manifest (hooks: [on_session_end, on_pre_compress]). Must match `plugin.yaml` (root).
 - `plugin.yaml` (root) — `hermes plugins install` manifest. CI auto-syncs version from `pyproject.toml` on release.

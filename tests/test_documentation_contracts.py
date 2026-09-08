@@ -20,13 +20,16 @@ def test_release_workflow_syncs_both_manifests_from_pyproject() -> None:
 
 def test_documented_config_surface_matches_runtime() -> None:
     readme = (ROOT / "README.md").read_text()
+    plugin_readme = (ROOT / "plugins/memory/cashew/README.md").read_text()
     agents = (ROOT / "AGENTS.md").read_text()
-    assert len(DEFAULTS) == 38
+    assert len(DEFAULTS) == 17
     assert len(get_config_schema()) == 17
-    assert "38 persisted configuration fields" in readme
-    assert "17 fields backed by current" in readme
-    assert "38 compatibility defaults" in agents
+    assert "all 17 persisted configuration fields" in readme
+    assert "backed by current runtime behavior" in readme
     assert "17-field runtime-backed setup schema" in agents
+    for documentation in (readme, plugin_readme):
+        assert "Starting with v0.11.0" in documentation
+        assert "removed keys are ignored and pruned" in documentation
 
 
 def test_contributor_docs_match_threading_and_release_workflows() -> None:

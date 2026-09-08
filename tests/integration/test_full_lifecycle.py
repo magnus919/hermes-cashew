@@ -141,7 +141,7 @@ def test_full_lifecycle_config_roundtrip(tmp_path):
     provider = CashewMemoryProvider()
     custom = {
         "recall_k": 7,
-        "token_budget": 1000,
+        "prefetch_k": 4,
         "sleep_schedule": "0 3 * * *",
         "_features": {
             "experimental_batch_sync": True,
@@ -152,13 +152,13 @@ def test_full_lifecycle_config_roundtrip(tmp_path):
 
     config = load_config(str(tmp_path))
     assert config.recall_k == 7
-    assert config.token_budget == 1000
+    assert config.prefetch_k == 4
     assert config.sleep_schedule == "0 3 * * *"
     assert config._features == custom["_features"]
 
     # Non-overridden keys fall back to defaults
-    assert config.walk_depth == DEFAULTS["walk_depth"]
-    assert config.gc_mode == DEFAULTS["gc_mode"]
+    assert config.embedding_model == DEFAULTS["embedding_model"]
+    assert config.auto_extraction == DEFAULTS["auto_extraction"]
 
 
 def test_full_lifecycle_timing(tmp_path):

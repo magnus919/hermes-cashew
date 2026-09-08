@@ -2,7 +2,7 @@
 
 |This module has zero coupling to the Hermes ABC, the CashewMemoryProvider class,
 |or the Cashew runtime. It owns:
-|  - the expanded config schema (~33 flat JSON keys aligned with upstream Cashew)
+|  - the 17-field runtime-backed config schema
   - the on-disk JSON layout under hermes_home (CONF-02, CONF-03)
   - the rule that every path derives from hermes_home (CONF-04)
 
@@ -31,36 +31,13 @@ DEFAULTS: dict[str, Any] = {
     "embedding_device": "cpu",
     "recall_k": 5,
     "sync_queue_timeout": 30.0,
-    # Domains (6)
+    # Domain labels
     "user_domain": "user",
     "ai_domain": "ai",
-    "default_domain": "general",
-    "auto_classify": True,
-    "domain_classifications": ["personal", "work", "projects", "learning", "system"],
-    "domain_separation_enabled": True,
-    # Performance / retrieval (11)
-    "token_budget": 2000,
-    "walk_depth": 2,
-    "similarity_threshold": 0.3,
-    "access_weight": 0.2,
-    "temporal_weight": 0.1,
-    "clustering_eps": 0.35,
-    "clustering_min_samples": 3,
-    "novelty_threshold": 0.82,
-    "max_think_iterations": 3,
-    "think_cycle_nodes": 5,
-    # GC (5)
-    "gc_mode": "soft",
-    "gc_threshold": 0.05,
-    "gc_grace_days": 7,
-    "gc_protect_types": ["seed", "core_memory"],
-    "gc_think_cycle_penalty": 1.5,
-    # Features (5)
+    # Runtime behavior switches
     "auto_extraction": True,
     "think_cycles": True,
     "sleep_cycles": True,
-    "decay_pruning": True,
-    "pattern_detection": True,
     # LLM integration — "memory" activates LLM-powered extraction by default
     # via auxiliary.memory in Hermes config.yaml. On first load, the plugin
     # auto-populates auxiliary.memory from the main model config if absent.
@@ -81,11 +58,9 @@ DEFAULTS: dict[str, Any] = {
     },
 }
 
-# Retained for backwards-compatible parsing only. cashew-brain 1.x exposes no
-# supported per-call or service configuration contract for these historical
-# adapter knobs, so advertising them would imply behavior the plugin cannot
-# deliver. Non-default legacy values produce a startup warning.
-UNSUPPORTED_TUNING_KEYS: frozenset[str] = frozenset(
+# Removed from the runtime surface after a full deprecation cycle. This list is
+# used only to prune obsolete values from existing cashew.json files on save.
+REMOVED_LEGACY_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "default_domain",
         "auto_classify",
@@ -114,47 +89,20 @@ UNSUPPORTED_TUNING_KEYS: frozenset[str] = frozenset(
 
 @dataclasses.dataclass(frozen=True)
 class CashewConfig:
-    """Typed view over the Cashew config dict (~31 keys aligned with upstream)."""
+    """Typed view over the 17 behavior-backed Cashew adapter settings."""
 
     cashew_db_path: str = DEFAULTS["cashew_db_path"]
     embedding_model: str = DEFAULTS["embedding_model"]
     embedding_device: str = DEFAULTS["embedding_device"]
     recall_k: int = DEFAULTS["recall_k"]
     sync_queue_timeout: float = DEFAULTS["sync_queue_timeout"]
-    # Domains
+    # Domain labels
     user_domain: str = DEFAULTS["user_domain"]
     ai_domain: str = DEFAULTS["ai_domain"]
-    default_domain: str = DEFAULTS["default_domain"]
-    auto_classify: bool = DEFAULTS["auto_classify"]
-    domain_classifications: list[str] = dataclasses.field(
-        default_factory=lambda: list(DEFAULTS["domain_classifications"])
-    )
-    domain_separation_enabled: bool = DEFAULTS["domain_separation_enabled"]
-    # Performance / retrieval
-    token_budget: int = DEFAULTS["token_budget"]
-    walk_depth: int = DEFAULTS["walk_depth"]
-    similarity_threshold: float = DEFAULTS["similarity_threshold"]
-    access_weight: float = DEFAULTS["access_weight"]
-    temporal_weight: float = DEFAULTS["temporal_weight"]
-    clustering_eps: float = DEFAULTS["clustering_eps"]
-    clustering_min_samples: int = DEFAULTS["clustering_min_samples"]
-    novelty_threshold: float = DEFAULTS["novelty_threshold"]
-    max_think_iterations: int = DEFAULTS["max_think_iterations"]
-    think_cycle_nodes: int = DEFAULTS["think_cycle_nodes"]
-    # GC
-    gc_mode: str = DEFAULTS["gc_mode"]
-    gc_threshold: float = DEFAULTS["gc_threshold"]
-    gc_grace_days: int = DEFAULTS["gc_grace_days"]
-    gc_protect_types: list[str] = dataclasses.field(
-        default_factory=lambda: list(DEFAULTS["gc_protect_types"])
-    )
-    gc_think_cycle_penalty: float = DEFAULTS["gc_think_cycle_penalty"]
-    # Features
+    # Runtime behavior switches
     auto_extraction: bool = DEFAULTS["auto_extraction"]
     think_cycles: bool = DEFAULTS["think_cycles"]
     sleep_cycles: bool = DEFAULTS["sleep_cycles"]
-    decay_pruning: bool = DEFAULTS["decay_pruning"]
-    pattern_detection: bool = DEFAULTS["pattern_detection"]
     # LLM integration
     llm_aux_role: str = DEFAULTS["llm_aux_role"]
     think_interval: int = DEFAULTS["think_interval"]
@@ -270,120 +218,6 @@ def get_config_schema() -> list[dict[str, Any]]:
             "env_var": _env_var_name("ai_domain"),
         },
         {
-            "key": "default_domain",
-            "description": "Fallback domain when none is specified during extraction.",
-            "default": DEFAULTS["default_domain"],
-            "env_var": _env_var_name("default_domain"),
-        },
-        {
-            "key": "auto_classify",
-            "description": "Automatically assign domain classifications during node extraction.",
-            "default": DEFAULTS["auto_classify"],
-            "env_var": _env_var_name("auto_classify"),
-        },
-        {
-            "key": "domain_classifications",
-            "description": "List of domain tags available for auto-classification.",
-            "default": DEFAULTS["domain_classifications"],
-            "env_var": _env_var_name("domain_classifications"),
-        },
-        {
-            "key": "domain_separation_enabled",
-            "description": "Keep user and AI nodes in separate domains by default.",
-            "default": DEFAULTS["domain_separation_enabled"],
-            "env_var": _env_var_name("domain_separation_enabled"),
-        },
-        {
-            "key": "token_budget",
-            "description": "Max tokens to inject into context generation per retrieval.",
-            "default": DEFAULTS["token_budget"],
-            "env_var": _env_var_name("token_budget"),
-        },
-        {
-            "key": "walk_depth",
-            "description": "Graph BFS walk depth for context expansion from seed nodes.",
-            "default": DEFAULTS["walk_depth"],
-            "env_var": _env_var_name("walk_depth"),
-        },
-        {
-            "key": "similarity_threshold",
-            "description": "Minimum cosine similarity (0-1) for vec search results.",
-            "default": DEFAULTS["similarity_threshold"],
-            "env_var": _env_var_name("similarity_threshold"),
-        },
-        {
-            "key": "access_weight",
-            "description": "Weight of access_count in hybrid scoring (0-1).",
-            "default": DEFAULTS["access_weight"],
-            "env_var": _env_var_name("access_weight"),
-        },
-        {
-            "key": "temporal_weight",
-            "description": "Weight of recency in hybrid scoring (0-1).",
-            "default": DEFAULTS["temporal_weight"],
-            "env_var": _env_var_name("temporal_weight"),
-        },
-        {
-            "key": "clustering_eps",
-            "description": "DBSCAN epsilon for hierarchical clustering during sleep.",
-            "default": DEFAULTS["clustering_eps"],
-            "env_var": _env_var_name("clustering_eps"),
-        },
-        {
-            "key": "clustering_min_samples",
-            "description": "DBSCAN min_samples for hierarchical clustering.",
-            "default": DEFAULTS["clustering_min_samples"],
-            "env_var": _env_var_name("clustering_min_samples"),
-        },
-        {
-            "key": "novelty_threshold",
-            "description": "Score threshold (0-1) below which nodes are considered redundant.",
-            "default": DEFAULTS["novelty_threshold"],
-            "env_var": _env_var_name("novelty_threshold"),
-        },
-        {
-            "key": "max_think_iterations",
-            "description": "Max autonomous think-cycle iterations per run.",
-            "default": DEFAULTS["max_think_iterations"],
-            "env_var": _env_var_name("max_think_iterations"),
-        },
-        {
-            "key": "think_cycle_nodes",
-            "description": "Number of seed nodes to use in a think cycle.",
-            "default": DEFAULTS["think_cycle_nodes"],
-            "env_var": _env_var_name("think_cycle_nodes"),
-        },
-        {
-            "key": "gc_mode",
-            "description": "Garbage collection mode: soft, hard, or off.",
-            "default": DEFAULTS["gc_mode"],
-            "env_var": _env_var_name("gc_mode"),
-        },
-        {
-            "key": "gc_threshold",
-            "description": "Relevance score below which nodes are eligible for GC.",
-            "default": DEFAULTS["gc_threshold"],
-            "env_var": _env_var_name("gc_threshold"),
-        },
-        {
-            "key": "gc_grace_days",
-            "description": "Days since last_accessed before a low-score node can be GC'd.",
-            "default": DEFAULTS["gc_grace_days"],
-            "env_var": _env_var_name("gc_grace_days"),
-        },
-        {
-            "key": "gc_protect_types",
-            "description": "Node types immune from garbage collection.",
-            "default": DEFAULTS["gc_protect_types"],
-            "env_var": _env_var_name("gc_protect_types"),
-        },
-        {
-            "key": "gc_think_cycle_penalty",
-            "description": "Multiplier on gc_threshold for think-cycle nodes.",
-            "default": DEFAULTS["gc_think_cycle_penalty"],
-            "env_var": _env_var_name("gc_think_cycle_penalty"),
-        },
-        {
             "key": "auto_extraction",
             "description": "Enable automatic knowledge extraction from conversation turns.",
             "default": DEFAULTS["auto_extraction"],
@@ -400,18 +234,6 @@ def get_config_schema() -> list[dict[str, Any]]:
             "description": "Enable sleep cycles for deep graph consolidation.",
             "default": DEFAULTS["sleep_cycles"],
             "env_var": _env_var_name("sleep_cycles"),
-        },
-        {
-            "key": "decay_pruning",
-            "description": "Enable organic decay of low-value nodes over time.",
-            "default": DEFAULTS["decay_pruning"],
-            "env_var": _env_var_name("decay_pruning"),
-        },
-        {
-            "key": "pattern_detection",
-            "description": "Enable automatic pattern detection across node clusters.",
-            "default": DEFAULTS["pattern_detection"],
-            "env_var": _env_var_name("pattern_detection"),
         },
         {
             "key": "llm_aux_role",
@@ -490,7 +312,7 @@ def get_config_schema() -> list[dict[str, Any]]:
             "env_var": "",
         },
     ]
-    return [field for field in schema if field["key"] not in UNSUPPORTED_TUNING_KEYS]
+    return schema
 
 
 _PROVIDER_ENV_MAP: dict[str, str] = {
@@ -771,16 +593,6 @@ def load_config(hermes_home: str | os.PathLike[str]) -> CashewConfig:
                     "Invalid value for %s (%s), skipping: %r", key, env_name, env_val
                 )
 
-    unsupported_overrides = sorted(
-        key for key in UNSUPPORTED_TUNING_KEYS if merged.get(key) != DEFAULTS[key]
-    )
-    if unsupported_overrides:
-        logger.warning(
-            "Ignoring unsupported legacy Cashew settings: %s. "
-            "These keys are retained only for config-file compatibility.",
-            ", ".join(unsupported_overrides),
-        )
-
     known = {f.name for f in dataclasses.fields(CashewConfig)}
     filtered = {k: v for k, v in merged.items() if k in known}
     return CashewConfig(**filtered)
@@ -806,7 +618,8 @@ def save_config(
 ) -> pathlib.Path:
     """Persist the provider config to $HERMES_HOME/cashew.json (CONF-02).
 
-    Preserves unknown keys from existing files. Unknown keys in `values` are dropped.
+    Preserves unknown keys from existing files, except for the explicitly
+    removed legacy settings. Unknown keys in `values` are dropped.
     Returns the path written.
 
     Writes are UTF-8, 2-space indent, sorted keys, trailing newline — stable
@@ -817,9 +630,13 @@ def save_config(
     existing: dict[str, Any] = {}
     if path.exists():
         try:
-            existing = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(existing, dict):
-                existing = {}
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = {
+                    key: value
+                    for key, value in loaded.items()
+                    if key not in REMOVED_LEGACY_CONFIG_KEYS
+                }
         except (json.JSONDecodeError, ValueError):
             existing = {}
     known = {f.name for f in dataclasses.fields(CashewConfig)}

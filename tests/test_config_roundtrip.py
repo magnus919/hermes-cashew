@@ -1,6 +1,6 @@
 # tests/test_config_roundtrip.py
 # Phase 2 Plan 02-03: pure helper-module tests for plugins/memory/cashew/config.py.
-# Phase 10 expansion: ~30 keys aligned with upstream Cashew.
+# Runtime-backed configuration contract.
 # Exercises CashewConfig dataclass, DEFAULTS, CONFIG_FILENAME, get_config_schema,
 # resolve_config_path, resolve_db_path, load_config, save_config — all in isolation
 # from CashewMemoryProvider. Provider-level tests live in test_initialize_lifecycle.py.
@@ -18,7 +18,7 @@ from plugins.memory.cashew.config import (
     _PROVIDER_ENV_MAP,
     DEFAULTS,
     ENV_VAR_MAP,
-    UNSUPPORTED_TUNING_KEYS,
+    REMOVED_LEGACY_CONFIG_KEYS,
     CashewConfig,
     _env_var_name,
     get_ai_domain,
@@ -31,51 +31,32 @@ from plugins.memory.cashew.config import (
     save_config,
 )
 
-EXPECTED_KEY_COUNT = 38
+EXPECTED_KEY_COUNT = 17
 
 
-def test_defaults_contains_exactly_32_keys_with_documented_values():
-    """CONF-01: schema declares all ~32 keys."""
+def test_defaults_contains_exactly_the_runtime_backed_keys():
+    """CONF-01: persisted defaults expose behavior the adapter implements."""
+    assert set(DEFAULTS) == {
+        "cashew_db_path",
+        "embedding_model",
+        "embedding_device",
+        "recall_k",
+        "sync_queue_timeout",
+        "user_domain",
+        "ai_domain",
+        "auto_extraction",
+        "think_cycles",
+        "sleep_cycles",
+        "llm_aux_role",
+        "think_interval",
+        "prefetch_k",
+        "prefetch_cues",
+        "sleep_schedule",
+        "sleep_max_nodes",
+        "_features",
+    }
     assert len(DEFAULTS) == EXPECTED_KEY_COUNT
-    assert DEFAULTS["cashew_db_path"] == "cashew/brain.db"
-    assert DEFAULTS["embedding_model"] == "thenlper/gte-large"
     assert DEFAULTS["embedding_device"] == "cpu"
-    assert DEFAULTS["recall_k"] == 5
-    assert DEFAULTS["sync_queue_timeout"] == 30.0
-    assert DEFAULTS["user_domain"] == "user"
-    assert DEFAULTS["ai_domain"] == "ai"
-    assert DEFAULTS["default_domain"] == "general"
-    assert DEFAULTS["auto_classify"] is True
-    assert DEFAULTS["domain_classifications"] == [
-        "personal",
-        "work",
-        "projects",
-        "learning",
-        "system",
-    ]
-    assert DEFAULTS["domain_separation_enabled"] is True
-    assert DEFAULTS["token_budget"] == 2000
-    assert DEFAULTS["walk_depth"] == 2
-    assert DEFAULTS["similarity_threshold"] == 0.3
-    assert DEFAULTS["access_weight"] == 0.2
-    assert DEFAULTS["temporal_weight"] == 0.1
-    assert DEFAULTS["clustering_eps"] == 0.35
-    assert DEFAULTS["clustering_min_samples"] == 3
-    assert DEFAULTS["novelty_threshold"] == 0.82
-    assert DEFAULTS["max_think_iterations"] == 3
-    assert DEFAULTS["think_cycle_nodes"] == 5
-    assert DEFAULTS["gc_mode"] == "soft"
-    assert DEFAULTS["gc_threshold"] == 0.05
-    assert DEFAULTS["gc_grace_days"] == 7
-    assert DEFAULTS["gc_protect_types"] == ["seed", "core_memory"]
-    assert DEFAULTS["gc_think_cycle_penalty"] == 1.5
-    assert DEFAULTS["auto_extraction"] is True
-    assert DEFAULTS["think_cycles"] is True
-    assert DEFAULTS["sleep_cycles"] is True
-    assert DEFAULTS["decay_pruning"] is True
-    assert DEFAULTS["pattern_detection"] is True
-    assert DEFAULTS["llm_aux_role"] == "memory"
-    assert DEFAULTS["think_interval"] == 10
 
 
 def test_cashew_config_dataclass_field_set_matches_defaults():
@@ -87,12 +68,12 @@ def test_cashew_config_dataclass_field_set_matches_defaults():
 
 
 def test_get_config_schema_shape_is_list_of_field_descriptors():
-    """CONF-01 + CONFIG-07: schema returns ~30 field descriptors for hermes memory setup."""
+    """CONF-01 + CONFIG-07: setup exposes every runtime-backed field."""
     schema = get_config_schema()
     assert isinstance(schema, list)
-    assert len(schema) == EXPECTED_KEY_COUNT - len(UNSUPPORTED_TUNING_KEYS)
+    assert len(schema) == EXPECTED_KEY_COUNT
     keys = {f["key"] for f in schema}
-    assert keys == set(DEFAULTS) - UNSUPPORTED_TUNING_KEYS
+    assert keys == set(DEFAULTS)
     for field in schema:
         assert "key" in field
         assert "description" in field and len(field["description"]) >= 20, (
@@ -107,8 +88,8 @@ def test_get_config_schema_shape_is_list_of_field_descriptors():
         )
 
 
-def test_env_var_map_has_30_entries():
-    """ENV_VAR_MAP covers all 30 config keys."""
+def test_env_var_map_has_all_runtime_entries():
+    """ENV_VAR_MAP covers all runtime config keys."""
     assert len(ENV_VAR_MAP) == EXPECTED_KEY_COUNT
     for key in DEFAULTS:
         assert key in ENV_VAR_MAP
@@ -121,8 +102,8 @@ def test_env_var_name_derivation():
     assert _env_var_name("user_domain") == "CASHEW_USER_DOMAIN"
     assert _env_var_name("recall_k") == "CASHEW_RECALL_K"
     assert _env_var_name("ai_domain") == "CASHEW_AI_DOMAIN"
-    assert _env_var_name("gc_mode") == "CASHEW_GC_MODE"
     assert _env_var_name("embedding_device") == "CASHEW_EMBEDDING_DEVICE"
+    assert _env_var_name("sleep_schedule") == "CASHEW_SLEEP_SCHEDULE"
 
 
 def test_load_config_env_override_embedding_device(monkeypatch, tmp_path):
@@ -193,13 +174,13 @@ def test_cron_script_db_path_uses_profile_isolation_guard(tmp_path):
 
 
 def test_load_config_returns_defaults_when_file_absent(tmp_path):
-    """No cashew.json → defaults for all 30 keys. No exception."""
+    """No cashew.json returns all runtime defaults without error."""
     cfg = load_config(tmp_path)
     assert cfg == CashewConfig(**DEFAULTS)
 
 
 def test_load_config_merges_partial_file_over_defaults(tmp_path):
-    """Partial cashew.json (1 of 30 keys) → that key honored, others default."""
+    """A partial cashew.json honors supplied runtime values and fills defaults."""
     (tmp_path / "cashew.json").write_text(
         json.dumps({"recall_k": 9, "user_domain": "ganesh"})
     )
@@ -208,7 +189,6 @@ def test_load_config_merges_partial_file_over_defaults(tmp_path):
     assert cfg.user_domain == "ganesh"
     assert cfg.cashew_db_path == DEFAULTS["cashew_db_path"]
     assert cfg.embedding_model == DEFAULTS["embedding_model"]
-    assert cfg.gc_mode == DEFAULTS["gc_mode"]
     assert cfg.auto_extraction == DEFAULTS["auto_extraction"]
 
 
@@ -247,32 +227,11 @@ def test_load_config_env_override_int(monkeypatch, tmp_path):
     assert cfg.recall_k == 12
 
 
-def test_load_config_env_override_float(monkeypatch, tmp_path):
-    """CONFIG-03: CASHEW_SIMILARITY_THRESHOLD=0.5 overrides float field."""
-    monkeypatch.setenv("CASHEW_SIMILARITY_THRESHOLD", "0.5")
-    cfg = load_config(tmp_path)
-    assert cfg.similarity_threshold == 0.5
-
-
-def test_load_config_env_override_bool(monkeypatch, tmp_path):
-    """CONFIG-03: CASHEW_AUTO_CLASSIFY=false overrides bool field to False."""
-    monkeypatch.setenv("CASHEW_AUTO_CLASSIFY", "false")
-    cfg = load_config(tmp_path)
-    assert cfg.auto_classify is False
-
-
 def test_load_config_env_override_bool_yes(monkeypatch, tmp_path):
     """CONFIG-03: CASHEW_THINK_CYCLES=yes sets bool to True."""
     monkeypatch.setenv("CASHEW_THINK_CYCLES", "yes")
     cfg = load_config(tmp_path)
     assert cfg.think_cycles is True
-
-
-def test_load_config_env_override_list(monkeypatch, tmp_path):
-    """CONFIG-03: CASHEW_GC_PROTECT_TYPES=seed,custom overrides list field."""
-    monkeypatch.setenv("CASHEW_GC_PROTECT_TYPES", "seed, custom_type")
-    cfg = load_config(tmp_path)
-    assert cfg.gc_protect_types == ["seed", "custom_type"]
 
 
 def test_load_config_env_override_string(monkeypatch, tmp_path):
@@ -289,14 +248,6 @@ def test_load_config_env_override_invalid_int_skips(monkeypatch, tmp_path, caplo
         cfg = load_config(tmp_path)
     assert cfg.recall_k == DEFAULTS["recall_k"]
     assert "CASHEW_RECALL_K" in caplog.text or "recall_k" in caplog.text
-
-
-def test_load_config_env_override_invalid_float_skips(monkeypatch, tmp_path, caplog):
-    """CONFIG-03: invalid float env var logs warning and is skipped."""
-    monkeypatch.setenv("CASHEW_SIMILARITY_THRESHOLD", "not-a-float")
-    with caplog.at_level("WARNING", logger="plugins.memory.cashew.config"):
-        cfg = load_config(tmp_path)
-    assert cfg.similarity_threshold == DEFAULTS["similarity_threshold"]
 
 
 def test_load_config_env_overrides_file(tmp_path):
@@ -316,22 +267,21 @@ def test_save_config_roundtrip(tmp_path):
         {
             "recall_k": 7,
             "embedding_model": "BAAI/bge-small-en",
-            "similarity_threshold": 0.45,
-            "auto_classify": False,
-            "gc_protect_types": ["seed", "custom"],
+            "auto_extraction": False,
+            "prefetch_k": 8,
+            "sleep_schedule": "every 24h",
         },
         tmp_path,
     )
     cfg = load_config(tmp_path)
     assert cfg.recall_k == 7
     assert cfg.embedding_model == "BAAI/bge-small-en"
-    assert cfg.similarity_threshold == 0.45
-    assert cfg.auto_classify is False
-    assert cfg.gc_protect_types == ["seed", "custom"]
+    assert cfg.auto_extraction is False
+    assert cfg.prefetch_k == 8
+    assert cfg.sleep_schedule == "every 24h"
     assert cfg.cashew_db_path == DEFAULTS["cashew_db_path"]
     assert cfg.sync_queue_timeout == DEFAULTS["sync_queue_timeout"]
     assert cfg.user_domain == DEFAULTS["user_domain"]
-    assert cfg.gc_mode == DEFAULTS["gc_mode"]
 
 
 def test_save_config_writes_sorted_keys_with_trailing_newline(tmp_path):
@@ -403,12 +353,8 @@ def test_load_config_v0_1_0_four_key_file_gets_defaults_for_new_keys(tmp_path):
 
     assert cfg.user_domain == DEFAULTS["user_domain"]
     assert cfg.ai_domain == DEFAULTS["ai_domain"]
-    assert cfg.token_budget == DEFAULTS["token_budget"]
-    assert cfg.walk_depth == DEFAULTS["walk_depth"]
-    assert cfg.gc_mode == DEFAULTS["gc_mode"]
     assert cfg.auto_extraction == DEFAULTS["auto_extraction"]
-    assert cfg.domain_classifications == list(DEFAULTS["domain_classifications"])
-    assert cfg.gc_protect_types == list(DEFAULTS["gc_protect_types"])
+    assert cfg.prefetch_k == DEFAULTS["prefetch_k"]
 
 
 # ── resolve_model_fn tests ───────────────────────────────────────────────────
@@ -611,22 +557,39 @@ def test_resolve_model_fn_missing_base_url_uses_provider_map(tmp_path, monkeypat
     )
 
 
-def test_setup_schema_excludes_unsupported_legacy_tuning_keys():
-    from plugins.memory.cashew.config import UNSUPPORTED_TUNING_KEYS, get_config_schema
+def test_removed_legacy_keys_are_not_runtime_attributes_or_env_vars(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "cashew.json").write_text(
+        json.dumps({"walk_depth": 99, "gc_mode": "hard", "recall_k": 8})
+    )
+    monkeypatch.setenv("CASHEW_WALK_DEPTH", "12")
 
-    advertised = {field["key"] for field in get_config_schema()}
-    assert advertised.isdisjoint(UNSUPPORTED_TUNING_KEYS)
+    config = load_config(tmp_path)
+
+    assert config.recall_k == 8
+    assert not hasattr(config, "walk_depth")
+    assert not hasattr(config, "gc_mode")
+    assert "walk_depth" not in ENV_VAR_MAP
+    assert REMOVED_LEGACY_CONFIG_KEYS.isdisjoint(DEFAULTS)
 
 
-def test_non_default_legacy_tuning_value_warns(tmp_path, caplog):
-    import json
-    import logging
+def test_save_prunes_removed_legacy_keys_from_existing_file(tmp_path):
+    (tmp_path / "cashew.json").write_text(
+        json.dumps(
+            {
+                "walk_depth": 99,
+                "gc_mode": "hard",
+                "custom_user_setting": "preserved",
+                "recall_k": 8,
+            }
+        )
+    )
 
-    from plugins.memory.cashew.config import load_config
+    save_config({"prefetch_k": 6}, tmp_path)
 
-    (tmp_path / "cashew.json").write_text(json.dumps({"walk_depth": 99}))
-    with caplog.at_level(logging.WARNING, logger="plugins.memory.cashew.config"):
-        config = load_config(tmp_path)
-
-    assert config.walk_depth == 99
-    assert "Ignoring unsupported legacy Cashew settings: walk_depth" in caplog.text
+    on_disk = json.loads((tmp_path / "cashew.json").read_text())
+    assert REMOVED_LEGACY_CONFIG_KEYS.isdisjoint(on_disk)
+    assert on_disk["custom_user_setting"] == "preserved"
+    assert on_disk["recall_k"] == 8
+    assert on_disk["prefetch_k"] == 6

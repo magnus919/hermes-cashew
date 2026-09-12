@@ -10,6 +10,35 @@ explicit Hermes `auxiliary.memory` mapping for LLM-powered extraction, adds
 forest-level insight extraction via `on_pre_compress`, and runs graph
 consolidation on a persistent Hermes cron schedule.
 
+## Integrity audit
+
+Existing profiles can be inspected without opening a writable database:
+
+```bash
+python -m plugins.memory.cashew.integrity /path/to/brain.db
+```
+
+The audit uses a canonical shared maintenance lease and SQLite URI read-only
+mode. It reports schema and provider provenance, ordinary embedding validity,
+vector-index parity when the installed extension can be verified, orphan rows,
+referential graph defects, and permanence contradictions. It never runs schema
+migrations, decay, consolidation, embedding services, or repair as a side
+effect. Reports include only bounded counts and reason codes; historical merge
+intent remains an explicit manual-review item because it cannot be reconstructed
+from the stored graph safely.
+
+The explicit operator apply surface is currently fail-closed:
+
+```bash
+python -m plugins.memory.cashew.integrity --apply --confirm /path/to/brain.db
+```
+
+It returns a structured `stable_targeted_repair_api_unavailable` result and
+does not open or create the profile. Deterministic repair will be enabled only
+after Cashew exposes a connection-aware API with atomic ordinary/vector writes,
+verified backups, and repeatable post-repair checks. Do not use broad sleep or
+whole-database re-embedding as an integrity repair substitute.
+
 ## Prerequisites
 
 - [Hermes Agent](https://github.com/nousresearch/hermes-agent) installed

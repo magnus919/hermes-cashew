@@ -30,7 +30,18 @@ def _install_fake_cron(monkeypatch, jobs: list[dict]):
     package = types.ModuleType("cron")
     package.__path__ = []
     module = types.ModuleType("cron.jobs")
-    module.list_jobs = lambda: list(jobs)
+    list_calls: list[bool] = []
+
+    def list_jobs(*, include_disabled: bool = False):
+        list_calls.append(include_disabled)
+        return [
+            job
+            for job in jobs
+            if include_disabled or job.get("enabled", True) is not False
+        ]
+
+    module.list_jobs = list_jobs
+    module.list_calls = list_calls
     module.remove_job = lambda job_id: removed.append(job_id)
     module.parse_schedule = lambda schedule: schedule
 
@@ -103,6 +114,35 @@ def test_disabling_sleep_removes_persisted_job_before_host_uninstall(
     assert created == []
     assert provider._sleep_cron_job_id is None
     assert stores == [tmp_path]
+    assert sys.modules["cron.jobs"].list_calls == [True]
+
+
+def test_disabled_owned_job_is_adopted_without_creating_a_duplicate(
+    tmp_path, monkeypatch
+):
+    job = _owned_job(tmp_path, "paused", "every 12h")
+    job["enabled"] = False
+    removed, created, _updated, _stores = _install_fake_cron(monkeypatch, [job])
+    provider = _provider(tmp_path)
+
+    provider._register_sleep_cron()
+
+    assert provider._sleep_cron_job_id == "paused"
+    assert removed == []
+    assert created == []
+    assert sys.modules["cron.jobs"].list_calls == [True]
+
+
+def test_suspend_removes_disabled_owned_job(tmp_path, monkeypatch):
+    job = _owned_job(tmp_path, "paused", "every 12h")
+    job["enabled"] = False
+    removed, _created, _updated, _stores = _install_fake_cron(monkeypatch, [job])
+    provider = _provider(tmp_path)
+
+    provider._suspend_sleep_cron()
+
+    assert removed == ["paused"]
+    assert sys.modules["cron.jobs"].list_calls == [True]
 
 
 def test_schedule_change_updates_owned_job_and_refreshes_script(tmp_path, monkeypatch):
@@ -135,7 +175,7 @@ def test_matching_job_is_adopted_without_reset(tmp_path, monkeypatch):
     # can then adopt only the matching profile-tagged scheduler record.
     provider._register_sleep_cron()
     job = _owned_job(tmp_path, "current", "every 12h")
-    sys.modules["cron.jobs"].list_jobs = lambda: [job]
+    sys.modules["cron.jobs"].list_jobs = lambda *, include_disabled=False: [job]
     created.clear()
     provider = _provider(tmp_path)
 
@@ -195,7 +235,7 @@ def test_script_staging_uses_unique_cleanup_on_replace_failure(tmp_path, monkeyp
 
 
 def test_reconciliation_uses_real_profile_cron_store(tmp_path):
-    """The real Hermes API scopes, adopts, and updates this profile's job."""
+    """The real Hermes API scopes, adopts, and updates even paused owned jobs."""
     cron_jobs = pytest.importorskip("cron.jobs")
     provider = _provider(tmp_path)
     other_home = tmp_path / "other-profile"
@@ -203,12 +243,17 @@ def test_reconciliation_uses_real_profile_cron_store(tmp_path):
     try:
         provider._register_sleep_cron()
         job_id = provider._sleep_cron_job_id
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.update_job(job_id, {"enabled": False})
+
+        # Hermes omits disabled records unless callers ask for them.  Reconcile
+        # must retain this owned paused job rather than create a duplicate.
         provider._config = replace(provider._config, sleep_schedule="every 6h")
         provider._register_sleep_cron()
         with cron_jobs.use_cron_store(tmp_path):
             owned = [
                 job
-                for job in cron_jobs.list_jobs()
+                for job in cron_jobs.list_jobs(include_disabled=True)
                 if job.get("id") == provider._sleep_cron_job_id
             ]
         with cron_jobs.use_cron_store(other_home):
@@ -217,6 +262,7 @@ def test_reconciliation_uses_real_profile_cron_store(tmp_path):
         assert len(owned) == 1
         assert provider._sleep_cron_job_id == job_id
         assert owned[0]["schedule"] == cron_jobs.parse_schedule("every 6h")
+        assert owned[0]["enabled"] is False
         assert other_jobs == []
     finally:
         if provider._sleep_cron_job_id:

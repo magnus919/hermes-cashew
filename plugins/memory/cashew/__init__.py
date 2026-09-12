@@ -1393,7 +1393,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             # read/reconcile/write transaction in this profile's store rather
             # than relying on the process-wide active Hermes home.
             with profile_cron_lock(home), use_cron_store(home):
-                existing = [job for job in list_jobs() if isinstance(job, dict)]
+                existing = [
+                    job
+                    for job in list_jobs(include_disabled=True)
+                    if isinstance(job, dict)
+                ]
                 owned = [job for job in existing if owns_job(job, profile_id)]
                 if not enabled:
                     for job in owned:
@@ -1473,7 +1477,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             home = self._hermes_home
             profile_id = profile_identity(home)
             with profile_cron_lock(home), use_cron_store(home):
-                for job in list_jobs():
+                for job in list_jobs(include_disabled=True):
                     if isinstance(job, dict) and owns_job(job, profile_id):
                         job_id = job.get("id")
                         if isinstance(job_id, str):

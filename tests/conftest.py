@@ -22,6 +22,13 @@ def _clear_cashew_env_vars(monkeypatch: pytest.MonkeyPatch):
     for key in list(os.environ):
         if key.startswith("CASHEW_"):
             monkeypatch.delenv(key, raising=False)
+    yield
+    try:
+        from plugins.memory.cashew.embedding_process import _close_owner_for_tests
+
+        _close_owner_for_tests()
+    except ImportError:
+        pass
 
 
 # Synthesize agent.memory_provider if hermes-agent is not installed.
@@ -137,9 +144,10 @@ def fake_embedder(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _mock_heavy_imports(monkeypatch: pytest.MonkeyPatch):
-    """Mock sklearn and SentenceTransformer so sleep_refactor tests run offline.
+    """Mock sklearn and reject parent-process SentenceTransformer construction.
 
-    Provides a pure-numpy cosine_similarity fallback and a no-op SentenceTransformer.
+    Provides a pure-numpy cosine_similarity fallback. Native embedding tests
+    inject their fake only into the subprocess import path.
     """
     import numpy as np
 
@@ -151,29 +159,10 @@ def _mock_heavy_imports(monkeypatch: pytest.MonkeyPatch):
         return np.dot(x_norm, x_norm.T)
 
     class _FakeSentenceTransformer:
-        """No-op SentenceTransformer that returns deterministic embeddings."""
+        """Fail if a production path constructs a model in the pytest host."""
 
         def __init__(self, model_name: str = "", device: str | None = None):
-            self.model_name = model_name
-            self.device = device
-
-        def encode(
-            self, texts, normalize_embeddings: bool = True, **kwargs
-        ) -> np.ndarray:
-            if isinstance(texts, str):
-                texts = [texts]
-            # Deterministic: hash-based embedding
-            dim = 384
-            vecs = np.zeros((len(texts), dim), dtype=np.float32)
-            for i, t in enumerate(texts):
-                seed = abs(hash(t)) % 2**31
-                rng = np.random.RandomState(seed)
-                vecs[i] = rng.randn(dim).astype(np.float32)
-            if normalize_embeddings:
-                norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-                norms[norms == 0] = 1.0
-                vecs = vecs / norms
-            return vecs if len(vecs) > 1 else vecs[0]
+            raise AssertionError("SentenceTransformer constructed in pytest host")
 
     # Mock sklearn.metrics.pairwise.cosine_similarity
     monkeypatch.setattr(
@@ -182,7 +171,7 @@ def _mock_heavy_imports(monkeypatch: pytest.MonkeyPatch):
         raising=False,
     )
 
-    # Mock SentenceTransformer at the import level — used inside _embed_orphans()
+    # Keep any accidental in-process native model construction loud and offline.
     import sys
 
     _had_st = "sentence_transformers" in sys.modules

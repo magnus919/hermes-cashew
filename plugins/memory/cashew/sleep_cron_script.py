@@ -72,6 +72,8 @@ def _load_profile_modules(hermes_home: Path):
     if (
         not (implementation / "config.py").is_file()
         or not (implementation / "sleep_refactor.py").is_file()
+        or not (implementation / "embedding_process.py").is_file()
+        or not (implementation / "embedding_worker.py").is_file()
     ):
         raise RuntimeError(
             "Cashew installation is incomplete for this cron job; reinstall or "
@@ -119,17 +121,30 @@ def main() -> None:
     # Resolve the LLM callable from auxiliary config for dream generation.
     model_fn = config_module.resolve_model_fn(hermes_home=hermes_home, config=config)
 
-    result = sleep_module.run_sleep_cycle(
-        db_path=db_path,
-        limit=config.sleep_max_nodes,
-        model_fn=model_fn,
-        # This process owns the scheduled cycle and exits immediately after
-        # printing the result. Keep dream generation and orphan embedding
-        # synchronous so they complete before interpreter shutdown.
-        background_dream=False,
-        embedding_model=config.embedding_model,
-        embedding_device=config.embedding_device,
+    process_module = importlib.import_module(
+        f"{sleep_module.__package__}.embedding_process"
     )
+    supervisor = process_module.EmbeddingSupervisor(
+        model=config.embedding_model,
+        device=config.embedding_device,
+        dimension=0,
+        cache_dir=hermes_home / "cashew" / "model-cache",
+    )
+    try:
+        result = sleep_module.run_sleep_cycle(
+            db_path=db_path,
+            limit=config.sleep_max_nodes,
+            model_fn=model_fn,
+            # This process owns the scheduled cycle and exits immediately after
+            # printing the result. Keep dream generation and orphan embedding
+            # synchronous so they complete before interpreter shutdown.
+            background_dream=False,
+            embedding_model=config.embedding_model,
+            embedding_device=config.embedding_device,
+            embedding_client=supervisor,
+        )
+    finally:
+        supervisor.close()
     print(json.dumps(result, indent=2))
 
 

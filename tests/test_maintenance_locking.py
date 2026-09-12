@@ -190,7 +190,9 @@ def test_initialize_survives_acquisition_failure_when_inspection_needs_no_migrat
         return real_flock(handle, operation)
 
     monkeypatch.setattr(locking.fcntl, "flock", denied_lock)
-    monkeypatch.setattr(cashew_module, "_patch_upstream_embedding", lambda *_: None)
+    monkeypatch.setattr(
+        cashew_module, "_patch_upstream_embedding", lambda *_, **__: None
+    )
     monkeypatch.setattr(CashewMemoryProvider, "_ensure_db_schema", lambda *_: None)
     monkeypatch.setattr(
         CashewMemoryProvider, "_embedding_dimensions", lambda *_: (set(), None)
@@ -231,7 +233,9 @@ def test_initialize_degrades_when_acquisition_failure_hides_required_migration(
         return real_flock(handle, operation)
 
     monkeypatch.setattr(locking.fcntl, "flock", denied_lock)
-    monkeypatch.setattr(cashew_module, "_patch_upstream_embedding", lambda *_: None)
+    monkeypatch.setattr(
+        cashew_module, "_patch_upstream_embedding", lambda *_, **__: None
+    )
     monkeypatch.setattr(CashewMemoryProvider, "_ensure_db_schema", lambda *_: None)
     monkeypatch.setattr(
         CashewMemoryProvider, "_embedding_dimensions", lambda *_: ({384}, 384)
@@ -275,7 +279,9 @@ def test_initialize_respects_held_aged_lock_without_removing_it(
         nonlocal migration_called
         migration_called = True
 
-    monkeypatch.setattr(cashew_module, "_patch_upstream_embedding", lambda *_: None)
+    monkeypatch.setattr(
+        cashew_module, "_patch_upstream_embedding", lambda *_, **__: None
+    )
     monkeypatch.setattr(CashewMemoryProvider, "_ensure_db_schema", lambda *_: None)
     monkeypatch.setattr(
         CashewMemoryProvider, "_repair_embedding_dimension_locked", migration_locked

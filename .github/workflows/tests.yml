@@ -30,9 +30,13 @@ jobs:
           python-version: "3.12"
 
       - name: Install
+        env:
+          UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/uv-python
+          UV_PYTHON_BIN_DIR: ${{ runner.temp }}/uv-python-bin
         run: |
           python -m pip install "uv==0.11.18"
-          uv sync --frozen --extra dev
+          uv python install --managed-python "3.12.11"
+          uv sync --frozen --extra dev --managed-python --python "3.12.11"
         timeout-minutes: 5
 
       - name: Verify Cashew source and SQLite migration capability
@@ -117,16 +121,20 @@ jobs:
           python-version: "3.12"
 
       - name: Build wheel
+        env:
+          UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/uv-python
+          UV_PYTHON_BIN_DIR: ${{ runner.temp }}/uv-python-bin
         run: |
           python -m pip install "uv==0.11.18"
-          uv sync --frozen --extra dev
+          uv python install --managed-python "3.12.11"
+          uv sync --frozen --extra dev --managed-python --python "3.12.11"
           .venv/bin/python -m build
 
       - name: CI-02 — install wheel into clean venv and verify discovery
         run: |
           set -o pipefail
           WHEEL_SMOKE_VENV="$RUNNER_TEMP/hermes-cashew-wheel-smoke"
-          python -m venv --clear "$WHEEL_SMOKE_VENV"
+          .venv/bin/python -m venv --clear "$WHEEL_SMOKE_VENV"
           {
             "$WHEEL_SMOKE_VENV/bin/pip" install dist/*.whl
             "$WHEEL_SMOKE_VENV/bin/python" -c "import plugins.memory.cashew; print(plugins.memory.cashew.__file__)"
@@ -145,7 +153,7 @@ jobs:
           set -o pipefail
           FLAT_SMOKE_VENV="$RUNNER_TEMP/hermes-cashew-flat-smoke"
           FLAT_DEP="$(.venv/bin/python -c "import yaml; print(next(d for d in yaml.safe_load(open('plugin.yaml'))['pip_dependencies'] if d.startswith('cashew-brain ')))")"
-          python -m venv --clear "$FLAT_SMOKE_VENV"
+          .venv/bin/python -m venv --clear "$FLAT_SMOKE_VENV"
           {
             # Model an existing user on the public 1.2.1 wheel, then apply the
             # manifest source without relying on a higher version number.

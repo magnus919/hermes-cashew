@@ -64,9 +64,13 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install
+        env:
+          UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/uv-python
+          UV_PYTHON_BIN_DIR: ${{ runner.temp }}/uv-python-bin
         run: |
           python -m pip install "uv==0.11.18"
-          uv sync --frozen --extra dev
+          uv python install --managed-python "3.12.11"
+          uv sync --frozen --extra dev --managed-python --python "3.12.11"
       - name: Verify Cashew source and SQLite migration capability
         run: .venv/bin/python scripts/verify-cashew-baseline.py
       - name: Run tests
@@ -110,9 +114,13 @@ jobs:
             echo "→ $f: version ${VERSION}"
           done
       - name: Install build dependencies
+        env:
+          UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/uv-python
+          UV_PYTHON_BIN_DIR: ${{ runner.temp }}/uv-python-bin
         run: |
           python -m pip install "uv==0.11.18"
-          uv sync --frozen --extra dev
+          uv python install --managed-python "3.12.11"
+          uv sync --frozen --extra dev --managed-python --python "3.12.11"
       - name: Build wheel and sdist
         run: .venv/bin/python -m build
       - name: Upload dist artifacts

@@ -102,6 +102,50 @@ def test_ci_and_contributor_docs_use_frozen_uv_lock() -> None:
     assert "uv sync --frozen --extra dev" in readme
     assert "uv sync --frozen --extra dev" in contributing
     assert "--cov-fail-under=75" in tests_workflow
-    assert "${{ runner.temp }}" not in tests_workflow
+    tests_config = yaml.safe_load(tests_workflow)
+    for job in tests_config["jobs"].values():
+        assert "${{ runner.temp }}" not in " ".join(job.get("env", {}).values())
     assert 'WHEEL_SMOKE_VENV="$RUNNER_TEMP/' in tests_workflow
     assert 'FLAT_SMOKE_VENV="$RUNNER_TEMP/' in tests_workflow
+
+
+def test_ci_uses_scoped_managed_python_for_sqlite_baseline() -> None:
+    expected_install = 'uv python install --managed-python "3.12.11"'
+    expected_sync = 'uv sync --frozen --extra dev --managed-python --python "3.12.11"'
+    expected_env = {
+        "UV_PYTHON_INSTALL_DIR": "${{ runner.temp }}/uv-python",
+        "UV_PYTHON_BIN_DIR": "${{ runner.temp }}/uv-python-bin",
+    }
+
+    tests = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
+    release = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
+    managed_steps = (
+        next(
+            step
+            for step in tests["jobs"]["test"]["steps"]
+            if step.get("name") == "Install"
+        ),
+        next(
+            step
+            for step in tests["jobs"]["wheel-smoke"]["steps"]
+            if step.get("name") == "Build wheel"
+        ),
+        next(
+            step
+            for step in release["jobs"]["test"]["steps"]
+            if step.get("name") == "Install"
+        ),
+        next(
+            step
+            for step in release["jobs"]["build"]["steps"]
+            if step.get("name") == "Install build dependencies"
+        ),
+    )
+    for step in managed_steps:
+        assert step["env"] == expected_env
+        assert expected_install in step["run"]
+        assert expected_sync in step["run"]
+
+    tests_text = (ROOT / ".github/workflows/tests.yml").read_text()
+    assert '.venv/bin/python -m venv --clear "$WHEEL_SMOKE_VENV"' in tests_text
+    assert '.venv/bin/python -m venv --clear "$FLAT_SMOKE_VENV"' in tests_text

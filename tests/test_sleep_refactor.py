@@ -15,6 +15,7 @@ import warnings
 import numpy as np
 import pytest
 
+from plugins.memory.cashew.locking import try_maintenance_lock
 from plugins.memory.cashew.sleep_refactor import (
     _batch_cross_links,
     _compute_metrics,
@@ -869,6 +870,143 @@ def test_run_sleep_cycle_too_few_nodes(empty_graph):
     result = run_sleep_cycle(empty_graph, limit=100, model_fn=None)
     assert "error" in result
     assert result["error"] in ("too few nodes", "no nodes selected")
+
+
+def test_run_sleep_cycle_skips_held_custom_database_lock(small_graph):
+    """Consolidation uses the configured database's stable maintenance lock."""
+    with try_maintenance_lock(small_graph) as lock_fd:
+        assert lock_fd is not None
+        assert run_sleep_cycle(small_graph, model_fn=None) == {}
+
+
+class _TrackedConnection:
+    def __init__(self, connection):
+        self._connection = connection
+        self.closed = False
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+    def close(self):
+        self.closed = True
+        return self._connection.close()
+
+
+def test_run_sleep_cycle_closes_resources_on_too_few_nodes(empty_graph, monkeypatch):
+    """The early return releases the connection and its maintenance lock."""
+    import plugins.memory.cashew.sleep_refactor as sleep
+
+    real_connect = sleep.sqlite3.connect
+    opened = []
+
+    def tracked_connect(*args, **kwargs):
+        connection = _TrackedConnection(real_connect(*args, **kwargs))
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(sleep.sqlite3, "connect", tracked_connect)
+
+    assert (
+        run_sleep_cycle(empty_graph, limit=100, model_fn=None)["error"]
+        == "too few nodes"
+    )
+    assert len(opened) == 1
+    assert opened[0].closed is True
+    with try_maintenance_lock(empty_graph) as lock_fd:
+        assert lock_fd is not None
+
+
+def test_run_sleep_cycle_closes_resources_after_normal_completion(
+    small_graph, monkeypatch
+):
+    """A successful synchronous cycle closes its owned SQLite connection."""
+    import plugins.memory.cashew.sleep_refactor as sleep
+
+    real_connect = sleep.sqlite3.connect
+    opened = []
+
+    def tracked_connect(*args, **kwargs):
+        connection = _TrackedConnection(real_connect(*args, **kwargs))
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(sleep.sqlite3, "connect", tracked_connect)
+
+    assert "error" not in run_sleep_cycle(small_graph, model_fn=None)
+    assert opened
+    assert opened[0].closed is True
+
+
+def test_run_sleep_cycle_closes_resources_when_wal_setup_fails(db_path, monkeypatch):
+    """Connection creation followed by WAL setup failure cannot leak the lock."""
+    import plugins.memory.cashew.sleep_refactor as sleep
+
+    real_connect = sleep.sqlite3.connect
+    opened = []
+
+    def tracked_connect(*args, **kwargs):
+        connection = _TrackedConnection(real_connect(*args, **kwargs))
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(sleep.sqlite3, "connect", tracked_connect)
+    monkeypatch.setattr(
+        sleep, "_set_wal", lambda _: (_ for _ in ()).throw(RuntimeError("wal"))
+    )
+
+    with pytest.raises(RuntimeError, match="wal"):
+        run_sleep_cycle(db_path, model_fn=None)
+    assert len(opened) == 1
+    assert opened[0].closed is True
+    with try_maintenance_lock(db_path) as lock_fd:
+        assert lock_fd is not None
+
+
+def test_run_sleep_cycle_releases_lock_before_sqlite_connection_exists(
+    db_path, monkeypatch
+):
+    """A connection-open failure leaves no maintenance lock owner behind."""
+    import plugins.memory.cashew.sleep_refactor as sleep
+
+    monkeypatch.setattr(
+        sleep.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("open")
+        ),
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="open"):
+        run_sleep_cycle(db_path, model_fn=None)
+    with try_maintenance_lock(db_path) as lock_fd:
+        assert lock_fd is not None
+
+
+def test_run_sleep_cycle_closes_resources_when_pipeline_fails(small_graph, monkeypatch):
+    """A synchronous consolidation failure closes its resources before raising."""
+    import plugins.memory.cashew.sleep_refactor as sleep
+
+    real_connect = sleep.sqlite3.connect
+    opened = []
+
+    def tracked_connect(*args, **kwargs):
+        connection = _TrackedConnection(real_connect(*args, **kwargs))
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(sleep.sqlite3, "connect", tracked_connect)
+    monkeypatch.setattr(
+        sleep,
+        "_find_candidates",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("pipeline")),
+    )
+
+    with pytest.raises(RuntimeError, match="pipeline"):
+        run_sleep_cycle(small_graph, model_fn=None)
+    assert len(opened) == 1
+    assert opened[0].closed is True
+    with try_maintenance_lock(small_graph) as lock_fd:
+        assert lock_fd is not None
 
 
 def test_run_sleep_cycle_respects_limit(small_graph):

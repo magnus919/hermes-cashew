@@ -2,7 +2,6 @@
 # Source: Pattern mirrored from plugins/memory/hindsight/__init__.py (NousResearch/hermes-agent@main)
 from __future__ import annotations
 
-import fcntl
 import logging
 import os
 import pathlib
@@ -20,6 +19,7 @@ from .embedding import (
     normalize_embedding_device,
 )
 from .error_tracking import capture_exception, set_plugin_context
+from .locking import lock_path_for_db, try_maintenance_lock
 from .log_filter import add_scrub_filter
 from .metrics import _METRICS
 from .tracing import trace_operation
@@ -523,8 +523,6 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         "cashew-brain dependency missing"
                     )
                 self._db_path.parent.mkdir(parents=True, exist_ok=True)
-                # Self-healing — clean up stale state from prior crashes.
-                self._heal_stale_lock()
                 self._ensure_db_schema(self._db_path)
                 self._repair_embedding_dimension(self._db_path)
                 self._retriever = ContextRetriever(db_path=str(self._db_path))
@@ -804,36 +802,6 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     q.task_done()
                     _METRICS.set_queue_depth(q.qsize())
 
-    def _heal_stale_lock(self) -> None:
-        """Remove stale sleep-cycle lock files left by prior crashes.
-
-        The sleep cycle creates ``brain.db.sleep.lock`` while running. If the
-        process is killed (SIGKILL, power loss, OOM) before the lock is
-        released, the file persists and blocks future sleep cycles.
-
-        Rule: any lock file older than 60 minutes is considered stale and
-        removed silently.  Newer locks are left alone (the sleep cycle may
-        still be running in another process).
-        """
-        import time
-
-        stale_threshold = 3600  # 60 minutes in seconds
-        if self._db_path is None:
-            return
-        lock_path = self._db_path.parent / "brain.db.sleep.lock"
-        if lock_path.exists():
-            age = time.time() - lock_path.stat().st_mtime
-            if age > stale_threshold:
-                lock_path.unlink(missing_ok=True)
-                logger.info(
-                    "cashew self-heal: removed stale sleep lock (age=%.0fs)", age
-                )
-            elif age > 0:
-                logger.debug(
-                    "cashew self-heal: sleep lock is fresh (age=%.0fs) — leaving in place",
-                    age,
-                )
-
     def _ensure_db_schema(self, db_path: pathlib.Path) -> None:
         """Create or migrate Cashew schema tables.
 
@@ -921,23 +889,16 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         the same advisory lock as the sleep cycle so separate Hermes processes
         cannot mutate the graph during migration.
         """
-        lock_path = pathlib.Path(f"{db_path}.sleep.lock")
-        lock_fd = lock_path.open("a+")
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            lock_fd.close()
-            logger.warning(
-                "embedding dimension migration deferred; another Cashew process "
-                "holds %s",
-                lock_path,
-            )
-            return
-        try:
+        lock_path = lock_path_for_db(db_path)
+        with try_maintenance_lock(db_path) as lock_fd:
+            if lock_fd is None:
+                logger.warning(
+                    "embedding dimension migration deferred; another Cashew process "
+                    "holds %s",
+                    lock_path,
+                )
+                return
             self._repair_embedding_dimension_locked(db_path)
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            lock_fd.close()
 
     def _repair_embedding_dimension_locked(self, db_path: pathlib.Path) -> None:
         """Repair dimensions while the cross-process Cashew lock is held."""

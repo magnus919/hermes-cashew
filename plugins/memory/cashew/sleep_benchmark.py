@@ -207,7 +207,7 @@ def _timed_phases(
             setattr(sleep_refactor, name, original)
 
 
-def measure_sleep_cycle(
+def _measure_sleep_cycle(
     db_path: pathlib.Path,
     *,
     node_count: int,
@@ -362,10 +362,32 @@ def measure_sleep_cycle(
     }
 
 
-def run_benchmark(**kwargs: Any) -> dict[str, Any]:
-    """Create a temporary database, run :func:`measure_sleep_cycle`, clean up."""
+def run_benchmark(
+    *,
+    node_count: int,
+    orphan_count: int,
+    delay_s: float = 0.05,
+    limit: int | None = None,
+    max_edges: int = 100_000,
+    pair_similarity: float | None = None,
+    dimension: int = DEFAULT_DIMENSION,
+) -> dict[str, Any]:
+    """Run a benchmark in temporary storage owned by this function.
+
+    The public API intentionally has no database-path argument.  Benchmark
+    callers cannot point the probe at a live Hermes profile or user database.
+    """
     with tempfile.TemporaryDirectory(prefix="hermes-cashew-sleep-") as temp_dir:
-        return measure_sleep_cycle(pathlib.Path(temp_dir) / "brain.db", **kwargs)
+        return _measure_sleep_cycle(
+            pathlib.Path(temp_dir) / "brain.db",
+            node_count=node_count,
+            orphan_count=orphan_count,
+            delay_s=delay_s,
+            limit=limit,
+            max_edges=max_edges,
+            pair_similarity=pair_similarity,
+            dimension=dimension,
+        )
 
 
 def main() -> None:

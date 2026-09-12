@@ -2,9 +2,21 @@
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 from plugins.memory.cashew.sleep_benchmark import run_benchmark
+
+
+def test_benchmark_public_api_owns_storage(tmp_path) -> None:
+    """The public benchmark cannot mutate a caller-selected database path."""
+    assert "db_path" not in inspect.signature(run_benchmark).parameters
+
+    caller_path = tmp_path / "caller.db"
+    with pytest.raises(TypeError):
+        run_benchmark(node_count=2, orphan_count=0, db_path=caller_path)
+    assert not caller_path.exists()
 
 
 def test_benchmark_is_deterministic_and_records_phase_and_contention_evidence() -> None:

@@ -31,6 +31,10 @@ def _install_fake_cron(monkeypatch, jobs: list[dict]):
 
 
 def _provider(tmp_path: Path, **changes) -> CashewMemoryProvider:
+    source = Path(__file__).parents[1] / "plugins" / "memory" / "cashew"
+    anchor = tmp_path / "hermes-agent" / "plugins" / "memory" / "cashew"
+    anchor.parent.mkdir(parents=True, exist_ok=True)
+    anchor.symlink_to(source, target_is_directory=True)
     provider = CashewMemoryProvider()
     provider._hermes_home = tmp_path
     provider._config = replace(CashewConfig(), **changes)
@@ -66,8 +70,7 @@ def test_schedule_change_replaces_job_and_refreshes_script(tmp_path, monkeypatch
     assert removed == ["old"]
     assert created[0]["schedule"] == "every 6h"
     assert provider._sleep_cron_job_id == "replacement"
-    packaged = Path(__file__).parents[1] / "plugins/memory/cashew/sleep_cron_script.py"
-    assert script.read_text() == packaged.read_text()
+    assert "_INSTALLATION_MARKER = {" in script.read_text()
 
 
 def test_matching_job_is_adopted_without_reset(tmp_path, monkeypatch):

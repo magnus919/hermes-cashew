@@ -602,6 +602,35 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             script_source = (
                 pathlib.Path(__file__).parent / "sleep_cron_script.py"
             ).read_text()
+            implementation = pathlib.Path(__file__).parent.resolve()
+            flat_anchor = self._hermes_home / "plugins" / "cashew"
+            dev_anchor = (
+                self._hermes_home / "hermes-agent" / "plugins" / "memory" / "cashew"
+            )
+            if (
+                flat_anchor / "plugins" / "memory" / "cashew"
+            ).resolve() == implementation:
+                marker = {
+                    "kind": "flat",
+                    "anchor": "plugins/cashew",
+                    "implementation": str(implementation),
+                }
+            elif dev_anchor.resolve() == implementation:
+                marker = {
+                    "kind": "development",
+                    "anchor": "hermes-agent/plugins/memory/cashew",
+                    "implementation": str(implementation),
+                }
+            else:
+                raise RuntimeError(
+                    "Cashew must be installed at the selected HERMES_HOME flat or "
+                    "development anchor before its cron job can be registered"
+                )
+            script_source = script_source.replace(
+                "_INSTALLATION_MARKER = None",
+                f"_INSTALLATION_MARKER = {marker!r}",
+                1,
+            )
             script_dest = self._hermes_home / "scripts" / "cashew-sleep-cycle.py"
             script_dest.parent.mkdir(parents=True, exist_ok=True)
             if not script_dest.exists() or script_dest.read_text() != script_source:

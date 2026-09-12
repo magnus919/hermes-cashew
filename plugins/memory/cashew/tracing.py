@@ -181,6 +181,9 @@ def trace_operation(
     try:
         yield span
     except BaseException as error:
+        # Automatic exception recording is disabled at span creation, so ensure
+        # the safe proxy records the fixed event before context teardown.
+        span._set_error(error)
         try:
             context.__exit__(type(error), error, error.__traceback__)
         except Exception:

@@ -38,7 +38,7 @@ from .locking import (
     lock_path_for_db,
     try_maintenance_lock,
 )
-from .log_filter import add_scrub_filter
+from .log_filter import acquire_provider_scrub_filters, release_provider_scrub_filters
 from .metrics import _METRICS
 from .tracing import trace_operation
 
@@ -90,9 +90,6 @@ def _retrieve_with_embedding_wait(**kwargs: Any) -> Any:
     with embedding_caller_wait(1.5):
         return retrieve_recursive_bfs(**kwargs)
 
-
-# Install scrub filter on the cashew logger so all log output is sanitized.
-add_scrub_filter(logger)
 
 # Issue #18: sentence-transformers emits INFO-level progress bars and BertModel
 # load reports directly to the terminal during embedding. That noise leaks into
@@ -476,6 +473,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         # Optional diagnostics are explicitly enabled and owned by this
         # provider generation. It is closed only after accepted workers drain.
         self._sentry_telemetry: SentryTelemetry | None = None
+        self._log_scrub_acquired = False
 
     @property
     def name(self) -> str:
@@ -656,6 +654,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             # after a prior shutdown.
             self._shutdown_started.clear()
             self._shutdown_flag.clear()
+            acquire_provider_scrub_filters()
+            self._log_scrub_acquired = True
             self._sentry_telemetry = start_sentry_telemetry()
             with trace_operation("cashew.initialize"):
                 self._config = load_config(self._hermes_home)
@@ -789,6 +789,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 close_model()
             close_sentry_telemetry(telemetry)
             self._close_embedding_runtime(supervisor)
+            if self._log_scrub_acquired:
+                release_provider_scrub_filters()
+                self._log_scrub_acquired = False
         except Exception as _exc:
             capture_exception(
                 _exc,
@@ -826,6 +829,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 close_model()
             close_sentry_telemetry(telemetry)
             self._close_embedding_runtime(supervisor)
+            if self._log_scrub_acquired:
+                release_provider_scrub_filters()
+                self._log_scrub_acquired = False
         finally:
             with self._lifecycle_lock:
                 self._initializing = False
@@ -2277,6 +2283,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             timeout=embedding_close_timeout,
             mark_stopped=True,
         )
+        if self._log_scrub_acquired:
+            release_provider_scrub_filters()
+            self._log_scrub_acquired = False
 
     def prefetch(  # noqa: C901 - retrieval fallback branches preserve the adapter contract
         self,

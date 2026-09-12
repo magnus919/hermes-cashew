@@ -149,7 +149,12 @@ Enable in `cashew.json` under the `_features` key:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `experimental_batch_sync` | `false` | Drain up to 8 sync turns per worker iteration instead of one-at-a-time |
-| `experimental_parallel_retrieval` | `false` | Use parallel retrieval paths for semantic search |
+
+The former `experimental_parallel_retrieval` setting is retired. Existing
+profiles still load; saving removes that setting. Recall always uses upstream
+retrieval first, with keyword fallback for an empty result or failure. This
+removes the competing retrieval threads and timing-dependent result selection;
+it does not impose a deadline on the normal upstream call.
 
 Environment variables override config values: prefix any key with `CASHEW_`
 (e.g. `CASHEW_RECALL_K=10`).

@@ -301,7 +301,7 @@ def test_prefetch_warm_result_is_copied_and_limited_at_format_time(tmp_path):
         ("prefetch_cues", 0),
         ("user_domain", "other-user"),
         ("ai_domain", "other-ai"),
-        ("_features", {"experimental_parallel_retrieval": True}),
+        ("_features", {"experimental_batch_sync": True}),
     ],
 )
 def test_late_prefetch_rejects_each_same_session_identity_change(

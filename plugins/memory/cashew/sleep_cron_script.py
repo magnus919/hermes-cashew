@@ -115,40 +115,49 @@ def main() -> None:
     """Discover config, import sleep_refactor, run one cycle, print JSON."""
     hermes_home = _find_hermes_home()
     config_module, sleep_module = _load_profile_modules(hermes_home)
-    config = config_module.load_config(hermes_home)
-    db_path = _resolve_db_path(hermes_home, config.cashew_db_path, config_module)
-
-    # Resolve the LLM callable from auxiliary config for dream generation.
-    model_fn = config_module.resolve_model_fn(hermes_home=hermes_home, config=config)
-
-    process_module = importlib.import_module(
-        f"{sleep_module.__package__}.embedding_process"
+    log_filter_module = importlib.import_module(
+        f"{sleep_module.__package__}.log_filter"
     )
-    supervisor = process_module.EmbeddingSupervisor(
-        model=config.embedding_model,
-        device=config.embedding_device,
-        dimension=0,
-        cache_dir=hermes_home / "cashew" / "model-cache",
-    )
+    log_filter_module.acquire_provider_scrub_filters()
     try:
-        # Validate the child model/dimension before sleep reads or writes any
-        # semantic state; no parent-process model fallback is permitted.
-        supervisor.start()
-        result = sleep_module.run_sleep_cycle(
-            db_path=db_path,
-            limit=config.sleep_max_nodes,
-            model_fn=model_fn,
-            # This process owns the scheduled cycle and exits immediately after
-            # printing the result. Keep dream generation and orphan embedding
-            # synchronous so they complete before interpreter shutdown.
-            background_dream=False,
-            embedding_model=config.embedding_model,
-            embedding_device=config.embedding_device,
-            embedding_client=supervisor,
+        config = config_module.load_config(hermes_home)
+        db_path = _resolve_db_path(hermes_home, config.cashew_db_path, config_module)
+
+        # Resolve the LLM callable from auxiliary config for dream generation.
+        model_fn = config_module.resolve_model_fn(
+            hermes_home=hermes_home, config=config
         )
+
+        process_module = importlib.import_module(
+            f"{sleep_module.__package__}.embedding_process"
+        )
+        supervisor = process_module.EmbeddingSupervisor(
+            model=config.embedding_model,
+            device=config.embedding_device,
+            dimension=0,
+            cache_dir=hermes_home / "cashew" / "model-cache",
+        )
+        try:
+            # Validate the child model/dimension before sleep reads or writes any
+            # semantic state; no parent-process model fallback is permitted.
+            supervisor.start()
+            result = sleep_module.run_sleep_cycle(
+                db_path=db_path,
+                limit=config.sleep_max_nodes,
+                model_fn=model_fn,
+                # This process owns the scheduled cycle and exits immediately after
+                # printing the result. Keep dream generation and orphan embedding
+                # synchronous so they complete before interpreter shutdown.
+                background_dream=False,
+                embedding_model=config.embedding_model,
+                embedding_device=config.embedding_device,
+                embedding_client=supervisor,
+            )
+        finally:
+            supervisor.close()
+        print(json.dumps(result, indent=2))
     finally:
-        supervisor.close()
-    print(json.dumps(result, indent=2))
+        log_filter_module.release_provider_scrub_filters()
 
 
 if __name__ == "__main__":

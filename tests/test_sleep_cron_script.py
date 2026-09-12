@@ -65,17 +65,33 @@ def _write_installation(implementation: Path, identity: str) -> None:
         "    def close(self): _event('close')\n"
     )
     (implementation / "embedding_worker.py").write_text("# test worker marker\n")
+    (implementation / "log_filter.py").write_text(
+        (Path(provider_module.__file__).parent / "log_filter.py").read_text()
+    )
     (implementation / "sleep_refactor.py").write_text(
+        "import logging\n"
         "import os\n"
         "from pathlib import Path\n"
         "from .companion import IDENTITY\n"
         "from . import embedding\n"
+        "def _generate_dream():\n"
+        "    raise RuntimeError('CONTENT-CANARY /private/profile SECRET-CANARY')\n"
         "def run_sleep_cycle(**kwargs):\n"
         "    path = os.environ.get('CRON_EVENTS')\n"
         "    if path:\n"
         "        with open(path, 'a') as handle: handle.write('run\\n')\n"
         "    if os.environ.get('CRON_RAISE'):\n"
         "        raise RuntimeError('synthetic cron failure')\n"
+        "    if os.environ.get('CRON_GENERATE_DREAM_FAILURE'):\n"
+        "        root = logging.getLogger()\n"
+        "        core = logging.getLogger('core')\n"
+        "        root.addHandler(logging.StreamHandler())\n"
+        "        core.addHandler(logging.StreamHandler())\n"
+        "        try:\n"
+        "            _generate_dream()\n"
+        "        except RuntimeError as error:\n"
+        "            root.warning('dream failed: %s', error, exc_info=True)\n"
+        "            core.error('dream failed: %s', error, exc_info=True)\n"
         "    assert kwargs['background_dream'] is False\n"
         "    Path(os.environ['PHASE_MARKER']).write_text(IDENTITY)\n"
         "    return {\n"
@@ -369,7 +385,10 @@ def test_main_uses_pinned_module_to_reject_invalid_profile_config(
     monkeypatch.setattr(
         sleep_cron_script,
         "_load_profile_modules",
-        lambda _home: (profile_config, object()),
+        lambda _home: (
+            profile_config,
+            types.SimpleNamespace(__package__="plugins.memory.cashew"),
+        ),
     )
     with pytest.raises(ValueError, match="sleep_max_nodes must be an integer"):
         sleep_cron_script.main()
@@ -394,3 +413,34 @@ def test_unmarked_copied_script_requests_reinitialization(tmp_path: Path) -> Non
 
     assert completed.returncode == 1
     assert "reinitialize Cashew" in completed.stderr
+
+
+def test_generated_cron_scrubs_caught_dream_failure_at_dynamic_root_and_core_handlers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The generated script owns and releases its dynamic logging boundary."""
+    hermes_home, script, _implementation = _generate_script(
+        tmp_path, monkeypatch, "flat"
+    )
+    marker = tmp_path / "phase-complete"
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        cwd=tmp_path,
+        env={
+            "HERMES_HOME": str(hermes_home),
+            "PATH": os.defpath,
+            "PYTHONPATH": "",
+            "PHASE_MARKER": str(marker),
+            "CRON_GENERATE_DREAM_FAILURE": "1",
+        },
+    )
+
+    emitted = completed.stderr
+    for canary in ("CONTENT-CANARY", "SECRET-CANARY", "/private/profile"):
+        assert canary not in emitted
+    assert emitted.count("cashew local log event error=RuntimeError") >= 2
+    assert marker.read_text() == "flat"

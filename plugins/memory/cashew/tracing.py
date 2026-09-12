@@ -185,7 +185,9 @@ def trace_operation(
         # the safe proxy records the fixed event before context teardown.
         span._set_error(error)
         try:
-            context.__exit__(type(error), error, error.__traceback__)
+            # Never hand a third-party context the original exception object,
+            # message, or traceback after emitting Cashew's fixed safe event.
+            context.__exit__(None, None, None)
         except Exception:
             pass
         raise

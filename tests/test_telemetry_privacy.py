@@ -106,21 +106,22 @@ def test_locked_sentry_final_envelope_is_allowlisted_and_host_unchanged(monkeypa
 
 
 def test_sentry_worker_is_bounded_and_provider_owned(monkeypatch):
-    monkeypatch.setenv("HERMES_CASHEW_SENTRY_DSN", "https://public@example.invalid/123")
+    monkeypatch.delenv("HERMES_CASHEW_SENTRY_DSN", raising=False)
     before_modules = set(sys.modules)
-    first = error_tracking.start_sentry_telemetry()
+    first, records, attempts = error_tracking._start_recording_sentry_for_test()
     second = error_tracking.start_sentry_telemetry()
-    assert first is not None and second is not None and first is not second
+    assert second is None
     for _ in range(64):
         error_tracking.capture_exception(
             RuntimeError("CONTENT-CANARY"), telemetry=first
         )
+    assert records.poll(5)
+    _decode_event(records.recv())
     error_tracking.close_sentry_telemetry(first)
-    error_tracking.close_sentry_telemetry(first)
-    error_tracking.close_sentry_telemetry(second)
+    records.close()
     assert "sentry_sdk" not in set(sys.modules) - before_modules
+    assert attempts.empty()
     assert not first.process.is_alive()
-    assert not second.process.is_alive()
 
 
 def test_provider_runtime_cleanup_closes_only_its_telemetry(monkeypatch):
@@ -450,7 +451,7 @@ def test_otel_raised_provider_operation_records_safe_error_before_exit(monkeypat
         assert str(error) == "CONTENT-CANARY /private/profile"
     else:
         raise AssertionError("functional exception was swallowed")
-    assert tracer.context.exit_args[0] is RuntimeError
+    assert tracer.context.exit_args == (None, None, None)
     assert tracer.span.events == [
         (
             "exception",

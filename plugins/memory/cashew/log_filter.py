@@ -70,7 +70,9 @@ def _is_owned_source(record: logging.LogRecord) -> bool:
 
 def _is_adapter_source(record: logging.LogRecord) -> bool:
     try:
-        return Path(record.pathname).resolve().is_relative_to(_PACKAGE_DIR)
+        return record.name.startswith("plugins.memory.cashew") and Path(
+            record.pathname
+        ).resolve().is_relative_to(_PACKAGE_DIR)
     except (OSError, ValueError):
         return False
 

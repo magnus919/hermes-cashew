@@ -47,6 +47,22 @@ introduced by it. `hermes memory setup` may warn that it refused the direct
 URL; that warning is expected and does not replace or downgrade a manually
 installed candidate.
 
+### Optional diagnostics
+
+Diagnostics remain disabled unless explicitly enabled. The normal plugin install
+uses runtime dependencies only. To enable either optional Sentry or OpenTelemetry
+diagnostics, install the tracing extra into Hermes's environment first:
+
+```bash
+uv pip install --python ~/.hermes/hermes-agent/venv/bin/python3 \
+  'hermes-cashew[tracing]'
+```
+
+Then set `HERMES_CASHEW_SENTRY_DSN` for Cashew's isolated diagnostics worker,
+or set `HERMES_CASHEW_OTEL_ENABLED=1` for Cashew spans. Generic `SENTRY_*` and
+`OTEL_*` host settings do not enable Cashew diagnostics. Events and spans contain
+only fixed operation codes and allowlisted bounded metadata.
+
 After install, run setup and restart the gateway:
 
 ```bash

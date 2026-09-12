@@ -136,7 +136,9 @@ Diagnostics are disabled by default. The plugin ignores generic host telemetry
 settings. Set `HERMES_CASHEW_SENTRY_DSN` to opt into an isolated,
 provider-owned worker that owns its Sentry client; the parent process never
 imports or configures Sentry. Its final outbound transport rebuilds every
-envelope from Cashew's allowlist. Set `HERMES_CASHEW_OTEL_ENABLED=1` to emit
+envelope from Cashew's allowlist. The normal install does not include these
+optional SDKs: install `hermes-cashew[tracing]` into the Hermes environment
+before enabling them. Set `HERMES_CASHEW_OTEL_ENABLED=1` to emit
 Cashew OpenTelemetry spans through the existing host provider. Neither option
 changes the host's global telemetry configuration.
 

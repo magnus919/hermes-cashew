@@ -200,7 +200,10 @@ def _post_final_envelope(payload: bytes, dsn: str) -> None:
 
 
 def _sentry_worker(
-    events: Any, dsn: str, record_connection: Connection | None = None
+    events: Any,
+    dsn: str,
+    record_connection: Connection | None = None,
+    network_attempts: Any | None = None,
 ) -> None:
     """Own the high-level SDK in a child so host SDK globals never change."""
     try:
@@ -214,6 +217,8 @@ def _sentry_worker(
                     record_connection.send(payload)
                     return
                 try:
+                    if network_attempts is not None:
+                        network_attempts.put_nowait("attempted")
                     _post_final_envelope(payload, dsn)
                 except Exception:
                     pass
@@ -253,6 +258,22 @@ def _sentry_worker(
             pass
         if record_connection is not None:
             record_connection.close()
+
+
+def _start_recording_sentry_for_test() -> tuple[SentryTelemetry, Connection, Any]:
+    """Create a recording-only worker for bounded no-network contract tests."""
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe()
+    events = context.Queue(maxsize=16)
+    attempts = context.Queue()
+    process = context.Process(
+        target=_sentry_worker,
+        args=(events, "https://public@example.invalid/1", child, attempts),
+    )
+    process.daemon = True
+    process.start()
+    child.close()
+    return SentryTelemetry(events, process, threading.Lock()), parent, attempts
 
 
 def _record_final_envelope_for_test(event: dict[str, Any], dsn: str) -> bytes:

@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import queue
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from plugins.memory.cashew import CashewMemoryProvider
+from plugins.memory.cashew.config import CashewConfig
 
 
 def _provider_with_mock_config(tmp_path):
@@ -32,6 +37,20 @@ def _half_state_provider():
     provider._config = None
     provider._db_path = None
     return provider
+
+
+def _stage_prefetch_result(
+    provider: CashewMemoryProvider, cues: list[str], nodes: list[dict]
+) -> None:
+    """Stage synthetic nodes through the provider's production cache handoff."""
+    identity = provider._prefetch_request_identity(
+        session_id=provider._session_id,
+        generation=provider._prefetch_generation,
+        domain=None,
+        tag=None,
+        exclude_tags=None,
+    )
+    provider._stage_prefetch_result(identity, cues, nodes)
 
 
 # ── queue_prefetch half-state guards ──────────────────────────────────────
@@ -58,36 +77,48 @@ def test_queue_prefetch_skips_empty_query(tmp_path):
 def test_prefetch_uses_warm_cache_on_exact_match(tmp_path):
     """prefetch() must return cached context when the raw query matches exactly."""
     provider = _provider_with_mock_config(tmp_path)
-    provider._warm_cache["leader election raft"] = "cached: raft consensus"
+    _stage_prefetch_result(
+        provider,
+        ["leader election raft"],
+        [{"id": "raft", "content": "cached raft consensus"}],
+    )
     result = provider.prefetch("leader election raft")
-    assert result == "cached: raft consensus"
+    assert "cached raft consensus" in result
     assert provider._warm_cache == {}
 
 
 def test_prefetch_uses_warm_cache_on_substring_match(tmp_path):
     """prefetch() must match when the query is a substring of the cached cue."""
     provider = _provider_with_mock_config(tmp_path)
-    provider._warm_cache["we discussed the Raft consensus protocol earlier"] = (
-        "cached: raft details"
+    _stage_prefetch_result(
+        provider,
+        ["we discussed the Raft consensus protocol earlier"],
+        [{"id": "raft", "content": "cached raft details"}],
     )
     result = provider.prefetch("Raft consensus")
-    assert result == "cached: raft details"
+    assert "cached raft details" in result
 
 
 def test_prefetch_uses_warm_cache_on_word_overlap(tmp_path):
     """prefetch() must match when ≥2 significant words overlap between cue and query."""
     provider = _provider_with_mock_config(tmp_path)
-    provider._warm_cache["distributed database write throughput"] = (
-        "cached: write concerns"
+    _stage_prefetch_result(
+        provider,
+        ["distributed database write throughput"],
+        [{"id": "throughput", "content": "cached write concerns"}],
     )
     result = provider.prefetch("database write performance")
-    assert result == "cached: write concerns"
+    assert "cached write concerns" in result
 
 
 def test_prefetch_cache_miss_falls_through(tmp_path):
     """prefetch() must fall through on cache miss, not return cached unrelated content."""
     provider = _provider_with_mock_config(tmp_path)
-    provider._warm_cache["unrelated topic"] = "cached: unrelated"
+    _stage_prefetch_result(
+        provider,
+        ["unrelated topic"],
+        [{"id": "unrelated", "content": "cached unrelated"}],
+    )
     # No retrieve_recursive_bfs mocked, so falls to keyword search → returns ""
     result = provider.prefetch("completely different subject xyzw")
     assert result != "cached: unrelated"
@@ -101,25 +132,23 @@ def test_prefetch_swaps_pending_into_warm_cache(tmp_path):
     """Pending context retains its cue and uses normal relevance matching."""
     provider = _provider_with_mock_config(tmp_path)
     provider._prefetch_generation = 1
-    provider._prefetch_pending = (
-        1,
-        "test-session",
+    _stage_prefetch_result(
+        provider,
         ["database migration"],
-        "staged context",
+        [{"id": "migration", "content": "staged context"}],
     )
     result = provider.prefetch("database migration plan")
-    assert result == "staged context"
+    assert "staged context" in result
     assert provider._prefetch_pending is None
 
 
 def test_prefetch_does_not_relabel_unrelated_pending_context(tmp_path):
     provider = _provider_with_mock_config(tmp_path)
     provider._prefetch_generation = 1
-    provider._prefetch_pending = (
-        1,
-        "test-session",
+    _stage_prefetch_result(
+        provider,
         ["pizza preferences"],
-        "cached pizza context",
+        [{"id": "pizza", "content": "cached pizza context"}],
     )
 
     result = provider.prefetch("production database migration")
@@ -131,16 +160,199 @@ def test_stale_prefetch_worker_cannot_replace_newer_generation(tmp_path):
     provider = _provider_with_mock_config(tmp_path)
     provider._prefetch_generation = 2
 
-    provider._stage_prefetch_result(1, "test-session", ["old"], "old context")
+    old_identity = provider._prefetch_request_identity(
+        session_id="test-session",
+        generation=1,
+        domain=None,
+        tag=None,
+        exclude_tags=None,
+    )
+    provider._stage_prefetch_result(old_identity, ["old"], [{"content": "old"}])
     assert provider._prefetch_pending is None
 
-    provider._stage_prefetch_result(2, "test-session", ["new"], "new context")
-    assert provider._prefetch_pending == (
-        2,
-        "test-session",
-        ["new"],
-        "new context",
+    new_identity = provider._prefetch_request_identity(
+        session_id="test-session",
+        generation=2,
+        domain=None,
+        tag=None,
+        exclude_tags=None,
     )
+    provider._stage_prefetch_result(new_identity, ["new"], [{"content": "new"}])
+    assert provider._prefetch_pending is not None
+    assert provider._prefetch_pending.identity == new_identity
+
+
+def test_prefetch_filtered_request_cold_falls_through_unfiltered_warm_result(
+    tmp_path, monkeypatch
+):
+    """Domain and tag selectors cannot reuse an unfiltered warm result."""
+    provider = _provider_with_mock_config(tmp_path)
+    warm_nodes = [
+        {"id": "personal", "content": "personal identity"},
+        {"id": "private", "content": "private identity"},
+    ]
+
+    def cold_nodes(query, max_nodes, domain, tag, exclude_tags, db_path=None):
+        assert db_path == provider._db_path
+        assert query == "shared project memory"
+        if domain == "work":
+            return [{"id": "work", "content": "work identity"}]
+        if tag == "approved":
+            return [{"id": "approved", "content": "approved identity"}]
+        assert exclude_tags == ["private"]
+        return [{"id": "public", "content": "public identity"}]
+
+    monkeypatch.setattr(provider, "_keyword_search", cold_nodes)
+    for kwargs, expected in (
+        ({"domain": "work"}, "work identity"),
+        ({"tag": "approved"}, "approved identity"),
+        ({"exclude_tags": ["private"]}, "public identity"),
+    ):
+        _stage_prefetch_result(provider, ["shared project memory"], warm_nodes)
+        result = provider.prefetch("shared project memory", **kwargs)
+        assert expected in result
+        assert "personal identity" not in result
+        assert "private identity" not in result
+
+
+def test_prefetch_empty_or_whitespace_query_never_matches_cached_cue(
+    tmp_path, monkeypatch
+):
+    provider = _provider_with_mock_config(tmp_path)
+    monkeypatch.setattr(
+        provider,
+        "_keyword_search",
+        lambda *args, **kwargs: [{"id": "cold", "content": "cold empty result"}],
+    )
+    for query in ("", "   "):
+        _stage_prefetch_result(
+            provider,
+            ["specific cached cue"],
+            [{"id": "cached", "content": "arbitrary cached context"}],
+        )
+        result = provider.prefetch(query)
+        assert "cold empty result" in result
+        assert "arbitrary cached context" not in result
+
+
+def test_prefetch_warm_result_is_copied_and_limited_at_format_time(tmp_path):
+    provider = _provider_with_mock_config(tmp_path)
+    provider._config = CashewConfig(recall_k=1)
+    nodes = [
+        {"id": "first", "content": "first cached identity"},
+        {"id": "second", "content": "second cached identity"},
+    ]
+    _stage_prefetch_result(provider, ["limit proof"], nodes)
+    nodes[0]["content"] = "mutated caller value"
+
+    result = provider.prefetch("limit proof")
+
+    assert "first cached identity" in result
+    assert "mutated caller value" not in result
+    assert "second cached identity" not in result
+
+
+@pytest.mark.parametrize(
+    ("change", "value"),
+    [
+        ("db_path", "other-profile.db"),
+        ("cashew_db_path", "other/brain.db"),
+        ("embedding_model", "example/alternate-embedding-model"),
+        ("embedding_device", "mps"),
+        ("recall_k", 1),
+        ("prefetch_k", 4),
+        ("prefetch_cues", 0),
+        ("user_domain", "other-user"),
+        ("ai_domain", "other-ai"),
+        ("_features", {"experimental_parallel_retrieval": True}),
+    ],
+)
+def test_late_prefetch_rejects_each_same_session_identity_change(
+    tmp_path, change, value
+):
+    provider = _provider_with_mock_config(tmp_path)
+    provider._config = CashewConfig()
+    old_identity = provider._prefetch_request_identity(
+        session_id="test-session",
+        generation=0,
+        domain=None,
+        tag=None,
+        exclude_tags=None,
+    )
+
+    if change == "db_path":
+        provider._db_path = tmp_path / value
+    else:
+        provider._config = dataclasses.replace(provider._config, **{change: value})
+    provider._stage_prefetch_result(
+        old_identity, ["late"], [{"id": "old", "content": "old identity"}]
+    )
+
+    assert provider._prefetch_pending is None
+
+
+def test_queue_prefetch_roundtrip_hits_warm_cache_without_second_retrieval(
+    tmp_path, monkeypatch
+):
+    """The public queue hook stages a reusable unfiltered result asynchronously."""
+    provider = _provider_with_mock_config(tmp_path)
+    calls: list[dict] = []
+
+    def retrieve(**kwargs):
+        calls.append(kwargs)
+        return [SimpleNamespace(node_id="warm")]
+
+    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", retrieve)
+    monkeypatch.setattr(
+        provider,
+        "_enrich_results",
+        lambda node_ids, **kwargs: [
+            {"id": node_ids[0], "content": "queued warm identity"}
+        ],
+    )
+
+    provider.queue_prefetch("queued cache proof")
+    deadline = time.monotonic() + 1.0
+    while provider._prefetch_pending is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert provider._prefetch_pending is not None
+    assert "queued warm identity" in provider.prefetch("queued cache proof")
+    assert len(calls) == 1
+
+
+def test_queue_prefetch_filtered_request_cold_falls_through_staged_result(
+    tmp_path, monkeypatch
+):
+    """A queued unfiltered result cannot satisfy a later domain-constrained recall."""
+    provider = _provider_with_mock_config(tmp_path)
+    calls: list[dict] = []
+
+    def retrieve(**kwargs):
+        calls.append(kwargs)
+        node_id = "work" if kwargs.get("domain") == "work" else "personal"
+        return [SimpleNamespace(node_id=node_id)]
+
+    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", retrieve)
+    monkeypatch.setattr(
+        provider,
+        "_enrich_results",
+        lambda node_ids, **kwargs: [
+            {"id": node_ids[0], "content": f"{node_ids[0]} identity"}
+        ],
+    )
+
+    provider.queue_prefetch("queued selector proof")
+    deadline = time.monotonic() + 1.0
+    while provider._prefetch_pending is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert provider._prefetch_pending is not None
+    result = provider.prefetch("queued selector proof", domain="work")
+    assert "work identity" in result
+    assert "personal identity" not in result
+    assert len(calls) == 2
+    assert calls[1]["domain"] == "work"
 
 
 def test_prefetch_half_state_skips_warm_cache():

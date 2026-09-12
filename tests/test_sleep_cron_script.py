@@ -35,10 +35,20 @@ def _write_installation(implementation: Path, identity: str) -> None:
     source_template = Path(provider_module.__file__).parent / "sleep_cron_script.py"
     (implementation / "sleep_cron_script.py").write_text(source_template.read_text())
     (implementation / "config.py").write_text(
+        "import json\n"
         "from pathlib import Path\n"
+        "class Config:\n"
+        "    def __init__(self, values):\n"
+        "        self.cashew_db_path = values.get('cashew_db_path', 'cashew/brain.db')\n"
+        "        self.sleep_max_nodes = values.get('sleep_max_nodes', 2000)\n"
+        "        self.embedding_model = values.get('embedding_model', 'thenlper/gte-large')\n"
+        "        self.embedding_device = values.get('embedding_device', 'cpu')\n"
+        "def load_config(home):\n"
+        "    path = Path(home) / 'cashew.json'\n"
+        "    return Config(json.loads(path.read_text()) if path.exists() else {})\n"
         "def resolve_db_path(home, raw):\n"
         "    return Path(home) / raw\n"
-        "def resolve_model_fn(*, hermes_home):\n"
+        "def resolve_model_fn(*, hermes_home, config):\n"
         "    return 'resolved-memory-model'\n"
     )
     (implementation / "companion.py").write_text(f"IDENTITY = {identity!r}\n")
@@ -292,6 +302,26 @@ def test_generated_script_rejects_malformed_installation_marker(
 
     assert completed.returncode == 1
     assert "installation marker is malformed" in completed.stderr
+
+
+def test_main_uses_pinned_module_to_reject_invalid_profile_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cron entry point validates config through its registered source."""
+    hermes_home = tmp_path / "profile"
+    hermes_home.mkdir()
+    (hermes_home / "cashew.json").write_text(json.dumps({"sleep_max_nodes": -1}))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    import plugins.memory.cashew.config as profile_config
+
+    monkeypatch.setattr(
+        sleep_cron_script,
+        "_load_profile_modules",
+        lambda _home: (profile_config, object()),
+    )
+    with pytest.raises(ValueError, match="sleep_max_nodes must be an integer"):
+        sleep_cron_script.main()
 
 
 def test_unmarked_copied_script_requests_reinitialization(tmp_path: Path) -> None:

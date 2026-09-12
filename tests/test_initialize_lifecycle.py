@@ -9,6 +9,7 @@ import json
 import queue
 import sys
 import threading
+from contextlib import contextmanager
 
 import pytest
 
@@ -82,6 +83,148 @@ def test_initialize_then_shutdown_returns_to_baseline_threads(tmp_path):
 
     _time.sleep(0.05)
     assert threading.active_count() == baseline
+
+
+def test_initialize_serializes_ownership_and_defers_second_profile(
+    tmp_path, monkeypatch
+):
+    """A second initialize cannot replace state while the first owns setup."""
+    entered_schema = threading.Event()
+    release_schema = threading.Event()
+    real_ensure_schema = CashewMemoryProvider._ensure_db_schema
+
+    def blocked_schema(provider, db_path):
+        entered_schema.set()
+        assert release_schema.wait(timeout=2.0)
+        return real_ensure_schema(provider, db_path)
+
+    monkeypatch.setattr(CashewMemoryProvider, "_ensure_db_schema", blocked_schema)
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    p = CashewMemoryProvider()
+    first = threading.Thread(
+        target=p.initialize,
+        args=("session-a",),
+        kwargs={"hermes_home": str(home_a)},
+    )
+    first.start()
+    try:
+        assert entered_schema.wait(timeout=1.0)
+        p.initialize("session-b", hermes_home=str(home_b))
+        p.on_session_switch("session-b")
+        assert p._initializing is True
+        assert p._session_id == "session-a"
+        assert p._hermes_home == home_a
+        release_schema.set()
+        first.join(timeout=2.0)
+        assert not first.is_alive()
+        assert p._session_id == "session-a"
+        assert p._hermes_home == home_a
+    finally:
+        release_schema.set()
+        first.join(timeout=2.0)
+        p.shutdown()
+
+
+def test_shutdown_cancels_blocked_initialize_without_publishing_worker(
+    tmp_path, monkeypatch
+):
+    """Shutdown during setup cannot leave a worker using cleared state."""
+    entered_schema = threading.Event()
+    release_schema = threading.Event()
+    real_ensure_schema = CashewMemoryProvider._ensure_db_schema
+
+    def blocked_schema(provider, db_path):
+        entered_schema.set()
+        assert release_schema.wait(timeout=2.0)
+        return real_ensure_schema(provider, db_path)
+
+    monkeypatch.setattr(CashewMemoryProvider, "_ensure_db_schema", blocked_schema)
+    p = CashewMemoryProvider()
+    first = threading.Thread(
+        target=p.initialize,
+        args=("session-a",),
+        kwargs={"hermes_home": str(tmp_path)},
+    )
+    first.start()
+    try:
+        assert entered_schema.wait(timeout=1.0)
+        p.shutdown()
+        assert p._shutdown_started.is_set()
+        release_schema.set()
+        first.join(timeout=2.0)
+        assert not first.is_alive()
+        assert p._sync_worker is None
+        assert p._sync_queue is None
+        assert p._initializing is False
+        assert p._shutdown_started.is_set() is False
+    finally:
+        release_schema.set()
+        first.join(timeout=2.0)
+        p.shutdown()
+
+
+def test_initialize_ownership_survives_trace_exit_while_shutdown_runs(
+    tmp_path, monkeypatch
+):
+    """A new generation cannot claim ownership before A's trace exits."""
+    trace_exit_entered = threading.Event()
+    release_trace_exit = threading.Event()
+    block_first_initialize_exit = True
+
+    class Span:
+        def set_attribute(self, *args, **kwargs):
+            del args, kwargs
+
+    @contextmanager
+    def blocking_trace(name, *args, **kwargs):
+        del args, kwargs
+        nonlocal block_first_initialize_exit
+        yield Span()
+        if name == "cashew.initialize" and block_first_initialize_exit:
+            block_first_initialize_exit = False
+            trace_exit_entered.set()
+            assert release_trace_exit.wait(timeout=2.0)
+
+    monkeypatch.setattr("plugins.memory.cashew.trace_operation", blocking_trace)
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    p = CashewMemoryProvider()
+    first = threading.Thread(
+        target=p.initialize,
+        args=("session-a",),
+        kwargs={"hermes_home": str(home_a)},
+    )
+    shutdown: threading.Thread | None = None
+    first.start()
+    try:
+        assert trace_exit_entered.wait(timeout=2.0)
+        assert p._sync_worker is not None
+        shutdown = threading.Thread(target=p.shutdown)
+        shutdown.start()
+        # Shutdown can complete while A remains paused in its trace exit.
+        shutdown.join(timeout=2.0)
+        assert not shutdown.is_alive()
+        assert p._sync_queue is None
+        assert p._initializing is True
+        # B must be deferred even though shutdown has already consumed A's
+        # published worker; A still owns initialization until trace exit.
+        p.initialize("session-b", hermes_home=str(home_b))
+        assert p._session_id == "session-a"
+        release_trace_exit.set()
+        first.join(timeout=2.0)
+        assert not first.is_alive()
+        assert p._initializing is False
+
+        p.save_config({}, str(home_b))
+        p.initialize("session-b", hermes_home=str(home_b))
+        assert p._session_id == "session-b"
+    finally:
+        release_trace_exit.set()
+        first.join(timeout=2.0)
+        if shutdown is not None:
+            shutdown.join(timeout=2.0)
+        p.shutdown()
 
 
 def test_initialize_loads_default_config_when_no_file(tmp_path):
@@ -163,17 +306,17 @@ def test_initialize_generates_config_file_on_first_load(tmp_path):
 
 def test_initialize_does_not_overwrite_existing_config(tmp_path):
     """First-load bootstrap: existing cashew.json is never overwritten."""
-    existing = {"recall_k": 42, "user_domain": "custom"}
+    existing = {"recall_k": 12, "user_domain": "custom"}
     (tmp_path / CONFIG_FILENAME).write_text(json.dumps(existing))
     p = CashewMemoryProvider()
     p.initialize("s", hermes_home=str(tmp_path))
     try:
         # Verify our custom values survived
-        assert p._config.recall_k == 42
+        assert p._config.recall_k == 12
         assert p._config.user_domain == "custom"
         # Verify the file wasn't replaced wholesale
         on_disk = json.loads((tmp_path / CONFIG_FILENAME).read_text())
-        assert on_disk["recall_k"] == 42
+        assert on_disk["recall_k"] == 12
     finally:
         p.shutdown()
 

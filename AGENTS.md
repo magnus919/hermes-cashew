@@ -105,7 +105,7 @@ done
 - **No `~/.hermes` writes.** All paths scope under `hermes_home`. Tests use `tmp_path` fixture.
 - **`sync_turn` must return <10 ms.** Bounded queue + daemon worker; shutdown gives already-accepted turns a bounded opportunity to drain.
 - **Cashew dependency**: source archive at upstream commit
-  `dd57ef029cf9a6dce0b8145d335a55202dd1bac4`, pinned by its full commit and
+  `ac090ce75ffd2e97dac257cee9430628c68aa241`, pinned by its full commit and
   SHA-256 in `pyproject.toml`, both manifests, and `uv.lock`. The upstream
   package still reports version `1.2.1`, so version metadata alone does not
   identify the selected code.

@@ -36,7 +36,7 @@ both report version `1.2.1`, so reinstall the source and verify its provenance:
 ```sh
 HERMES_TEST_ENV=/tmp/hermes-agent-$REV-venv
 UV_PROJECT_ENVIRONMENT="$HERMES_TEST_ENV" uv sync --frozen --no-install-project --project "$DEST"
-CASHEW_PIN='cashew-brain @ https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz#sha256=38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab'
+CASHEW_PIN='cashew-brain @ https://github.com/rajkripal/cashew/archive/ac090ce75ffd2e97dac257cee9430628c68aa241.tar.gz#sha256=0777dcb89bde8e0d6103786358c93c0ad3fd4ffb7f8a210194c37b211ae4c28b'
 uv pip install --python "$HERMES_TEST_ENV/bin/python" \
   --reinstall "$CASHEW_PIN" 'sqlite-vec==0.1.9'
 "$HERMES_TEST_ENV/bin/python" scripts/verify-cashew-baseline.py

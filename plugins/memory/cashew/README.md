@@ -6,7 +6,7 @@ Persistent thought-graph memory for Hermes Agent, backed by [cashew-brain](https
 
 ```bash
 hermes plugins install cashew
-CASHEW_PIN='cashew-brain @ https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz#sha256=38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab'
+CASHEW_PIN='cashew-brain @ https://github.com/rajkripal/cashew/archive/ac090ce75ffd2e97dac257cee9430628c68aa241.tar.gz#sha256=0777dcb89bde8e0d6103786358c93c0ad3fd4ffb7f8a210194c37b211ae4c28b'
 uv pip install --python ~/.hermes/hermes-agent/venv/bin/python3 \
   --reinstall "$CASHEW_PIN" sqlite-vec
 ~/.hermes/hermes-agent/venv/bin/python3 \

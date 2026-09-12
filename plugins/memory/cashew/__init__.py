@@ -317,7 +317,7 @@ _UPSTREAM_KNOWN_DIMS: dict[str, int] = {
     "BAAI/bge-small-en-v1.5": 384,
 }
 
-# Cashew-brain at dd57ef0 has no instance-scoped migration or embedding API.
+# Cashew-brain at ac090ce has no instance-scoped migration or embedding API.
 # These are the only private compatibility seams retained by this adapter:
 #
 # * ``core.config.config.embedding_model`` selects the model used by pinned

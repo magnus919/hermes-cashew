@@ -132,7 +132,7 @@ jobs:
     steps:
       - name: Require all supported Python workers to pass
         env:
-          MATRIX_RESULT: ${{ needs.test-python.result }}
+          MATRIX_RESULT: ${{ needs['test-python'].result }}
         run: |
           test "$MATRIX_RESULT" = "success" || {
             echo "::error::supported Python matrix result: $MATRIX_RESULT"

@@ -102,6 +102,10 @@ def test_ci_and_contributor_docs_use_frozen_uv_lock() -> None:
     assert 'python-version: "3.12"' in release_workflow
     assert "uv sync --frozen --extra dev" in readme
     assert "uv sync --frozen --extra dev" in contributing
+    assert (
+        "uv run --frozen --extra dev python scripts/check-recursive-symlinks.py"
+        in contributing
+    )
     assert "--cov-fail-under=75" in tests_workflow
     tests_config = yaml.safe_load(tests_workflow)
     for job in tests_config["jobs"].values():
@@ -181,6 +185,9 @@ def test_ci_covers_declared_minimum_and_current_python() -> None:
     assert workflow["jobs"]["test"]["name"] == "test"
     assert workflow["jobs"]["test"]["needs"] == "test-python"
     assert workflow["jobs"]["test"]["if"] == "always()"
+    assert workflow["jobs"]["test"]["steps"][0]["env"]["MATRIX_RESULT"] == (
+        "${{ needs['test-python'].result }}"
+    )
     assert workflow["jobs"]["wheel-smoke"]["needs"] == "test"
 
 

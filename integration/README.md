@@ -52,8 +52,9 @@ setup failure. The test patches only the embedding model and external client
 resolution; Hermes loader, `MemoryManager`, `MemoryProvider`, auxiliary task
 routing, and `cron.jobs` remain real imports.
 
-Cron subprocess execution is part of the default command. While issue #186's
-flat-install import fix is being incorporated, the flat scenario exits with an
-actionable failure at that boundary. The development scenario can be run alone
-with `--scenario dev`; the complete default command remains blocked until #186
-is incorporated.
+Cron subprocess execution is part of the default command. The current main
+branch includes the flat-install import fix from issue #186, so both the flat
+and development scenarios are expected to pass. A cron failure remains an
+actionable integration failure rather than a skipped check. The development
+scenario can still be run alone with `--scenario dev` when isolating loader
+behavior.

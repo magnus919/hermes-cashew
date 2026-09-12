@@ -118,7 +118,7 @@ def _prepare_think_db(db: Path) -> None:
 _FORK_ADMISSION = None
 
 
-def _run_inherited_async_dream(ready) -> None:
+def _run_inherited_async_dream(ready, parent_closed, reacquired) -> None:
     """Run the actual async dream entrypoint with an inherited admission token."""
     import plugins.memory.cashew.sleep_refactor as sleep_module
     from plugins.memory.cashew.admission import current_admission
@@ -129,7 +129,17 @@ def _run_inherited_async_dream(ready) -> None:
     def paused_dream(*_args, **_kwargs):
         assert current_admission() is admission
         ready.set()
-        time.sleep(30)
+        assert parent_closed.wait(timeout=10)
+        # The parent has released its inherited descriptor copy.  Reacquire
+        # both leases in this child on independent descriptors before the
+        # competing-process assertion; this is the actual transferred token's
+        # owner, not a fresh admission or a production-path substitute.
+        with try_maintenance_lock(admission.graph_path) as graph_lease:
+            with try_maintenance_lock(admission.cache_path) as cache_lease:
+                assert graph_lease is not None
+                assert cache_lease is not None
+                reacquired.set()
+                time.sleep(30)
 
     sleep_module._generate_dream = paused_dream
     sleep_module._run_dream_async(
@@ -525,14 +535,21 @@ def test_async_dream_transfers_exact_token_and_process_death_releases_leases(
         _FORK_ADMISSION = admission
         owner = admission.lease_owner
         assert owner is not None
-        # Mark ownership transferred before fork.  The child receives the
-        # immutable token and re-enters the idempotent transfer path; the
-        # parent's context will not unlock descriptors still used by the child.
-        owner.transfer()
-        child = context.Process(target=_run_inherited_async_dream, args=(ready,))
+        parent_closed = context.Event()
+        reacquired = context.Event()
+        child = context.Process(
+            target=_run_inherited_async_dream,
+            args=(ready, parent_closed, reacquired),
+        )
         child.start()
         try:
             assert ready.wait(timeout=10)
+            # The child performs the one transfer itself.  Closing the parent's
+            # copy releases its inherited descriptors; the child then owns
+            # independent leases for the remainder of the actual async call.
+            owner.close()
+            parent_closed.set()
+            assert reacquired.wait(timeout=10)
             # The transferred child owns the exact token and both descriptors;
             # independent exclusive contenders remain blocked until it exits.
             probe_context = multiprocessing.get_context("spawn")
@@ -549,7 +566,6 @@ def test_async_dream_transfers_exact_token_and_process_death_releases_leases(
             child.terminate()
             child.join(timeout=10)
             assert child.exitcode is not None
-            owner.close()
         finally:
             if child.is_alive():
                 child.kill()

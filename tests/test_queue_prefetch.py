@@ -54,6 +54,23 @@ def _stage_prefetch_result(
     provider._stage_prefetch_result(identity, cues, nodes)
 
 
+def _wait_for_prefetch_idle(
+    provider: CashewMemoryProvider, timeout: float = 2.0
+) -> bool:
+    """Wait until neither active nor pending work remains under its condition."""
+    deadline = time.monotonic() + timeout
+    with provider._prefetch_condition:
+        while (
+            provider._prefetch_active_identity is not None
+            or provider._prefetch_pending_request is not None
+        ):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            provider._prefetch_condition.wait(timeout=remaining)
+        return True
+
+
 # ── queue_prefetch half-state guards ──────────────────────────────────────
 
 
@@ -366,9 +383,12 @@ def test_prefetch_half_state_skips_warm_cache():
 # ── background thread mechanics ──────────────────────────────────────────
 
 
-def test_queue_prefetch_dispatches_tracked_background_thread(tmp_path, monkeypatch):
+def test_queue_prefetch_dispatches_tracked_background_thread(
+    tmp_path, monkeypatch, request
+):
     """queue_prefetch tracks one persistent daemon until shutdown."""
     provider = _provider_with_mock_config(tmp_path)
+    request.addfinalizer(provider.shutdown)
     provider._sync_queue = queue.Queue()
     started = threading.Event()
     release = threading.Event()
@@ -388,21 +408,18 @@ def test_queue_prefetch_dispatches_tracked_background_thread(tmp_path, monkeypat
     assert threads[0].daemon
 
     release.set()
-    deadline = time.monotonic() + 1.0
-    while (
-        provider._prefetch_active_identity is not None and time.monotonic() < deadline
-    ):
-        time.sleep(0.01)
+    assert _wait_for_prefetch_idle(provider)
     assert threads[0].is_alive()
     provider.shutdown()
     assert provider._prefetch_threads == set()
 
 
 def test_queue_prefetch_burst_has_one_active_and_one_latest_pending(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, request
 ):
     """A burst coalesces behind one active worker and one latest request."""
     provider = _provider_with_mock_config(tmp_path)
+    request.addfinalizer(provider.shutdown)
     provider._sync_queue = queue.Queue()
     started = threading.Event()
     release = threading.Event()
@@ -438,11 +455,7 @@ def test_queue_prefetch_burst_has_one_active_and_one_latest_pending(
         assert len(provider._prefetch_threads) == 1
     release.set()
     worker = next(iter(provider._prefetch_threads))
-    deadline = time.monotonic() + 2.0
-    while (
-        provider._prefetch_active_identity is not None and time.monotonic() < deadline
-    ):
-        time.sleep(0.01)
+    assert _wait_for_prefetch_idle(provider)
 
     assert worker.is_alive()
     assert max_active == 1
@@ -452,10 +465,11 @@ def test_queue_prefetch_burst_has_one_active_and_one_latest_pending(
 
 
 def test_superseded_active_prefetch_skips_retrieval_after_cue_extraction(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, request
 ):
     """An active request invalidated during cue extraction does no retrieval."""
     provider = _provider_with_mock_config(tmp_path)
+    request.addfinalizer(provider.shutdown)
     provider._sync_queue = queue.Queue()
     provider._config.prefetch_cues = 1
     cue_started = threading.Event()
@@ -482,11 +496,7 @@ def test_superseded_active_prefetch_skips_retrieval_after_cue_extraction(
     provider.queue_prefetch("current request")
     release.set()
 
-    deadline = time.monotonic() + 2.0
-    while (
-        provider._prefetch_active_identity is not None and time.monotonic() < deadline
-    ):
-        time.sleep(0.01)
+    assert _wait_for_prefetch_idle(provider)
 
     assert retrieval_queries == ["current request"]
     assert _METRICS._snapshot()["prefetch_cancelled"] > cancelled_before
@@ -494,10 +504,11 @@ def test_superseded_active_prefetch_skips_retrieval_after_cue_extraction(
 
 
 def test_active_prefetch_drops_result_after_runtime_identity_change(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, request
 ):
     """A config identity change prevents late active publication."""
     provider = _provider_with_mock_config(tmp_path)
+    request.addfinalizer(provider.shutdown)
     provider._config = CashewConfig()
     provider._sync_queue = queue.Queue()
     started = threading.Event()
@@ -524,11 +535,7 @@ def test_active_prefetch_drops_result_after_runtime_identity_change(
         provider._config = dataclasses.replace(provider._config, recall_k=1)
     release.set()
 
-    deadline = time.monotonic() + 2.0
-    while (
-        provider._prefetch_active_identity is not None and time.monotonic() < deadline
-    ):
-        time.sleep(0.01)
+    assert _wait_for_prefetch_idle(provider)
 
     assert provider._prefetch_pending is None
     assert _METRICS._snapshot()["prefetch_cancelled"] > cancelled_before

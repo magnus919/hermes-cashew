@@ -1925,6 +1925,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._run_prefetch_request(request)
                 with self._prefetch_condition:
                     self._prefetch_active_identity = None
+                    self._prefetch_condition.notify_all()
         finally:
             with self._prefetch_condition:
                 self._prefetch_threads.discard(current_thread)

@@ -1,4 +1,4 @@
-"""Subprocess contracts for the standalone sleep-cycle cron script."""
+"""Subprocess contracts for the generated standalone sleep-cycle cron script."""
 
 from __future__ import annotations
 
@@ -6,139 +6,340 @@ import json
 import os
 import subprocess
 import sys
+import types
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from plugins.memory.cashew import sleep_cron_script
+import plugins.memory.cashew as provider_module
+from plugins.memory.cashew import CashewMemoryProvider, sleep_cron_script
+from plugins.memory.cashew.config import CashewConfig
 
 
-def test_cron_process_waits_for_owned_sleep_phases(tmp_path: Path) -> None:
-    """The cron process must not delegate work to a disposable daemon thread."""
-    hermes_home = tmp_path / "hermes-home"
-    agent_root = hermes_home / "hermes-agent"
-    package = agent_root / "plugins" / "memory" / "cashew"
-    scripts = hermes_home / "scripts"
-    package.mkdir(parents=True)
-    scripts.mkdir(parents=True)
-    for init_file in (
-        agent_root / "plugins" / "__init__.py",
-        agent_root / "plugins" / "memory" / "__init__.py",
-        package / "__init__.py",
-    ):
-        init_file.write_text("")
+def _install_fake_cron(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provide the small Hermes cron API surface used during registration."""
+    cron_package = types.ModuleType("cron")
+    cron_package.__path__ = []  # type: ignore[attr-defined]
+    cron_jobs = types.ModuleType("cron.jobs")
+    cron_jobs.list_jobs = lambda: []
+    cron_jobs.remove_job = lambda _job_id: None
+    cron_jobs.create_job = lambda **_kwargs: {"id": "cashew-sleep-test"}
+    monkeypatch.setitem(sys.modules, "cron", cron_package)
+    monkeypatch.setitem(sys.modules, "cron.jobs", cron_jobs)
 
-    marker = hermes_home / "phase-complete"
-    (hermes_home / "cashew.json").write_text(
-        json.dumps({"cashew_db_path": "cashew/brain.db"})
-    )
-    (package / "config.py").write_text(
+
+def _write_installation(implementation: Path, identity: str) -> None:
+    """Create a minimal loadable provider implementation for a subprocess."""
+    implementation.mkdir(parents=True)
+    source_template = Path(provider_module.__file__).parent / "sleep_cron_script.py"
+    (implementation / "sleep_cron_script.py").write_text(source_template.read_text())
+    (implementation / "config.py").write_text(
+        "import json\n"
         "from pathlib import Path\n"
+        "class Config:\n"
+        "    def __init__(self, values):\n"
+        "        self.cashew_db_path = values.get('cashew_db_path', 'cashew/brain.db')\n"
+        "        self.sleep_max_nodes = values.get('sleep_max_nodes', 2000)\n"
+        "        self.embedding_model = values.get('embedding_model', 'thenlper/gte-large')\n"
+        "        self.embedding_device = values.get('embedding_device', 'cpu')\n"
+        "def load_config(home):\n"
+        "    path = Path(home) / 'cashew.json'\n"
+        "    return Config(json.loads(path.read_text()) if path.exists() else {})\n"
         "def resolve_db_path(home, raw):\n"
-        "    path = Path(home) / raw\n"
-        "    path.parent.mkdir(parents=True, exist_ok=True)\n"
-        "    return path\n"
-        "def resolve_model_fn(*, hermes_home):\n"
-        "    return lambda prompt: 'dream'\n"
+        "    return Path(home) / raw\n"
+        "def resolve_model_fn(*, hermes_home, config):\n"
+        "    return 'resolved-memory-model'\n"
     )
-    (package / "sleep_refactor.py").write_text(
-        "import json, os, time\n"
+    (implementation / "companion.py").write_text(f"IDENTITY = {identity!r}\n")
+    (implementation / "embedding.py").write_text("MODEL = 'test-embedding'\n")
+    (implementation / "sleep_refactor.py").write_text(
+        "import os\n"
         "from pathlib import Path\n"
+        "from .companion import IDENTITY\n"
+        "from . import embedding\n"
         "def run_sleep_cycle(**kwargs):\n"
         "    assert kwargs['background_dream'] is False\n"
-        "    time.sleep(0.15)\n"
-        "    Path(os.environ['PHASE_MARKER']).write_text('complete')\n"
-        "    return {'dream_pending': False, 'dream_generation': 'ran'}\n"
+        "    Path(os.environ['PHASE_MARKER']).write_text(IDENTITY)\n"
+        "    return {\n"
+        "        'installation': IDENTITY,\n"
+        "        'db_path': kwargs['db_path'],\n"
+        "        'limit': kwargs['limit'],\n"
+        "        'model_fn': kwargs['model_fn'],\n"
+        "        'background_dream': kwargs['background_dream'],\n"
+        "        'embedding_model': kwargs['embedding_model'],\n"
+        "        'embedding_device': kwargs['embedding_device'],\n"
+        "    }\n"
     )
 
-    source = (
-        Path(__file__).parents[1]
-        / "plugins"
-        / "memory"
-        / "cashew"
-        / "sleep_cron_script.py"
+
+def _generate_script(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> tuple[Path, Path, Path]:
+    """Drive registration itself so tests execute the emitted script."""
+    _install_fake_cron(monkeypatch)
+    hermes_home = tmp_path / "profile"
+    if kind == "flat":
+        implementation = (
+            hermes_home / "plugins" / "cashew" / "plugins" / "memory" / "cashew"
+        )
+        _write_installation(implementation, "flat")
+    else:
+        external = tmp_path / "external-checkout" / "plugins" / "memory" / "cashew"
+        _write_installation(external, "development")
+        implementation = hermes_home / "hermes-agent" / "plugins" / "memory" / "cashew"
+        implementation.parent.mkdir(parents=True)
+        implementation.symlink_to(external, target_is_directory=True)
+
+    monkeypatch.setattr(
+        provider_module, "__file__", str(implementation / "__init__.py")
     )
-    script = scripts / "cashew-sleep-cycle.py"
-    script.write_text(source.read_text())
+    provider = CashewMemoryProvider()
+    provider._hermes_home = hermes_home
+    provider._config = replace(CashewConfig(), sleep_schedule="every 1h")
+    provider._register_sleep_cron()
 
-    env = os.environ.copy()
-    env.update({"HERMES_HOME": str(hermes_home), "PHASE_MARKER": str(marker)})
-    completed = subprocess.run(
-        [sys.executable, str(script)],
-        env=env,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=5,
+    return (
+        hermes_home,
+        hermes_home / "scripts" / "cashew-sleep-cycle.py",
+        implementation,
     )
 
-    assert marker.read_text() == "complete"
-    assert json.loads(completed.stdout) == {
-        "dream_pending": False,
-        "dream_generation": "ran",
-    }
 
-
-def test_main_uses_profile_config_and_prints_cycle_result(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+@pytest.mark.parametrize("kind", ["flat", "development"])
+def test_generated_cron_script_runs_from_registered_installation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
-    hermes_home = tmp_path / "hermes-home"
-    hermes_home.mkdir()
+    hermes_home, script, _implementation = _generate_script(tmp_path, monkeypatch, kind)
+    marker = tmp_path / "phase-complete"
+    custom_db = "owned/custom-cashew.db"
     (hermes_home / "cashew.json").write_text(
         json.dumps(
             {
-                "cashew_db_path": "data/brain.db",
-                "sleep_max_nodes": 321,
-                "embedding_model": "example/model",
+                "cashew_db_path": custom_db,
+                "sleep_max_nodes": 7,
+                "embedding_model": "test/embedding-model",
                 "embedding_device": "mps",
             }
         )
     )
-    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-    calls: list[dict] = []
-    model_fn = object()
-
-    import plugins.memory.cashew.config as config_module
-    import plugins.memory.cashew.sleep_refactor as refactor_module
-
-    monkeypatch.setattr(
-        config_module,
-        "resolve_model_fn",
-        lambda *, hermes_home: model_fn,
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        cwd=tmp_path,
+        env={
+            "HERMES_HOME": str(hermes_home),
+            "PATH": os.defpath,
+            "PYTHONPATH": "",
+            "PHASE_MARKER": str(marker),
+        },
     )
 
-    def run_sleep_cycle(**kwargs):
-        calls.append(kwargs)
-        return {"processed": 4, "dream_pending": False}
-
-    monkeypatch.setattr(refactor_module, "run_sleep_cycle", run_sleep_cycle)
-
-    sleep_cron_script.main()
-
-    assert json.loads(capsys.readouterr().out) == {
-        "processed": 4,
-        "dream_pending": False,
-    }
-    assert calls == [
-        {
-            "db_path": str(hermes_home / "data" / "brain.db"),
-            "limit": 321,
-            "model_fn": model_fn,
-            "background_dream": False,
-            "embedding_model": "example/model",
-            "embedding_device": "mps",
-        }
-    ]
+    result = json.loads(completed.stdout)
+    assert marker.read_text() == kind
+    assert result["installation"] == kind
+    assert result["db_path"] == str(hermes_home / custom_db)
+    assert result["limit"] == 7
+    assert result["model_fn"] == "resolved-memory-model"
+    assert result["background_dream"] is False
+    assert result["embedding_model"] == "test/embedding-model"
+    assert result["embedding_device"] == "mps"
 
 
-def test_helpers_require_home_and_default_missing_config(
+@pytest.mark.parametrize("kind", ["flat", "development"])
+def test_generated_script_uses_registered_anchor_without_stale_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    hermes_home, script, _implementation = _generate_script(tmp_path, monkeypatch, kind)
+    decoy = tmp_path / "external-decoy" / "plugins" / "memory" / "cashew"
+    _write_installation(decoy, "decoy")
+    if kind == "flat":
+        other_anchor = hermes_home / "hermes-agent" / "plugins" / "memory" / "cashew"
+        other_anchor.parent.mkdir(parents=True)
+        other_anchor.symlink_to(decoy, target_is_directory=True)
+    else:
+        other_anchor = (
+            hermes_home / "plugins" / "cashew" / "plugins" / "memory" / "cashew"
+        )
+        _write_installation(other_anchor, "decoy")
+    marker = tmp_path / "phase-complete"
+
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        cwd=tmp_path,
+        env={
+            "HERMES_HOME": str(hermes_home),
+            "PATH": os.defpath,
+            "PYTHONPATH": "",
+            "PHASE_MARKER": str(marker),
+        },
+    )
+
+    assert marker.read_text() == kind
+    assert json.loads(completed.stdout)["installation"] == kind
+
+
+def test_generated_script_rejects_moved_or_reinstalled_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("HERMES_HOME", raising=False)
-    with pytest.raises(RuntimeError, match="HERMES_HOME is not set"):
-        sleep_cron_script._find_hermes_home()
+    hermes_home, script, implementation = _generate_script(
+        tmp_path, monkeypatch, "development"
+    )
+    implementation.unlink()
+    implementation.mkdir()
 
-    assert sleep_cron_script._read_config(tmp_path) == {}
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        cwd=tmp_path,
+        env={"HERMES_HOME": str(hermes_home), "PATH": os.defpath, "PYTHONPATH": ""},
+    )
+
+    assert completed.returncode == 1
+    assert "reinitialize Cashew" in completed.stderr
+
+
+def test_copied_generated_script_rejects_different_hermes_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _hermes_home, script, _implementation = _generate_script(
+        tmp_path, monkeypatch, "flat"
+    )
+    other_home = tmp_path / "other-profile"
+    _write_installation(
+        other_home / "plugins" / "cashew" / "plugins" / "memory" / "cashew",
+        "other-profile",
+    )
+    copied_script = other_home / "scripts" / "cashew-sleep-cycle.py"
+    copied_script.parent.mkdir(parents=True)
+    copied_script.write_text(script.read_text())
+
+    completed = subprocess.run(
+        [sys.executable, str(copied_script)],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        cwd=tmp_path,
+        env={"HERMES_HOME": str(other_home), "PATH": os.defpath, "PYTHONPATH": ""},
+    )
+
+    assert completed.returncode == 1
+    assert "no longer matches this cron registration" in completed.stderr
+
+
+@pytest.mark.parametrize("missing_file", ["config.py", "sleep_refactor.py"])
+def test_generated_script_rejects_incomplete_installation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_file: str
+) -> None:
+    hermes_home, script, implementation = _generate_script(
+        tmp_path, monkeypatch, "flat"
+    )
+    (implementation / missing_file).unlink()
+
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        cwd=tmp_path,
+        env={"HERMES_HOME": str(hermes_home), "PATH": os.defpath, "PYTHONPATH": ""},
+    )
+
+    assert completed.returncode == 1
+    assert "installation is incomplete" in completed.stderr
+
+
+def test_generated_script_reports_missing_imported_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hermes_home, script, implementation = _generate_script(
+        tmp_path, monkeypatch, "flat"
+    )
+    (implementation / "embedding.py").unlink()
+
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        cwd=tmp_path,
+        env={"HERMES_HOME": str(hermes_home), "PATH": os.defpath, "PYTHONPATH": ""},
+    )
+
+    assert completed.returncode == 1
+    assert "could not load cron dependencies" in completed.stderr
+    assert "reinstall or reinitialize Cashew" in completed.stderr
+
+
+def test_generated_script_rejects_malformed_installation_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hermes_home, script, _implementation = _generate_script(
+        tmp_path, monkeypatch, "flat"
+    )
+    script.write_text(
+        script.read_text().replace("'kind': 'flat'", "'kind': 'unexpected-layout'", 1)
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        cwd=tmp_path,
+        env={"HERMES_HOME": str(hermes_home), "PATH": os.defpath, "PYTHONPATH": ""},
+    )
+
+    assert completed.returncode == 1
+    assert "installation marker is malformed" in completed.stderr
+
+
+def test_main_uses_pinned_module_to_reject_invalid_profile_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cron entry point validates config through its registered source."""
+    hermes_home = tmp_path / "profile"
+    hermes_home.mkdir()
+    (hermes_home / "cashew.json").write_text(json.dumps({"sleep_max_nodes": -1}))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    import plugins.memory.cashew.config as profile_config
+
+    monkeypatch.setattr(
+        sleep_cron_script,
+        "_load_profile_modules",
+        lambda _home: (profile_config, object()),
+    )
+    with pytest.raises(ValueError, match="sleep_max_nodes must be an integer"):
+        sleep_cron_script.main()
+
+
+def test_unmarked_copied_script_requests_reinitialization(tmp_path: Path) -> None:
+    script = tmp_path / "cashew-sleep-cycle.py"
+    script.write_text(Path(sleep_cron_script.__file__).read_text())
+
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        cwd=tmp_path,
+        env={
+            "HERMES_HOME": str(tmp_path / "profile"),
+            "PATH": os.defpath,
+            "PYTHONPATH": "",
+        },
+    )
+
+    assert completed.returncode == 1
+    assert "reinitialize Cashew" in completed.stderr

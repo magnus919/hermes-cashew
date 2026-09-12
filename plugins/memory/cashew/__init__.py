@@ -2,6 +2,9 @@
 # Source: Pattern mirrored from plugins/memory/hindsight/__init__.py (NousResearch/hermes-agent@main)
 from __future__ import annotations
 
+import copy
+import dataclasses
+import json
 import logging
 import os
 import pathlib
@@ -87,6 +90,30 @@ Compared with `is` (identity), never `==`. Never None — None collides with
 legitimate test-code payloads and with Python 3.13's queue.Queue.shutdown()
 signal path.
 """
+
+
+@dataclasses.dataclass(frozen=True)
+class _PrefetchRequestIdentity:
+    """The retrieval inputs a warm result must match before it can be reused."""
+
+    generation: int
+    session_id: str
+    db_path: str
+    config_fingerprint: str
+    recall_limit: int
+    domain: str | None
+    tag: str | None
+    exclude_tags: tuple[str, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class _PrefetchResult:
+    """An ephemeral warmup result with the request context that produced it."""
+
+    identity: _PrefetchRequestIdentity
+    cues: tuple[str, ...]
+    nodes: tuple[dict[str, Any], ...]
+
 
 # Probe for the Hermes cron module. In a full Hermes Agent environment the
 # cron.jobs package is importable (the agent root is on sys.path). In CI and
@@ -409,15 +436,15 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         # Incremented inside sync_turn's overflow branch each time a queued
         # turn is evicted to make room for a new one.
         self._model_fn: Callable[[str], str] | None = None
-        # Prefetch warm cache: cue → formatted context string.
+        # Prefetch warm cache: cue → structured result with its request identity.
         # Populated by queue_prefetch(), consumed by prefetch(), cleared in
         # shutdown(). Ephemeral per-turn state — never persisted.
-        self._warm_cache: dict[str, str] = {}
+        self._warm_cache: dict[str, _PrefetchResult] = {}
         # Staging slot for background prefetch results. The queue_prefetch
         # background thread writes here; prefetch() atomically swaps it into
         # _warm_cache at the start of its call. This avoids concurrent access
         # between the daemon thread and the main agent loop.
-        self._prefetch_pending: tuple[int, str, list[str], str] | None = None
+        self._prefetch_pending: _PrefetchResult | None = None
         self._prefetch_generation: int = 0
         # Background warmups accepted by queue_prefetch(). Shutdown joins
         # these before clearing DB/config state so a worker cannot observe a
@@ -604,6 +631,41 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             script_source = (
                 pathlib.Path(__file__).parent / "sleep_cron_script.py"
             ).read_text()
+            implementation = pathlib.Path(__file__).parent.resolve()
+            flat_anchor = self._hermes_home / "plugins" / "cashew"
+            dev_anchor = (
+                self._hermes_home / "hermes-agent" / "plugins" / "memory" / "cashew"
+            )
+            if (
+                flat_anchor / "plugins" / "memory" / "cashew"
+            ).resolve() == implementation:
+                marker = {
+                    "kind": "flat",
+                    "anchor": "plugins/cashew",
+                    "implementation": str(implementation),
+                }
+            elif dev_anchor.resolve() == implementation:
+                marker = {
+                    "kind": "development",
+                    "anchor": "hermes-agent/plugins/memory/cashew",
+                    "implementation": str(implementation),
+                }
+            else:
+                raise RuntimeError(
+                    "Cashew must be installed at the selected HERMES_HOME flat or "
+                    "development anchor before its cron job can be registered"
+                )
+            marker_sentinel = "_INSTALLATION_MARKER = None"
+            if script_source.count(marker_sentinel) != 1:
+                raise RuntimeError(
+                    "Cashew cron script template is invalid; reinstall or "
+                    "reinitialize Cashew before registering its cron job"
+                )
+            script_source = script_source.replace(
+                marker_sentinel,
+                f"_INSTALLATION_MARKER = {marker!r}",
+                1,
+            )
             script_dest = self._hermes_home / "scripts" / "cashew-sleep-cycle.py"
             script_dest.parent.mkdir(parents=True, exist_ok=True)
             if not script_dest.exists() or script_dest.read_text() != script_source:
@@ -1646,12 +1708,21 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         if self._config is None:
             return ""
         requested_session = str(kwargs.get("session_id") or self._session_id)
-        self._warm_cache.update(self._consume_prefetch_pending(requested_session))
+        identity = self._prefetch_request_identity(
+            session_id=requested_session,
+            generation=self._prefetch_generation,
+            domain=domain,
+            tag=tag,
+            exclude_tags=exclude_tags,
+        )
+        self._warm_cache.update(self._consume_prefetch_pending(identity))
         # Warm cache fast path: check if a cached cue matches the query.
-        if self._warm_cache:
+        if query.strip() and self._warm_cache:
             query_lower = query.lower()
-            for cue, ctx in self._warm_cache.items():
+            for cue, warm_result in self._warm_cache.items():
                 if not cue:
+                    continue
+                if warm_result.identity != identity:
                     continue
                 cue_lower = cue.lower()
                 if cue_lower in query_lower or query_lower in cue_lower:
@@ -1661,7 +1732,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         len(query),
                     )
                     self._warm_cache.clear()
-                    return ctx
+                    return self._format_context(
+                        copy.deepcopy(list(warm_result.nodes[: identity.recall_limit]))
+                    )
                 cue_words = set(w for w in cue_lower.split() if len(w) > 3)
                 query_words = set(w for w in query_lower.split() if len(w) > 3)
                 if len(cue_words & query_words) >= 2:
@@ -1671,7 +1744,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         len(query),
                     )
                     self._warm_cache.clear()
-                    return ctx
+                    return self._format_context(
+                        copy.deepcopy(list(warm_result.nodes[: identity.recall_limit]))
+                    )
             # No match — clear stale cache and fall through to cold retrieval.
             logger.info(
                 "prefetch warm cache MISS (%d cue(s) in cache) — falling through to cold retrieval",
@@ -1754,6 +1829,13 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             db_path = str(self._db_path)
             top_k = self._config.prefetch_k
             use_llm = self._model_fn is not None and self._config.prefetch_cues > 0
+            identity = self._prefetch_request_identity(
+                session_id=effective_session,
+                generation=generation,
+                domain=None,
+                tag=None,
+                exclude_tags=None,
+            )
         if not query:
             logger.debug("queue_prefetch: empty query, no warmup")
             return
@@ -1800,10 +1882,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                                 all_nodes.append(n)
 
                 if all_nodes:
-                    ctx = self._format_context(all_nodes)
-                    self._stage_prefetch_result(
-                        generation, effective_session, cues, ctx
-                    )
+                    self._stage_prefetch_result(identity, cues, all_nodes)
                     logger.info(
                         "queue_prefetch: cached %d result(s) from %d cue(s) for next turn",
                         len(all_nodes),
@@ -1833,29 +1912,70 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 logger.debug("queue_prefetch: failed to start warmup", exc_info=True)
 
     def _stage_prefetch_result(
-        self, generation: int, session_id: str, cues: list[str], context: str
+        self,
+        identity: _PrefetchRequestIdentity,
+        cues: list[str],
+        nodes: list[dict],
     ) -> None:
         """Publish a warmup result only if its request is still current."""
         with self._sync_state_lock:
-            if (
-                generation != self._prefetch_generation
-                or session_id != self._session_id
-            ):
+            current_identity = self._prefetch_request_identity(
+                session_id=self._session_id,
+                generation=self._prefetch_generation,
+                domain=identity.domain,
+                tag=identity.tag,
+                exclude_tags=list(identity.exclude_tags),
+            )
+            if identity != current_identity:
                 return
-            self._prefetch_pending = (generation, session_id, list(cues), context)
+            self._prefetch_pending = _PrefetchResult(
+                identity=identity,
+                cues=tuple(cue for cue in cues if cue.strip()),
+                nodes=tuple(copy.deepcopy(nodes)),
+            )
 
-    def _consume_prefetch_pending(self, session_id: str) -> dict[str, str]:
+    def _consume_prefetch_pending(
+        self, identity: _PrefetchRequestIdentity
+    ) -> dict[str, _PrefetchResult]:
         """Atomically consume a current result, retaining its source cues."""
         with self._sync_state_lock:
             pending = self._prefetch_pending
             self._prefetch_pending = None
-            current_generation = self._prefetch_generation
-        if pending is None:
+        if pending is None or pending.identity != identity:
             return {}
-        generation, result_session, cues, context = pending
-        if generation != current_generation or result_session != session_id:
-            return {}
-        return {cue: context for cue in cues}
+        return {cue: pending for cue in pending.cues}
+
+    def _prefetch_request_identity(
+        self,
+        *,
+        session_id: str,
+        generation: int,
+        domain: str | None,
+        tag: str | None,
+        exclude_tags: list[str] | None,
+    ) -> _PrefetchRequestIdentity:
+        """Snapshot every retrieval input that makes a warm result reusable."""
+        config = self._config
+        assert config is not None
+        config_values = (
+            dataclasses.asdict(config)
+            if dataclasses.is_dataclass(config)
+            else repr(config)
+        )
+        return _PrefetchRequestIdentity(
+            generation=generation,
+            session_id=session_id,
+            db_path=str(self._db_path),
+            config_fingerprint=json.dumps(
+                config_values, sort_keys=True, separators=(",", ":"), default=repr
+            ),
+            recall_limit=config.recall_k,
+            domain=domain or None,
+            tag=tag or None,
+            exclude_tags=tuple(
+                sorted({value for value in exclude_tags or [] if value})
+            ),
+        )
 
     def _extract_prefetch_cues(self, query: str) -> list[str]:
         """Use the auxiliary LLM to extract concrete search cues from the turn.

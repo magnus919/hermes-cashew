@@ -8,11 +8,15 @@
 from __future__ import annotations
 
 import dataclasses
+import errno
 import json
+import multiprocessing
 import os
+import stat
 
 import pytest
 
+import plugins.memory.cashew.config as config_module
 from plugins.memory.cashew.config import (
     _PROVIDER_BASE_URLS,
     _PROVIDER_ENV_MAP,
@@ -32,6 +36,13 @@ from plugins.memory.cashew.config import (
 )
 
 EXPECTED_KEY_COUNT = 17
+
+
+def _save_config_in_process(
+    hermes_home: str, values: dict[str, object], barrier
+) -> None:
+    barrier.wait(timeout=5)
+    save_config(values, hermes_home)
 
 
 def test_defaults_contains_exactly_the_runtime_backed_keys():
@@ -168,9 +179,11 @@ def test_cron_script_db_path_uses_profile_isolation_guard(tmp_path):
     from plugins.memory.cashew.sleep_cron_script import _resolve_db_path
 
     with pytest.raises(ValueError, match="must stay within hermes_home"):
-        _resolve_db_path(tmp_path, {"cashew_db_path": "../outside.db"})
+        _resolve_db_path(tmp_path, "../outside.db")
 
-    assert _resolve_db_path(tmp_path, {}) == str(tmp_path / "cashew" / "brain.db")
+    assert _resolve_db_path(tmp_path, "cashew/brain.db") == str(
+        tmp_path / "cashew" / "brain.db"
+    )
 
 
 def test_load_config_returns_defaults_when_file_absent(tmp_path):
@@ -250,13 +263,100 @@ def test_load_config_env_override_invalid_int_skips(monkeypatch, tmp_path, caplo
     assert "CASHEW_RECALL_K" in caplog.text or "recall_k" in caplog.text
 
 
+def test_load_config_invalid_env_preserves_existing_value_and_hides_raw_value(
+    monkeypatch, tmp_path, caplog
+):
+    (tmp_path / "cashew.json").write_text(json.dumps({"think_cycles": True}))
+    monkeypatch.setenv("CASHEW_THINK_CYCLES", "not-a-boolean-secret")
+
+    with caplog.at_level("WARNING", logger="plugins.memory.cashew.config"):
+        config = load_config(tmp_path)
+
+    assert config.think_cycles is True
+    assert "CASHEW_THINK_CYCLES" in caplog.text
+    assert "not-a-boolean-secret" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("recall_k", "invalid", "recall_k must be an integer from 1 to 20"),
+        ("prefetch_k", 0, "prefetch_k must be an integer from 1 to 20"),
+        ("sleep_max_nodes", -1, "sleep_max_nodes must be an integer from 1 to 2000"),
+        (
+            "sync_queue_timeout",
+            float("inf"),
+            "sync_queue_timeout must be a finite number",
+        ),
+        ("auto_extraction", "true", "auto_extraction must be a boolean"),
+        ("embedding_device", "", "embedding_device must be a non-empty string"),
+        ("_features", {"future_flag": "yes"}, "_features must be an object of boolean"),
+    ],
+)
+def test_load_config_rejects_invalid_runtime_values(tmp_path, key, value, message):
+    (tmp_path / "cashew.json").write_text(json.dumps({key: value}))
+
+    with pytest.raises(ValueError, match=message):
+        load_config(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("key", "lower", "upper"),
+    [
+        ("recall_k", 1, 20),
+        ("think_interval", 0, 10_000),
+        ("prefetch_k", 1, 20),
+        ("prefetch_cues", 0, 20),
+        ("sleep_max_nodes", 1, 2_000),
+    ],
+)
+def test_load_config_accepts_each_count_boundary(tmp_path, key, lower, upper):
+    for value in (lower, upper):
+        (tmp_path / "cashew.json").write_text(json.dumps({key: value}))
+        assert getattr(load_config(tmp_path), key) == value
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_load_config_rejects_boolean_for_integer_setting(tmp_path, value):
+    (tmp_path / "cashew.json").write_text(json.dumps({"recall_k": value}))
+
+    with pytest.raises(ValueError, match="recall_k must be an integer"):
+        load_config(tmp_path)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("-inf")])
+def test_load_config_rejects_nonfinite_or_negative_timeout(tmp_path, value):
+    (tmp_path / "cashew.json").write_text(json.dumps({"sync_queue_timeout": value}))
+
+    with pytest.raises(ValueError, match="sync_queue_timeout must be a finite number"):
+        load_config(tmp_path)
+
+
+def test_load_config_accepts_nullable_llm_role_and_unknown_boolean_feature(tmp_path):
+    (tmp_path / "cashew.json").write_text(
+        json.dumps({"llm_aux_role": None, "_features": {"future_flag": True}})
+    )
+
+    config = load_config(tmp_path)
+
+    assert config.llm_aux_role is None
+    assert config._features["future_flag"] is True
+
+
+def test_valid_environment_override_rescues_invalid_json_value(monkeypatch, tmp_path):
+    (tmp_path / "cashew.json").write_text(json.dumps({"recall_k": "invalid"}))
+    monkeypatch.setenv("CASHEW_RECALL_K", "12")
+
+    assert load_config(tmp_path).recall_k == 12
+
+
 def test_load_config_env_overrides_file(tmp_path):
     """CONFIG-05 / D-05: priority is env var > JSON file > hardcoded defaults."""
-    os.environ["CASHEW_RECALL_K"] = "99"
+    os.environ["CASHEW_RECALL_K"] = "12"
     try:
         (tmp_path / "cashew.json").write_text(json.dumps({"recall_k": 7}))
         cfg = load_config(tmp_path)
-        assert cfg.recall_k == 99  # env wins over file
+        assert cfg.recall_k == 12  # env wins over file
     finally:
         del os.environ["CASHEW_RECALL_K"]
 
@@ -322,6 +422,157 @@ def test_save_config_preserves_unknown_keys_from_existing_file(tmp_path):
     assert on_disk["user_domain"] == "ganesh"
     assert on_disk["custom_user_setting"] == "preserved"
     assert "ai_domain" in on_disk
+
+
+def test_save_config_rejects_invalid_values_without_replacing_existing_file(tmp_path):
+    path = tmp_path / "cashew.json"
+    original = json.dumps({"recall_k": 7, "custom_user_setting": "preserved"})
+    path.write_text(original)
+
+    with pytest.raises(ValueError, match="recall_k must be an integer from 1 to 20"):
+        save_config({"recall_k": 0}, tmp_path)
+
+    assert path.read_text() == original
+
+
+def test_save_config_refuses_to_replace_an_existing_invalid_runtime_value(tmp_path):
+    path = tmp_path / "cashew.json"
+    original = json.dumps({"sleep_max_nodes": -1})
+    path.write_text(original)
+
+    with pytest.raises(ValueError, match="sleep_max_nodes must be an integer"):
+        save_config({"user_domain": "correct-value"}, tmp_path)
+
+    assert path.read_text() == original
+
+
+def test_save_config_refuses_to_overwrite_malformed_json(tmp_path):
+    path = tmp_path / "cashew.json"
+    original = "{ not json"
+    path.write_text(original)
+
+    with pytest.raises(ValueError, match="correct the file before saving"):
+        save_config({"recall_k": 7}, tmp_path)
+
+    assert path.read_text() == original
+
+
+def test_save_config_replaces_atomically_and_preserves_target_permissions(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "cashew.json"
+    path.write_text(json.dumps({"recall_k": 7}))
+    path.chmod(0o640)
+    original_replace = config_module.os.replace
+
+    def fail_replace(source, destination):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(config_module.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        save_config({"recall_k": 8}, tmp_path)
+    assert json.loads(path.read_text())["recall_k"] == 7
+    assert not list(tmp_path.glob(".cashew.json.*.tmp"))
+
+    monkeypatch.setattr(config_module.os, "replace", original_replace)
+    save_config({"recall_k": 8}, tmp_path)
+
+    assert json.loads(path.read_text())["recall_k"] == 8
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    lock_path = tmp_path / ".cashew.json.lock"
+    original_lock_inode = lock_path.stat().st_ino
+    save_config({"recall_k": 9}, tmp_path)
+    assert lock_path.stat().st_ino == original_lock_inode
+
+
+@pytest.mark.parametrize("err", (errno.EINVAL, errno.ENOTSUP, errno.EPERM))
+def test_save_config_allows_unsupported_directory_fsync_after_replacement(
+    tmp_path, monkeypatch, caplog, err
+):
+    path = tmp_path / "cashew.json"
+    original_fsync = config_module.os.fsync
+
+    def reject_directory_fsync(descriptor):
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError(err, "directory fsync unsupported")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(config_module.os, "fsync", reject_directory_fsync)
+
+    save_config({"recall_k": 8}, tmp_path)
+
+    assert json.loads(path.read_text())["recall_k"] == 8
+    assert "Directory fsync is unsupported" in caplog.text
+    assert not list(tmp_path.glob(".cashew.json.*.tmp"))
+
+
+def test_save_config_reports_real_directory_fsync_failure(tmp_path, monkeypatch):
+    path = tmp_path / "cashew.json"
+    original_fsync = config_module.os.fsync
+
+    def fail_directory_fsync(descriptor):
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError(errno.EIO, "fsync failed")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(config_module.os, "fsync", fail_directory_fsync)
+
+    with pytest.raises(OSError, match="fsync failed") as exc_info:
+        save_config({"recall_k": 8}, tmp_path)
+
+    assert exc_info.value.errno == errno.EIO
+    assert json.loads(path.read_text())["recall_k"] == 8
+    assert not list(tmp_path.glob(".cashew.json.*.tmp"))
+
+
+def test_save_config_preserves_existing_bytes_when_stream_fsync_fails(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "cashew.json"
+    original = json.dumps({"recall_k": 7})
+    path.write_text(original)
+    monkeypatch.setattr(
+        config_module.os,
+        "fsync",
+        lambda _descriptor: (_ for _ in ()).throw(OSError("stream fsync failed")),
+    )
+
+    with pytest.raises(OSError, match="stream fsync failed"):
+        save_config({"recall_k": 8}, tmp_path)
+
+    assert path.read_text() == original
+    assert not list(tmp_path.glob(".cashew.json.*.tmp"))
+
+
+def test_save_config_concurrent_process_writers_preserve_non_overlapping_updates(
+    tmp_path,
+):
+    context = multiprocessing.get_context("fork")
+    barrier = context.Barrier(2)
+    first = context.Process(
+        target=_save_config_in_process,
+        args=(str(tmp_path), {"user_domain": "first"}, barrier),
+    )
+    second = context.Process(
+        target=_save_config_in_process,
+        args=(str(tmp_path), {"ai_domain": "second"}, barrier),
+    )
+    try:
+        first.start()
+        second.start()
+        first.join(timeout=10)
+        second.join(timeout=10)
+
+        assert first.exitcode == 0
+        assert second.exitcode == 0
+        config = load_config(tmp_path)
+        assert config.user_domain == "first"
+        assert config.ai_domain == "second"
+    finally:
+        for process in (first, second):
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
 
 
 def test_save_config_v0_1_0_roundtrip_preserves_original_keys(tmp_path):
@@ -496,6 +747,25 @@ def test_resolve_model_fn_graceful_on_corrupt_config_yaml(tmp_path):
     (hermes_home / "config.yaml").write_text("::: not yaml :::")
     result = resolve_model_fn(hermes_home)
     assert result is None
+
+
+@pytest.mark.parametrize(
+    "yaml_text",
+    [
+        "- auxiliary\n- is-not-an-object\n",
+        "auxiliary: []\n",
+        "auxiliary:\n  memory: []\n",
+    ],
+)
+def test_resolve_model_fn_returns_none_for_malformed_auxiliary_shapes(
+    tmp_path, yaml_text
+):
+    hermes_home = tmp_path / "malformed-aux"
+    hermes_home.mkdir()
+    (hermes_home / "cashew.json").write_text(json.dumps({"llm_aux_role": "memory"}))
+    (hermes_home / "config.yaml").write_text(yaml_text)
+
+    assert resolve_model_fn(hermes_home) is None
 
 
 def test_resolve_model_fn_uses_default_base_url(tmp_path):

@@ -105,6 +105,13 @@ EOF
 | `think_cycles` | `true` | Enable periodic insight generation (think cycle) |
 | `think_interval` | `10` | Turns between think cycle runs (0 = disable) |
 
+Cashew validates the effective JSON and `CASHEW_*` configuration before use.
+`recall_k` and `prefetch_k` allow 1–20; `prefetch_cues` allows 0–20;
+`think_interval` allows 0–10,000; `sleep_max_nodes` allows 1–2,000; and
+`sync_queue_timeout` must be finite and between 0 and 300 seconds. Invalid
+JSON or values are left in place so they can be corrected instead of being
+silently overwritten. These numeric ceilings are a new validation policy.
+
 `embedding_device` defaults to `cpu` because native MPS failures can terminate
 the Python process before the plugin can recover. Set it to `auto` to restore
 SentenceTransformer's automatic hardware selection, or to an explicit device
@@ -270,6 +277,13 @@ executes ``$HERMES_HOME/scripts/cashew-sleep-cycle.py`` with **no LLM** —
 it is a ``no_agent`` script, meaning zero LLM overhead per tick. The script
 reads ``cashew.json`` at runtime to discover its database path and
 ``sleep_max_nodes`` setting.
+
+The generated script is pinned to the Cashew installation that registered the
+job. This keeps one Hermes profile from loading another profile's provider.
+After moving, reinstalling, or changing the plugin layout, reinitialize
+Cashew to refresh the script and cron registration. Development installs may
+use the documented ``$HERMES_HOME/hermes-agent/plugins/memory/cashew`` symlink
+to an external checkout.
 
 ### What happens during a cron tick
 

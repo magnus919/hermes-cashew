@@ -16,6 +16,7 @@ import pytest
 import plugins.memory.cashew as cashew_module
 from plugins.memory.cashew import CashewMemoryProvider
 from plugins.memory.cashew.config import CashewConfig
+from plugins.memory.cashew.cron_reconcile import cron_prompt, profile_identity
 
 
 @pytest.fixture(autouse=True)
@@ -671,6 +672,9 @@ def test_unresolved_identity_is_keyword_only_and_recovers_after_reinitialize(
             "name": "cashew-sleep-cycle",
             "script": "cashew-sleep-cycle.py",
             "schedule": "every 12h",
+            "prompt": cron_prompt(profile_identity(tmp_path)),
+            "no_agent": True,
+            "repeat": None,
         },
         {"id": "other", "name": "unrelated-job", "script": "other.py"},
     ]
@@ -687,9 +691,7 @@ def test_unresolved_identity_is_keyword_only_and_recovers_after_reinitialize(
         created.append(kwargs)
         job = {
             "id": "recovered-cashew",
-            "name": kwargs["name"],
-            "script": kwargs["script"],
-            "schedule": kwargs["schedule"],
+            **kwargs,
         }
         jobs.append(job)
         return job

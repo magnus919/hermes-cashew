@@ -770,6 +770,8 @@ def test_cron_revalidates_identity_after_graph_cache_admission(
         sleep_max_nodes = 10
         embedding_model = "model-a"
         embedding_device = "cpu"
+        sleep_cycles = True
+        sleep_schedule = "every 12h"
 
     class Supervisor:
         dimension = 4
@@ -790,7 +792,7 @@ def test_cron_revalidates_identity_after_graph_cache_admission(
         run_sleep_cycle=lambda **kwargs: sleep_calls.append(kwargs),
     )
     config_module = types.SimpleNamespace(
-        load_config=lambda _home: Config(),
+        load_effective_config_snapshot=lambda _home, _snapshot: Config(),
         resolve_db_path=lambda _home, value: value,
         resolve_model_fn=lambda **_kwargs: None,
     )
@@ -833,7 +835,7 @@ def test_cron_revalidates_identity_after_graph_cache_admission(
     monkeypatch.setattr(
         cron_module,
         "_load_profile_modules",
-        lambda _home: (config_module, sleep_module),
+        lambda _home: (config_module, sleep_module, {"config": {}}),
     )
     monkeypatch.setattr(cron_module.importlib, "import_module", import_module)
     cron_module.main()

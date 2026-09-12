@@ -76,6 +76,17 @@ from .config import (
 from .config import (
     save_config as _config_save_config,
 )
+from .cron_reconcile import (
+    CRON_JOB_NAME,
+    CRON_SCRIPT_NAME,
+    compatible_job,
+    installation_marker,
+    owns_job,
+    profile_cron_lock,
+    profile_identity,
+    render_script,
+    stage_script,
+)
 
 try:
     from core.context import ContextRetriever
@@ -697,28 +708,13 @@ def _persist_cache_identity(
 
 
 def _remove_existing_sleep_job(hermes_home: pathlib.Path | None) -> None:
-    """Remove any existing 'cashew-sleep-cycle' cron job to prevent duplicates.
+    """Compatibility no-op for older callers.
 
-    Hermes cron jobs persist across restarts in ``$HERMES_HOME/cron/jobs.json``.
-    Without dedup, each provider initialize() would add another job, causing
-    N sleep cycles per tick after N restarts.  This helper scans by name and
-    removes any previous instance before registering a fresh one.
+    Job ownership is now established by a profile token in the scheduler prompt
+    and by the generated script marker.  A name-only scan could delete another
+    profile's job, so reconciliation deliberately performs no global cleanup.
     """
-    if hermes_home is None:
-        return
-    if not _HAS_HERMES_CRON:
-        return
-    try:
-        from cron.jobs import list_jobs, remove_job
-
-        for job in list_jobs():
-            if job.get("name") == "cashew-sleep-cycle":
-                remove_job(job["id"])
-                logger.info("sleep: removed duplicate cron job %s", job["id"])
-    except ImportError:
-        logger.debug("sleep: cron module not available — skipping dedup")
-    except Exception:
-        logger.warning("sleep: failed to dedup cron jobs", exc_info=True)
+    del hermes_home
 
 
 # ── on_pre_compress prompt template ──────────────────────────────────
@@ -1370,7 +1366,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
     # ── Sleep cycle cron scheduling ──────────────────────────────────────
 
     def _register_sleep_cron(self) -> None:
-        """Reconcile the persistent cron job and managed script with config."""
+        """Reconcile this profile's persistent cron job and managed script."""
         if (
             self._hermes_home is None
             or self._config is None
@@ -1380,87 +1376,60 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         try:
             from cron.jobs import create_job, list_jobs, remove_job
 
-            existing = [
-                job for job in list_jobs() if job.get("name") == "cashew-sleep-cycle"
-            ]
-            desired_schedule = self._config.sleep_schedule
-            enabled = self._config.sleep_cycles and bool(desired_schedule)
-            if not enabled:
-                for job in existing:
-                    remove_job(job["id"])
-                self._sleep_cron_job_id = None
-                return
+            home = self._hermes_home
+            config = self._config
+            desired_schedule = config.sleep_schedule
+            enabled = config.sleep_cycles and bool(desired_schedule)
+            profile_id = profile_identity(home)
+            script_dest = home / "scripts" / CRON_SCRIPT_NAME
+            with profile_cron_lock(home):
+                existing = [job for job in list_jobs() if isinstance(job, dict)]
+                owned = [job for job in existing if owns_job(job, profile_id)]
+                if not enabled:
+                    for job in owned:
+                        job_id = job.get("id")
+                        if isinstance(job_id, str):
+                            remove_job(job_id)
+                    self._sleep_cron_job_id = None
+                    return
 
-            script_source = (
-                pathlib.Path(__file__).parent / "sleep_cron_script.py"
-            ).read_text()
-            implementation = pathlib.Path(__file__).parent.resolve()
-            flat_anchor = self._hermes_home / "plugins" / "cashew"
-            dev_anchor = (
-                self._hermes_home / "hermes-agent" / "plugins" / "memory" / "cashew"
-            )
-            if (
-                flat_anchor / "plugins" / "memory" / "cashew"
-            ).resolve() == implementation:
-                marker = {
-                    "kind": "flat",
-                    "anchor": "plugins/cashew",
-                    "implementation": str(implementation),
-                }
-            elif dev_anchor.resolve() == implementation:
-                marker = {
-                    "kind": "development",
-                    "anchor": "hermes-agent/plugins/memory/cashew",
-                    "implementation": str(implementation),
-                }
-            else:
-                raise RuntimeError(
-                    "Cashew must be installed at the selected HERMES_HOME flat or "
-                    "development anchor before its cron job can be registered"
+                marker = installation_marker(
+                    home, pathlib.Path(__file__).parent.resolve(), config
                 )
-            marker_sentinel = "_INSTALLATION_MARKER = None"
-            if script_source.count(marker_sentinel) != 1:
-                logger.warning(
-                    "sleep: cron script template is invalid; reinstall or reinitialize Cashew"
+                template = (
+                    pathlib.Path(__file__).parent / "sleep_cron_script.py"
+                ).read_text(encoding="utf-8")
+                rendered = render_script(template, marker)
+                if stage_script(script_dest, rendered):
+                    logger.info("sleep: refreshed cron script at %s", script_dest)
+
+                compatible = [
+                    job
+                    for job in owned
+                    if compatible_job(
+                        job, profile_id, desired_schedule, marker, script_dest
+                    )
+                ]
+                if len(owned) == 1 and len(compatible) == 1:
+                    job_id = compatible[0].get("id")
+                    if isinstance(job_id, str):
+                        self._sleep_cron_job_id = job_id
+                        with self._sync_state_lock:
+                            self._health_cron = "registered"
+                        return
+
+                for job in owned:
+                    job_id = job.get("id")
+                    if isinstance(job_id, str):
+                        remove_job(job_id)
+                job = create_job(
+                    prompt=f"hermes-cashew sleep cycle [{profile_id}]",
+                    schedule=desired_schedule,
+                    name=CRON_JOB_NAME,
+                    script=CRON_SCRIPT_NAME,
+                    no_agent=True,
+                    repeat=None,  # forever
                 )
-                raise RuntimeError(
-                    "Cashew cron script template is invalid; reinstall or "
-                    "reinitialize Cashew before registering its cron job"
-                )
-            script_source = script_source.replace(
-                marker_sentinel,
-                f"_INSTALLATION_MARKER = {marker!r}",
-                1,
-            )
-            script_dest = self._hermes_home / "scripts" / "cashew-sleep-cycle.py"
-            script_dest.parent.mkdir(parents=True, exist_ok=True)
-            if not script_dest.exists() or script_dest.read_text() != script_source:
-                staged = script_dest.with_suffix(".py.tmp")
-                staged.write_text(script_source)
-                staged.chmod(0o755)
-                staged.replace(script_dest)
-                logger.info("sleep: refreshed cron script at %s", script_dest)
-
-            matching = [
-                job for job in existing if job.get("schedule") == desired_schedule
-            ]
-            if len(existing) == 1 and len(matching) == 1:
-                self._sleep_cron_job_id = matching[0]["id"]
-                with self._sync_state_lock:
-                    self._health_cron = "registered"
-                return
-
-            for job in existing:
-                remove_job(job["id"])
-
-            job = create_job(
-                prompt="hermes-cashew sleep cycle",
-                schedule=desired_schedule,
-                name="cashew-sleep-cycle",
-                script="cashew-sleep-cycle.py",
-                no_agent=True,
-                repeat=None,  # forever
-            )
             self._sleep_cron_job_id = job["id"]
             with self._sync_state_lock:
                 self._health_cron = "registered"
@@ -1489,15 +1458,19 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
     def _suspend_sleep_cron(self) -> None:
         """Remove a stale sleep job when this profile's identity is unresolved."""
+        if self._hermes_home is None:
+            return
         try:
             from cron.jobs import list_jobs, remove_job
 
-            for job in list_jobs():
-                if (
-                    job.get("name") == "cashew-sleep-cycle"
-                    and job.get("script") == "cashew-sleep-cycle.py"
-                ):
-                    remove_job(job["id"])
+            home = self._hermes_home
+            profile_id = profile_identity(home)
+            with profile_cron_lock(home):
+                for job in list_jobs():
+                    if isinstance(job, dict) and owns_job(job, profile_id):
+                        job_id = job.get("id")
+                        if isinstance(job_id, str):
+                            remove_job(job_id)
         except ImportError:
             pass
         except Exception:
@@ -1508,9 +1481,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._health_cron = "disabled"
 
     def _remove_sleep_cron(self) -> None:
-        """Deregister the sleep cycle cron job.
+        """Explicitly deregister this instance's known sleep cycle cron job.
 
-        Called from shutdown().  Safe to call even when no job was registered.
+        Ordinary shutdown intentionally preserves profile-owned scheduled work;
+        this narrow helper is reserved for an explicit owner cleanup path.
         """
         if self._sleep_cron_job_id is None:
             return

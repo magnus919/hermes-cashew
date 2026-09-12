@@ -46,6 +46,16 @@ HERMES_PINNED_SOURCE=/tmp/hermes-agent-990473a79c6b0396b0a648fdd85ee8f7a5c267d3 
   "$HERMES_TEST_ENV/bin/python" integration/run_pinned_host.py
 ```
 
+Check explicit auxiliary-role admission separately with the same pinned source:
+
+```sh
+HERMES_PINNED_SOURCE=/tmp/hermes-agent-990473a79c6b0396b0a648fdd85ee8f7a5c267d3 \
+  "$HERMES_TEST_ENV/bin/python" integration/check_auxiliary_role_policy.py
+```
+
+The probe accepts an explicit `provider: auto` mapping and rejects a malformed
+`model: null` mapping before Hermes' client resolver can auto-route it.
+
 The command runs both the flat `hermes plugins install` loader and the
 bundled/development loader. A missing or mismatched host source is an explicit
 setup failure. The test patches only the embedding model and external client

@@ -1,11 +1,11 @@
-"""Tests for the sleep cycle cron job lifecycle (v0.11.0).
+"""Tests for persistent profile-owned sleep-cron lifecycle behavior.
 
 The sleep cycle was migrated from ``on_session_end()`` to a Hermes ``no_agent``
 cron job. These tests verify that:
 1. ``initialize()`` registers the cron job when sleeping is enabled
 2. ``initialize()`` skips cron registration when sleeping is disabled
-3. ``shutdown()`` removes the cron job
-4. The cron script is installed correctly
+3. ordinary ``shutdown()`` preserves the profile-owned job for adoption
+4. the cron script is installed correctly
 
 All tests in this file require the Hermes ``cron`` module, which is only
 available in a full Hermes Agent environment — not in CI or standalone

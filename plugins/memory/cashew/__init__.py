@@ -1487,32 +1487,6 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             with self._sync_state_lock:
                 self._health_cron = "disabled"
 
-    def _remove_sleep_cron(self) -> None:
-        """Explicitly deregister this instance's known sleep cycle cron job.
-
-        Ordinary shutdown intentionally preserves profile-owned scheduled work;
-        this narrow helper is reserved for an explicit owner cleanup path.
-        """
-        if self._sleep_cron_job_id is None or self._hermes_home is None:
-            return
-        try:
-            from cron.jobs import remove_job, use_cron_store
-
-            with (
-                profile_cron_lock(self._hermes_home),
-                use_cron_store(self._hermes_home),
-            ):
-                remove_job(self._sleep_cron_job_id)
-            logger.info("sleep: removed cron job %s", self._sleep_cron_job_id)
-        except Exception:
-            logger.warning(
-                "sleep: failed to remove cron job %s",
-                self._sleep_cron_job_id,
-                exc_info=True,
-            )
-        finally:
-            self._sleep_cron_job_id = None
-
     # LLM integration via auxiliary.memory convention
     # ------------------------------------------------------------------
 

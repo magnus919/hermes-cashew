@@ -24,9 +24,9 @@ Issue #188 tested this candidate baseline:
 
 | Component | Exact reference | Availability and provenance |
 | --- | --- | --- |
-| hermes-cashew | `9ed0636b24738d2f9e7046bc32ec5719bd9830b4` plus the issue #188 dependency, test, workflow, and documentation change | This was `origin/main` when the final candidate was rebased and tested. |
+| hermes-cashew | `cc1e31c66b1f0cf72079d91497e21c7347c47c99` plus the issue #188 dependency, test, workflow, and documentation change | This was `origin/main` when the final candidate was refreshed and tested. It includes the merged #199 real-Hermes integration lane. |
 | cashew-brain | `dd57ef029cf9a6dce0b8145d335a55202dd1bac4` | Immutable [upstream source archive](https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz), locked with archive SHA-256 `38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab`. The installed `core/session.py` SHA-256 is `0ce60cc63adf4fb7136581aee722bb10e9a344e556b6fb98f4d46855d53c36cd`. |
-| Hermes Agent loader/lifecycle evidence | `990473a79c6b0396b0a648fdd85ee8f7a5c267d3` | Separately exercised by unmerged #199 candidate `5cbb78b66827195e4959e92e53ed8e46497bc8be`, based on wrapper commit `84014a4`, in an isolated host environment containing released `cashew-brain==1.2.1`. That run did not combine #199 with the #188 source pin. It is compatibility evidence, not a merged change or a published minimum-version promise. |
+| Hermes Agent loader/lifecycle evidence | `990473a79c6b0396b0a648fdd85ee8f7a5c267d3` | The #199 lane merged in wrapper commit `cc1e31c66b1f0cf72079d91497e21c7347c47c99`. Its flat and development loader, auxiliary routing, lifecycle, and cron contracts also passed in a fresh environment containing the exact #188 source pin. The embedding model and external client were deterministic fakes; Hermes, SQLite 3.47.1, and the Cashew package boundary were real. This is bounded compatibility evidence, not a published Hermes minimum-version promise or native embedding-crash proof. |
 
 The selected commit was the upstream `main` tip at the audit date and is 22
 commits ahead of `v1.2.1` (`894637ba76b059347af3fe2142201521d9484fb4`).

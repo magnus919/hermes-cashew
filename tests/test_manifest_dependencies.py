@@ -54,6 +54,7 @@ def test_lock_records_selected_cashew_source_and_archive_hash() -> None:
 def test_source_install_docs_require_reinstall_and_provenance_check() -> None:
     root = Path(__file__).parents[1]
     readme = (root / "README.md").read_text()
+    integration_readme = (root / "integration/README.md").read_text()
 
     assert CASHEW_REQUIREMENT in readme
     assert '--reinstall "$CASHEW_PIN" sqlite-vec' in readme
@@ -61,6 +62,9 @@ def test_source_install_docs_require_reinstall_and_provenance_check() -> None:
     assert "hermes plugins update cashew" in readme
     assert "hermes update" in readme
     assert "installed automatically by `hermes plugins install`" not in readme
+    assert CASHEW_REQUIREMENT in integration_readme
+    assert '--reinstall "$CASHEW_PIN"' in integration_readme
+    assert "scripts/verify-cashew-baseline.py" in integration_readme
 
 
 def test_sleep_cycle_dependencies_are_direct_project_requirements() -> None:

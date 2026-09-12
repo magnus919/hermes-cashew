@@ -484,20 +484,17 @@ def test_shutdown_blocks_public_old_profile_access_until_cleanup(tmp_path, monke
 
 def test_prefetch_uses_snapshot_after_shutdown_clears_runtime(tmp_path, monkeypatch):
     """A prefetch admitted before teardown keeps its database snapshot."""
-    feature_entered = threading.Event()
-    feature_returned = threading.Event()
-    release_feature = threading.Event()
+    upstream_entered = threading.Event()
+    release_upstream = threading.Event()
     shutdown_done = threading.Event()
     observed_paths: list[Any] = []
 
-    def blocked_feature(config, name):
-        del config, name
-        feature_entered.set()
-        assert release_feature.wait(timeout=2.0)
-        feature_returned.set()
-        return False
+    def blocked_upstream(**kwargs):
+        upstream_entered.set()
+        assert release_upstream.wait(timeout=2.0)
+        return []
 
-    monkeypatch.setattr("plugins.memory.cashew.is_feature_enabled", blocked_feature)
+    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", blocked_upstream)
     p = make_initialized_provider(tmp_path)
     expected_db = p._db_path
 
@@ -523,19 +520,19 @@ def test_prefetch_uses_snapshot_after_shutdown_clears_runtime(tmp_path, monkeypa
     prefetch_thread.start()
     shutdown_thread: threading.Thread | None = None
     try:
-        assert feature_entered.wait(timeout=1.0)
-        release_feature.set()
-        assert feature_returned.wait(timeout=1.0)
+        assert upstream_entered.wait(timeout=1.0)
         shutdown_thread = threading.Thread(target=p.shutdown)
         shutdown_thread.start()
         shutdown_thread.join(timeout=2.0)
         assert not shutdown_thread.is_alive()
+        assert p._db_path is None
         shutdown_done.set()
+        release_upstream.set()
         assert prefetch_done.wait(timeout=2.0)
         assert prefetch_errors == []
         assert observed_paths == [expected_db]
     finally:
-        release_feature.set()
+        release_upstream.set()
         shutdown_done.set()
         prefetch_thread.join(timeout=2.0)
         if shutdown_thread is not None:

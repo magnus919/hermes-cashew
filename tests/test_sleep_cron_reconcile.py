@@ -7,6 +7,7 @@ import types
 from dataclasses import replace
 from pathlib import Path
 
+import plugins.memory.cashew as provider_module
 from plugins.memory.cashew import CashewMemoryProvider
 from plugins.memory.cashew.config import CashewConfig
 
@@ -85,3 +86,26 @@ def test_matching_job_is_adopted_without_reset(tmp_path, monkeypatch):
     assert removed == []
     assert created == []
     assert provider._sleep_cron_job_id == "current"
+
+
+def test_tampered_cron_template_does_not_install_script_or_job(
+    tmp_path, monkeypatch, caplog
+):
+    _removed, created = _install_fake_cron(monkeypatch, [])
+    provider = _provider(tmp_path)
+    template = Path(provider_module.__file__).parent / "sleep_cron_script.py"
+    original_read_text = Path.read_text
+
+    def read_tampered_template(path, *args, **kwargs):
+        if path == template:
+            return "# marker removed by a damaged installation\n"
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_tampered_template)
+
+    provider._register_sleep_cron()
+
+    assert created == []
+    assert provider._sleep_cron_job_id is None
+    assert not (tmp_path / "scripts" / "cashew-sleep-cycle.py").exists()
+    assert "cron script template is invalid" in caplog.text

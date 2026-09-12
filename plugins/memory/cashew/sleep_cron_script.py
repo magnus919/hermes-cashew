@@ -89,8 +89,20 @@ def _load_profile_modules(hermes_home: Path):
     package = types.ModuleType(package_name)
     package.__path__ = [str(implementation)]
     sys.modules[package_name] = package
-    config_module = importlib.import_module(f"{package_name}.config")
-    sleep_module = importlib.import_module(f"{package_name}.sleep_refactor")
+    try:
+        config_module = importlib.import_module(f"{package_name}.config")
+        sleep_module = importlib.import_module(f"{package_name}.sleep_refactor")
+    except ImportError as exc:
+        for module_name in (
+            package_name,
+            f"{package_name}.config",
+            f"{package_name}.sleep_refactor",
+        ):
+            sys.modules.pop(module_name, None)
+        raise RuntimeError(
+            "Cashew installation could not load cron dependencies; reinstall or "
+            "reinitialize Cashew."
+        ) from exc
     return config_module, sleep_module
 
 

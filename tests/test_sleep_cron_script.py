@@ -42,10 +42,12 @@ def _write_installation(implementation: Path, identity: str) -> None:
         "    return 'resolved-memory-model'\n"
     )
     (implementation / "companion.py").write_text(f"IDENTITY = {identity!r}\n")
+    (implementation / "embedding.py").write_text("MODEL = 'test-embedding'\n")
     (implementation / "sleep_refactor.py").write_text(
         "import os\n"
         "from pathlib import Path\n"
         "from .companion import IDENTITY\n"
+        "from . import embedding\n"
         "def run_sleep_cycle(**kwargs):\n"
         "    assert kwargs['background_dream'] is False\n"
         "    Path(os.environ['PHASE_MARKER']).write_text(IDENTITY)\n"
@@ -245,6 +247,28 @@ def test_generated_script_rejects_incomplete_installation(
 
     assert completed.returncode == 1
     assert "installation is incomplete" in completed.stderr
+
+
+def test_generated_script_reports_missing_imported_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hermes_home, script, implementation = _generate_script(
+        tmp_path, monkeypatch, "flat"
+    )
+    (implementation / "embedding.py").unlink()
+
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        cwd=tmp_path,
+        env={"HERMES_HOME": str(hermes_home), "PATH": os.defpath, "PYTHONPATH": ""},
+    )
+
+    assert completed.returncode == 1
+    assert "could not load cron dependencies" in completed.stderr
+    assert "reinstall or reinitialize Cashew" in completed.stderr
 
 
 def test_generated_script_rejects_malformed_installation_marker(

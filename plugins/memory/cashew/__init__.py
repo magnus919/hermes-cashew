@@ -626,8 +626,14 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     "Cashew must be installed at the selected HERMES_HOME flat or "
                     "development anchor before its cron job can be registered"
                 )
+            marker_sentinel = "_INSTALLATION_MARKER = None"
+            if script_source.count(marker_sentinel) != 1:
+                raise RuntimeError(
+                    "Cashew cron script template is invalid; reinstall or "
+                    "reinitialize Cashew before registering its cron job"
+                )
             script_source = script_source.replace(
-                "_INSTALLATION_MARKER = None",
+                marker_sentinel,
                 f"_INSTALLATION_MARKER = {marker!r}",
                 1,
             )

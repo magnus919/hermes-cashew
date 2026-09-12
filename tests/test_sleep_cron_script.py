@@ -23,7 +23,7 @@ def _install_fake_cron(monkeypatch: pytest.MonkeyPatch) -> None:
     cron_package = types.ModuleType("cron")
     cron_package.__path__ = []  # type: ignore[attr-defined]
     cron_jobs = types.ModuleType("cron.jobs")
-    cron_jobs.list_jobs = lambda: []
+    cron_jobs.list_jobs = lambda *, include_disabled=False: []
     cron_jobs.remove_job = lambda _job_id: None
     cron_jobs.parse_schedule = lambda schedule: schedule
     cron_jobs.create_job = lambda **_kwargs: {"id": "cashew-sleep-test"}

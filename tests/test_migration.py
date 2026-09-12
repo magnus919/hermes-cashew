@@ -681,7 +681,8 @@ def test_unresolved_identity_is_keyword_only_and_recovers_after_reinitialize(
     ]
     created: list[dict] = []
 
-    def list_jobs():
+    def list_jobs(*, include_disabled: bool = False):
+        del include_disabled
         return list(jobs)
 
     def remove_job(job_id):

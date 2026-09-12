@@ -39,7 +39,6 @@ from typing import Any, Optional
 
 import numpy as np
 
-from .embedding import load_sentence_transformer
 from .locking import MaintenanceLockAcquisitionError, try_maintenance_lock
 
 logger = logging.getLogger(__name__)
@@ -633,6 +632,7 @@ def _embed_orphans(
     conn: sqlite3.Connection,
     embedding_model: str = "thenlper/gte-large",
     embedding_device: str = "cpu",
+    embedding_client: Any = None,
 ) -> int:
     """Embed any active nodes lacking an embedding row. Returns count."""
     rows = conn.execute(
@@ -650,12 +650,26 @@ def _embed_orphans(
         "sleep: embedding %d orphaned nodes with %s...", len(rows), embedding_model
     )
 
-    model = load_sentence_transformer(embedding_model, embedding_device)
+    if embedding_client is None:
+        logger.warning("sleep: orphan embedding unavailable")
+        return 0
 
     embedded = 0
     for nid, content in rows:
         try:
-            vec = model.encode(content, normalize_embeddings=True)
+            vectors = np.asarray(
+                embedding_client.encode([content]),
+                dtype=np.float32,
+            )
+            if (
+                vectors.ndim != 2
+                or vectors.shape[0] != 1
+                or vectors.shape[1] == 0
+                or not np.isfinite(vectors).all()
+            ):
+                logger.warning("sleep: orphan embedding returned an invalid vector")
+                continue
+            vec = vectors[0]
             blob = vec.astype(np.float32).tobytes()
             try:
                 conn.execute(
@@ -678,8 +692,8 @@ def _embed_orphans(
             except sqlite3.OperationalError:
                 pass
             embedded += 1
-        except Exception as e:
-            logger.warning("sleep: failed to embed node %s: %s", nid[:8], e)
+        except Exception:
+            logger.warning("sleep: failed to embed orphan node %s", nid[:8])
 
     conn.commit()
     logger.info("sleep: embedded %d orphaned nodes", embedded)
@@ -695,6 +709,7 @@ def _run_dream_async(
     model_fn: Any,
     embedding_model: str = "thenlper/gte-large",
     embedding_device: str = "cpu",
+    embedding_client: Any = None,
 ) -> None:
     """Run Phase 8 (dream) + Phase 9 (orphan embedding) in a daemon thread.
 
@@ -714,6 +729,7 @@ def _run_dream_async(
                     conn,
                     embedding_model=embedding_model,
                     embedding_device=embedding_device,
+                    embedding_client=embedding_client,
                 )
             logger.info(
                 "sleep: background dream complete (id=%s, orphans=%d)",
@@ -736,6 +752,7 @@ def run_sleep_cycle(
     background_dream: bool = False,
     embedding_model: str = "thenlper/gte-large",
     embedding_device: str = "cpu",
+    embedding_client: Any = None,
 ) -> dict:
     """Run one complete refactored sleep cycle.
 
@@ -750,6 +767,8 @@ def run_sleep_cycle(
             hook return promptly after the ~20s synchronous path.
         embedding_model: SentenceTransformer model used for orphan embeddings.
         embedding_device: Device used for orphan embeddings. Defaults to CPU.
+        embedding_client: Isolated process client used for orphan embeddings.
+            When absent or unavailable, orphan repair is skipped.
 
     Returns:
         Dict with statistics for each phase. When *background_dream* is True,
@@ -802,6 +821,7 @@ def run_sleep_cycle(
                     background_dream=background_dream,
                     embedding_model=embedding_model,
                     embedding_device=embedding_device,
+                    embedding_client=embedding_client,
                     t_start=t_start,
                 )
     except MaintenanceLockAcquisitionError:
@@ -825,6 +845,7 @@ def _run_sleep_cycle_locked(
     background_dream: bool,
     embedding_model: str,
     embedding_device: str,
+    embedding_client: Any,
     t_start: float,
 ) -> dict:
     """Run synchronous sleep phases while the caller owns DB and lock resources."""
@@ -894,6 +915,7 @@ def _run_sleep_cycle_locked(
                 model_fn=model_fn,
                 embedding_model=embedding_model,
                 embedding_device=embedding_device,
+                embedding_client=embedding_client,
             )
             dream_pending = True
             dream_status = "pending"
@@ -911,6 +933,7 @@ def _run_sleep_cycle_locked(
             conn,
             embedding_model=embedding_model,
             embedding_device=embedding_device,
+            embedding_client=embedding_client,
         )
 
     elapsed = round(time.perf_counter() - t_start, 1)

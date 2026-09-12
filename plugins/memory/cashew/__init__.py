@@ -6,7 +6,6 @@ import copy
 import dataclasses
 import json
 import logging
-import os
 import pathlib
 import queue
 import re
@@ -17,8 +16,15 @@ from typing import Any, Callable, Dict, List
 
 from .embedding import (
     DEFAULT_EMBEDDING_DEVICE,
-    load_sentence_transformer,
     normalize_embedding_device,
+)
+from .embedding_process import (
+    EmbeddingFailure,
+    EmbeddingSupervisor,
+    EmbeddingUnavailable,
+    NoInProcessEmbeddingBackend,
+    ProcessEmbeddingBackend,
+    embedding_caller_wait,
 )
 from .error_tracking import capture_exception, set_plugin_context
 from .health import OutcomeLedger, safe_error_class
@@ -70,6 +76,15 @@ from .tools import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _retrieve_with_embedding_wait(**kwargs: Any) -> Any:
+    """Give interactive retrieval bounded patience without killing active work."""
+    from core.retrieval import retrieve_recursive_bfs
+
+    with embedding_caller_wait(1.5):
+        return retrieve_recursive_bfs(**kwargs)
+
 
 # Install scrub filter on the cashew logger so all log output is sanitized.
 add_scrub_filter(logger)
@@ -206,94 +221,85 @@ _UPSTREAM_KNOWN_DIMS: dict[str, int] = {
     "BAAI/bge-small-en-v1.5": 384,
 }
 
-# Try to patch upstream embedding model at import time, before any session
-# initializes. The per-session call in initialize() is the primary path;
-# this import-time attempt covers gateway sessions where the provider may
-# already be initialized by the time a new session starts.
-_IMPORT_TIME_EMBEDDING_MODEL = os.environ.get(
-    "CASHEW_EMBEDDING_MODEL", "thenlper/gte-large"
-)
-_IMPORT_TIME_EMBEDDING_DEVICE = os.environ.get(
-    "CASHEW_EMBEDDING_DEVICE", DEFAULT_EMBEDDING_DEVICE
-)
+
+def _open_profile_embedding_cache(cache_path: pathlib.Path) -> Any:
+    """Serialize only upstream's one-time shared cache schema initialization."""
+    from core.embedding_cache import EmbeddingCache
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + 5.0
+    while True:
+        with try_maintenance_lock(cache_path) as lock_fd:
+            if lock_fd is not None:
+                return EmbeddingCache(str(cache_path))
+        if time.monotonic() >= deadline:
+            raise EmbeddingUnavailable(EmbeddingFailure.BUSY)
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
 def _patch_upstream_embedding(
-    model_name: str, device: str = DEFAULT_EMBEDDING_DEVICE
-) -> None:
-    """Apply the provider's model and device selection to cashew-brain.
-
-    cashew-brain 1.2.1 resolves its model through ``core.config`` and stores
-    the active model name itself, but its local backend otherwise delegates
-    device choice to SentenceTransformer. The class patches below are installed
-    once and read the current configured device from the upstream module, so
-    repeated provider initialization never stacks wrappers.
-    """
+    model_name: str,
+    device: str = DEFAULT_EMBEDDING_DEVICE,
+    *,
+    cache_path: pathlib.Path | None = None,
+) -> EmbeddingSupervisor | None:
+    """Bind upstream embedding to an owned subprocess for one provider."""
     try:
         import core.config
         import core.embedding_service
     except ImportError:
         logger.warning("cashew-brain not installed; cannot patch embedding model")
-        return
+        return None
 
+    dim = _UPSTREAM_KNOWN_DIMS.get(model_name, 0)
     selected_device = normalize_embedding_device(device)
-    dim = _UPSTREAM_KNOWN_DIMS.get(model_name, 1024)
+    if cache_path is None:
+        core.config.config.embedding_model = model_name
+        # Retain the public compatibility constants for upstream consumers that
+        # still import them directly.
+        core.embedding_service.DEFAULT_MODEL = model_name
+        if dim:
+            core.embedding_service.EMBEDDING_DIM = dim
+        core.embedding_service.reset_default_service()
+        return None
+
+    supervisor = EmbeddingSupervisor(
+        model=model_name,
+        device=selected_device,
+        dimension=dim,
+        cache_dir=cache_path.parent / "model-cache",
+    )
+    try:
+        if dim == 0:
+            dim = supervisor.start()
+        service = core.embedding_service.EmbeddingService(
+            model=model_name,
+            cache=_open_profile_embedding_cache(cache_path),
+            daemon=ProcessEmbeddingBackend(supervisor),
+            local=NoInProcessEmbeddingBackend(dim),
+        )
+    except Exception:
+        supervisor.close()
+        raise
+    # Publish the process-global upstream selection only after ownership,
+    # dimension discovery, and cache setup all succeed. A rejected second
+    # provider must not disturb the active owner's model or service.
     core.config.config.embedding_model = model_name
-    # Retain the public compatibility constants for upstream consumers that
-    # still import them directly.
     core.embedding_service.DEFAULT_MODEL = model_name
     core.embedding_service.EMBEDDING_DIM = dim
-    core.embedding_service._hermes_cashew_embedding_device = selected_device
-
-    local_backend = core.embedding_service.LocalBackend
-    if not getattr(local_backend._ensure_model, "_hermes_cashew_device_patch", False):
-
-        def _ensure_model(instance: Any) -> None:
-            if instance._model is None:
-                active_device = getattr(
-                    core.embedding_service,
-                    "_hermes_cashew_embedding_device",
-                    DEFAULT_EMBEDDING_DEVICE,
-                )
-                instance._model = load_sentence_transformer(
-                    instance.model_name, active_device
-                )
-
-        _ensure_model._hermes_cashew_device_patch = True  # type: ignore[attr-defined]
-        local_backend._ensure_model = _ensure_model
-
-    daemon_backend = core.embedding_service.DaemonBackend
-    if not getattr(daemon_backend.encode, "_hermes_cashew_device_patch", False):
-        upstream_daemon_encode = daemon_backend.encode
-
-        def _encode(instance: Any, texts: list[str]) -> Any:
-            active_device = getattr(
-                core.embedding_service,
-                "_hermes_cashew_embedding_device",
-                DEFAULT_EMBEDDING_DEVICE,
-            )
-            if active_device != "auto":
-                return core.embedding_service.np.zeros(
-                    (0, instance.dim), dtype=core.embedding_service.np.float32
-                )
-            return upstream_daemon_encode(instance, texts)
-
-        _encode._hermes_cashew_device_patch = True  # type: ignore[attr-defined]
-        daemon_backend.encode = _encode
-
-    core.embedding_service.reset_default_service()
+    core.embedding_service._KNOWN_DIMS[model_name] = dim
+    core.embedding_service._default_service = service
     logger.info(
         "configured upstream embedding: model=%s dim=%d device=%s",
         model_name,
         dim,
         selected_device,
     )
+    return supervisor
 
 
-# Apply the patch at import time — before any session initializes.
-# This covers gateway scenarios where the provider may already be
-# constructed by the time initialize() is called.
-_patch_upstream_embedding(_IMPORT_TIME_EMBEDDING_MODEL, _IMPORT_TIME_EMBEDDING_DEVICE)
+# Import-time model construction is intentionally avoided. The provider binds
+# the process service after resolving its profile-scoped cache path.
 
 
 def _remove_existing_sleep_job(hermes_home: pathlib.Path | None) -> None:
@@ -383,6 +389,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         # Stop accepting new turns once shutdown begins while allowing turns
         # already ahead of the sentinel to drain normally.
         self._shutdown_started = threading.Event()
+        self._shutdown_cleanup_pending: (
+            tuple[threading.Thread | None, queue.Queue, tuple[threading.Thread, ...]]
+            | None
+        ) = None
         # Interpreter-finalization flag: set only after sentence-transformers
         # reports that Python's atexit sequence has begun. Unlike normal
         # shutdown, this is unrecoverable and remaining queued turns must stop.
@@ -399,6 +409,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         self._health_last_error_at: float | None = None
         self._outcomes = OutcomeLedger()
         self._vector_available: bool | None = None
+        self._embedding_supervisor: EmbeddingSupervisor | None = None
 
     @property
     def name(self) -> str:
@@ -581,17 +592,17 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             with trace_operation("cashew.initialize") as span:
                 span.set_attribute("session_id", session_id)
                 self._config = load_config(self._hermes_home)
-                # Configure upstream model and device before any embedding work.
-                # The singleton is reset so the next use observes both values.
-                _patch_upstream_embedding(
-                    self._config.embedding_model, self._config.embedding_device
-                )
                 # First-load bootstrap creates only Cashew's own config. The
                 # user explicitly opts into host-backed LLM work by adding an
                 # auxiliary role to Hermes config.yaml.
                 _ensure_config_file(self._hermes_home)
                 self._db_path = resolve_db_path(
                     self._hermes_home, self._config.cashew_db_path
+                )
+                self._embedding_supervisor = _patch_upstream_embedding(
+                    self._config.embedding_model,
+                    self._config.embedding_device,
+                    cache_path=self._db_path.parent / "embedding-cache.db",
                 )
                 # ContextRetriever.__init__ is lazy — no SQLite open, no embedding load yet.
                 # Guard against the defensive-import fallback (ContextRetriever = None).
@@ -674,17 +685,19 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                             self._set_health_locked("ready", None, cron=cron_state)
         except _InitializationCancelledError:
             model_fn = self._model_fn
+            supervisor = self._embedding_supervisor
             with self._sync_state_lock:
                 self._config = None
                 self._db_path = None
                 self._retriever = None
                 self._model_fn = None
                 self._sync_queue = None
-                self._shutdown_started.clear()
+                self._shutdown_started.set()
                 self._set_health_locked("stopped", "initialization_cancelled")
             close_model = getattr(model_fn, "_cashew_close", None)
             if callable(close_model):
                 close_model()
+            self._close_embedding_runtime(supervisor)
         except Exception as _exc:
             capture_exception(
                 _exc,
@@ -702,18 +715,21 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 exc_info=True,
             )
             model_fn = self._model_fn
+            supervisor = self._embedding_supervisor
             reason = self._initialization_reason(_exc)
             with self._sync_state_lock:
                 self._config = None
                 self._db_path = None
                 self._retriever = None
+                self._model_fn = None
                 self._sync_worker = None
                 self._sync_queue = None
-                self._shutdown_started.clear()
+                self._shutdown_started.set()
                 self._set_health_locked("failed", reason, error=_exc)
             close_model = getattr(model_fn, "_cashew_close", None)
             if callable(close_model):
                 close_model()
+            self._close_embedding_runtime(supervisor)
         finally:
             with self._lifecycle_lock:
                 self._initializing = False
@@ -1732,7 +1748,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._last_assistant = ""
             self._prefetch_condition.notify_all()
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> None:  # noqa: C901 - teardown state machine is explicit
         """Stop producers, bounded-join background work, clear references.
 
         Order is load-bearing:
@@ -1750,6 +1766,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         """
         # Serialize the ownership decision only. The bounded joins happen
         # outside both locks so sync_turn remains a non-blocking hot path.
+        retry_cleanup: (
+            tuple[threading.Thread | None, queue.Queue, tuple[threading.Thread, ...]]
+            | None
+        ) = None
         with self._lifecycle_lock:
             if self._initializing:
                 if self._sync_worker is None:
@@ -1764,25 +1784,39 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 # shutdown; initialize() retains ownership until its trace
                 # context exits and its unconditional finalizer runs.
             with self._sync_state_lock:
-                if self._sync_queue is None or self._shutdown_started.is_set():
-                    return  # safe no-op or shutdown already in progress
-                timeout = (
-                    self._config.sync_queue_timeout
-                    if self._config is not None
-                    else 30.0
-                )
-                deadline = time.monotonic() + max(0.0, timeout)
-                self._shutdown_started.set()
-                self._set_health_locked("stopping", "shutdown_requested")
-                self._prefetch_generation += 1
-                self._prefetch_pending = None
-                model_fn = self._model_fn
-                self._prefetch_pending_request = None
-                self._prefetch_latest_identity = None
-                q = self._sync_queue
-                assert q is not None
-                prefetch_threads = tuple(self._prefetch_threads)
-                self._prefetch_condition.notify_all()
+                if self._sync_queue is None:
+                    return  # safe no-op
+                if self._shutdown_started.is_set():
+                    retry_cleanup = self._shutdown_cleanup_pending
+                    if retry_cleanup is None:
+                        return  # shutdown already in progress
+                else:
+                    retry_cleanup = None
+                if retry_cleanup is not None:
+                    # Retry outside both provider locks. The prior shutdown
+                    # already closed producer admission and the model callable.
+                    pass
+                else:
+                    timeout = (
+                        self._config.sync_queue_timeout
+                        if self._config is not None
+                        else 30.0
+                    )
+                    deadline = time.monotonic() + max(0.0, timeout)
+                    self._shutdown_started.set()
+                    self._set_health_locked("stopping", "shutdown_requested")
+                    self._prefetch_generation += 1
+                    self._prefetch_pending = None
+                    model_fn = self._model_fn
+                    self._prefetch_pending_request = None
+                    self._prefetch_latest_identity = None
+                    q = self._sync_queue
+                    assert q is not None
+                    prefetch_threads = tuple(self._prefetch_threads)
+                    self._prefetch_condition.notify_all()
+        if retry_cleanup is not None:
+            self._schedule_shutdown_cleanup(*retry_cleanup)
+            return
         _METRICS.emit()
         # Items already in the queue remain ahead of the sentinel and receive a
         # bounded opportunity to persist before the worker exits.
@@ -1835,15 +1869,14 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         if alive_workers:
             with self._sync_state_lock:
                 self._set_health_locked("stopping", "worker_timeout")
-            cleanup = threading.Thread(
-                target=self._clear_state_after_workers_exit,
-                args=(worker, q, alive_workers),
-                daemon=True,
-                name=f"cashew-shutdown-{self._session_id}",
-            )
-            cleanup.start()
+                self._shutdown_cleanup_pending = (worker, q, alive_workers)
+            self._schedule_shutdown_cleanup(worker, q, alive_workers)
             return
-        self._clear_runtime_state(worker, q)
+        self._clear_runtime_state(
+            worker,
+            q,
+            embedding_close_timeout=max(0.0, deadline - time.monotonic()),
+        )
 
     def _clear_state_after_workers_exit(
         self,
@@ -1856,8 +1889,75 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             worker.join()
         self._clear_runtime_state(sync_worker, sync_queue)
 
+    def _schedule_shutdown_cleanup(
+        self,
+        sync_worker: threading.Thread | None,
+        sync_queue: queue.Queue,
+        workers: tuple[threading.Thread, ...],
+    ) -> None:
+        """Start or retry deferred cleanup without raising from shutdown()."""
+        if not any(worker.is_alive() for worker in workers):
+            self._clear_runtime_state(sync_worker, sync_queue)
+            return
+        try:
+            cleanup = threading.Thread(
+                target=self._clear_state_after_workers_exit,
+                args=(sync_worker, sync_queue, workers),
+                daemon=True,
+                name=f"cashew-shutdown-{self._session_id}",
+            )
+            cleanup.start()
+        except Exception:
+            logger.warning(
+                "cashew shutdown cleanup could not start; retry shutdown after worker exit"
+            )
+            return
+        with self._sync_state_lock:
+            if self._sync_queue is sync_queue:
+                self._shutdown_cleanup_pending = None
+
+    def _finish_embedding_runtime_close(
+        self,
+        supervisor: EmbeddingSupervisor | None,
+        *,
+        mark_stopped: bool,
+    ) -> None:
+        """Release lifecycle admission only after embedding ownership is gone."""
+        with self._sync_state_lock:
+            if supervisor is not None and self._embedding_supervisor is not supervisor:
+                return
+            self._embedding_supervisor = None
+            if self._sync_queue is not None:
+                return
+            self._shutdown_started.clear()
+            if mark_stopped:
+                self._set_health_locked("stopped", "shutdown_complete")
+        logger.debug("cashew provider shutdown complete")
+
+    def _close_embedding_runtime(
+        self,
+        supervisor: EmbeddingSupervisor | None,
+        *,
+        timeout: float | None = None,
+        mark_stopped: bool = False,
+    ) -> None:
+        """Close one embedding owner while retaining the shutdown admission gate."""
+        if supervisor is None:
+            self._finish_embedding_runtime_close(None, mark_stopped=mark_stopped)
+            return
+        supervisor._when_closed(
+            lambda: self._finish_embedding_runtime_close(
+                supervisor, mark_stopped=mark_stopped
+            )
+        )
+        supervisor.close(timeout=timeout)
+
     def _clear_runtime_state(
-        self, worker: threading.Thread | None, sync_queue: queue.Queue
+        self,
+        worker: threading.Thread | None,
+        sync_queue: queue.Queue,
+        *,
+        embedding_close_timeout: float | None = None,
     ) -> None:
         """Clear provider state if it still belongs to the exiting worker."""
         with self._sync_state_lock:
@@ -1872,11 +1972,13 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._sleep_cron_job_id = None  # clear instance tracking only
             # Clear state. _hermes_home persists (see is_available() contract).
             self._sync_queue = None
+            self._shutdown_cleanup_pending = None
             self._sync_worker = None
             self._config = None
             self._db_path = None
             self._retriever = None
             self._model_fn = None
+            supervisor = self._embedding_supervisor
             self._warm_cache.clear()
             self._prefetch_generation += 1
             self._prefetch_pending = None
@@ -1887,9 +1989,12 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._prefetch_latest_identity = None
             self._last_assistant = ""
             self._prefetch_condition.notify_all()
-            self._shutdown_started.clear()
-            self._set_health_locked("stopped", "shutdown_complete")
-        logger.debug("cashew provider shutdown complete")
+            self._set_health_locked("stopping", "embedding_shutdown")
+        self._close_embedding_runtime(
+            supervisor,
+            timeout=embedding_close_timeout,
+            mark_stopped=True,
+        )
 
     def prefetch(  # noqa: C901 - retrieval fallback branches preserve the adapter contract
         self,
@@ -1969,9 +2074,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             vector_failed = False
             keyword_failed = False
             try:
-                from core.retrieval import retrieve_recursive_bfs
-
-                results = retrieve_recursive_bfs(
+                results = _retrieve_with_embedding_wait(
                     db_path=str(db_path),
                     query=query,
                     top_k=max_nodes,
@@ -2161,15 +2264,13 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 _METRICS.record_prefetch_cancelled()
                 return
 
-            from core.retrieval import retrieve_recursive_bfs
-
             seen_ids: set[str] = set()
             all_nodes: list[dict] = []
             for cue in cues:
                 if not self._prefetch_request_is_current(identity):
                     _METRICS.record_prefetch_cancelled()
                     return
-                results = retrieve_recursive_bfs(
+                results = _retrieve_with_embedding_wait(
                     db_path=request.db_path,
                     query=cue,
                     top_k=request.top_k,
@@ -2448,9 +2549,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     exclude_tags = args.get("exclude_tags")
                     vector_failed = False
                     try:
-                        from core.retrieval import retrieve_recursive_bfs
-
-                        results = retrieve_recursive_bfs(
+                        results = _retrieve_with_embedding_wait(
                             db_path=str(self._db_path),
                             query=query,
                             top_k=max_nodes,

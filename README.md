@@ -156,12 +156,19 @@ Cashew validates the effective JSON and `CASHEW_*` configuration before use.
 JSON or values are left in place so they can be corrected instead of being
 silently overwritten. These numeric ceilings are a new validation policy.
 
-`embedding_device` defaults to `cpu` because native MPS failures can terminate
-the Python process before the plugin can recover. Set it to `auto` to restore
-SentenceTransformer's automatic hardware selection, or to an explicit device
-such as `mps`, `cuda`, or `cuda:0` after validating that backend. An explicit
-device bypasses Cashew's device-opaque warm daemon, and initialization failures
-on a non-CPU device retry once on CPU.
+`embedding_device` defaults to `cpu`. SentenceTransformer model loading and
+encoding run in one provider-owned child process. A backend process exit cannot
+terminate Hermes, and an interactive caller stops waiting after a bounded
+interval if the worker hangs. Set the option to `auto` or an explicit device
+such as `mps`, `cuda`, or `cuda:0` after validating that backend. A non-CPU
+startup failure retries once on CPU; Hermes never loads the model as a fallback.
+
+This boundary is deliberately narrow. SQLite, sqlite-vec, NumPy operations in
+the adapter, Cashew graph algorithms, and auxiliary LLM calls still run in the
+Hermes process. The child adds startup and local IPC overhead; deterministic
+transport checks are recorded in CI, while real-model latency and memory use
+remain hardware/model dependent and are not represented by those fake-model
+measurements.
 
 #### Legacy settings
 

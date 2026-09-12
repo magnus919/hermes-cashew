@@ -756,7 +756,12 @@ def test_embed_orphans_regression_not_null_schema(db_path):
     )
     conn.commit()
 
-    count = _embed_orphans(conn)
+    client = type(
+        "Client",
+        (),
+        {"encode": lambda _self, texts: np.ones((len(texts), 384), dtype=np.float32)},
+    )()
+    count = _embed_orphans(conn, embedding_client=client)
     assert count == 1, "should have embedded 1 orphan"
 
     # Verify the embedding row exists with all columns populated
@@ -772,20 +777,14 @@ def test_embed_orphans_regression_not_null_schema(db_path):
     conn.close()
 
 
-def test_embed_orphans_uses_configured_device(db_path, monkeypatch):
-    import plugins.memory.cashew.sleep_refactor as sleep
+def test_embed_orphans_uses_injected_process_client(db_path):
+    calls: list[list[str]] = []
 
-    calls: list[tuple[str, str]] = []
+    class FakeClient:
+        def encode(self, texts):
+            calls.append(texts)
+            return np.ones((len(texts), 384), dtype=np.float32)
 
-    class FakeModel:
-        def encode(self, content, normalize_embeddings=True):
-            return np.ones(384, dtype=np.float32)
-
-    def load_model(model_name, device):
-        calls.append((model_name, device))
-        return FakeModel()
-
-    monkeypatch.setattr(sleep, "load_sentence_transformer", load_model)
     conn = sqlite3.connect(db_path)
     _insert_node(conn, "device_orphan", "embedding device check")
     conn.commit()
@@ -794,10 +793,11 @@ def test_embed_orphans_uses_configured_device(db_path, monkeypatch):
         conn,
         embedding_model="example/model",
         embedding_device="mps",
+        embedding_client=FakeClient(),
     )
 
     assert count == 1
-    assert calls == [("example/model", "mps")]
+    assert calls == [["embedding device check"]]
     conn.close()
 
 
@@ -811,7 +811,12 @@ def test_embed_orphans_mixed_orphans(db_path):
     _insert_node(conn, "needs_embed_b", "orphan content B")
     conn.commit()
 
-    count = _embed_orphans(conn)
+    client = type(
+        "Client",
+        (),
+        {"encode": lambda _self, texts: np.ones((len(texts), 384), dtype=np.float32)},
+    )()
+    count = _embed_orphans(conn, embedding_client=client)
     assert count == 2, "should embed exactly the 2 orphans"
 
     # has_embed should still have its original embedding

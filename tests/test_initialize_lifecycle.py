@@ -7,14 +7,17 @@ from __future__ import annotations
 
 import json
 import queue
+import subprocess
 import sys
 import threading
+import time
 from contextlib import contextmanager
 
 import pytest
 
 from plugins.memory.cashew import CashewMemoryProvider
 from plugins.memory.cashew.config import CONFIG_FILENAME, DEFAULTS, CashewConfig
+from plugins.memory.cashew.embedding_process import EmbeddingSupervisor
 
 
 def test_fresh_provider_is_not_available_without_deps(monkeypatch):
@@ -224,6 +227,60 @@ def test_initialize_ownership_survives_trace_exit_while_shutdown_runs(
         first.join(timeout=2.0)
         if shutdown is not None:
             shutdown.join(timeout=2.0)
+        p.shutdown()
+
+
+def test_initialize_waits_for_embedding_reap_after_shutdown(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replacement generation cannot enter while the old child is unreaped."""
+    release_reaper = threading.Event()
+
+    class DelayedProcess:
+        pid = 43210
+        returncode = -9
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            if timeout is not None:
+                raise subprocess.TimeoutExpired("fake-worker", timeout)
+            assert release_reaper.wait(timeout=2.0)
+            return self.returncode
+
+    p = CashewMemoryProvider()
+    first_home = tmp_path / "first"
+    second_home = tmp_path / "second"
+    p.initialize("first-session", hermes_home=str(first_home))
+    supervisor = p._embedding_supervisor
+    assert isinstance(supervisor, EmbeddingSupervisor)
+    supervisor._process = DelayedProcess()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        "plugins.memory.cashew.embedding_process.os.killpg", lambda *_args: None
+    )
+    try:
+        p.shutdown()
+        assert supervisor._reaping
+        assert p._shutdown_started.is_set()
+        assert p._embedding_supervisor is supervisor
+
+        p.initialize("blocked-session", hermes_home=str(second_home))
+        assert p._session_id == "first-session"
+        assert p._sync_queue is None
+
+        release_reaper.set()
+        deadline = time.monotonic() + 1.0
+        while p._shutdown_started.is_set() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert not p._shutdown_started.is_set()
+        assert p._embedding_supervisor is None
+
+        p.initialize("second-session", hermes_home=str(second_home))
+        assert p._session_id == "second-session"
+        assert p._sync_queue is not None
+    finally:
+        release_reaper.set()
         p.shutdown()
 
 

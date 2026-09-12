@@ -157,7 +157,13 @@ def _two_vectors(similarity: float) -> tuple[np.ndarray, np.ndarray]:
     return left, right
 
 
-def _run(db_path: Path, *, limit: int, max_edges: int) -> dict[str, Any]:
+def _run(
+    db_path: Path,
+    *,
+    limit: int,
+    max_edges: int,
+    embedding_client: Any = None,
+) -> dict[str, Any]:
     result = sleep.run_sleep_cycle(
         str(db_path),
         limit=limit,
@@ -166,6 +172,7 @@ def _run(db_path: Path, *, limit: int, max_edges: int) -> dict[str, Any]:
         background_dream=False,
         embedding_model=GTE_LARGE,
         embedding_device="cpu",
+        embedding_client=embedding_client,
     )
     assert isinstance(result, dict)
     assert "error" not in result
@@ -744,36 +751,22 @@ def test_scheduled_cycle_orphan_embeddings_keep_real_vec_index_consistent(
         "invalid orphan vector": np.array([np.nan, 0.0, 0.0, 1.0], dtype=np.float32),
     }
 
-    class FakeModel:
-        def encode(self, content: str, normalize_embeddings: bool = True) -> np.ndarray:
-            assert normalize_embeddings is True
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def encode(self, texts: list[str]) -> np.ndarray:
+            assert len(texts) == 1
+            content = texts[0]
             assert content in orphan_vectors, f"unexpected model input: {content!r}"
-            return orphan_vectors[content].copy()
+            self.calls.append(content)
+            return orphan_vectors[content].reshape(1, -1).copy()
 
-    model_calls: list[tuple[str, str | None]] = []
-
-    def local_loader(model_name: str, device: str) -> FakeModel:
-        model_calls.append((model_name, device))
-        return FakeModel()
-
-    def sentence_transformer(model_name: str, *args: Any, **kwargs: Any) -> FakeModel:
-        model_calls.append((model_name, kwargs.get("device")))
-        return FakeModel()
-
-    monkeypatch.setattr(sleep, "load_sentence_transformer", local_loader, raising=False)
-    import core.config as core_config
-    import sentence_transformers
-
-    monkeypatch.setattr(core_config, "get_embedding_model", lambda: GTE_LARGE)
-    monkeypatch.setattr(
-        sentence_transformers, "SentenceTransformer", sentence_transformer
-    )
+    client = FakeClient()
     _patch_vec_connections(monkeypatch)
 
-    result = _run(db_path, limit=2, max_edges=10)
-    assert model_calls
-    assert {call[0] for call in model_calls} == {GTE_LARGE}
-    assert all(device in (None, "cpu") for _, device in model_calls)
+    result = _run(db_path, limit=2, max_edges=10, embedding_client=client)
+    assert client.calls == list(orphan_vectors)
 
     conn = _REAL_CONNECT(db_path)
     conn.enable_load_extension(True)
@@ -806,7 +799,7 @@ def test_scheduled_cycle_orphan_embeddings_keep_real_vec_index_consistent(
 
     current_list_binding_signature = (
         result["orphans_embedded"] == 0
-        and set(ordinary) == allowed_ids
+        and set(ordinary) == {*anchor_blobs, "valid-orphan"}
         and set(indexed) == set(anchor_blobs)
     )
     if current_list_binding_signature:

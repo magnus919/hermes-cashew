@@ -53,6 +53,12 @@ def _write_installation(implementation: Path, identity: str) -> None:
     )
     (implementation / "companion.py").write_text(f"IDENTITY = {identity!r}\n")
     (implementation / "embedding.py").write_text("MODEL = 'test-embedding'\n")
+    (implementation / "embedding_process.py").write_text(
+        "class EmbeddingSupervisor:\n"
+        "    def __init__(self, **kwargs): self.kwargs = kwargs\n"
+        "    def close(self): pass\n"
+    )
+    (implementation / "embedding_worker.py").write_text("# test worker marker\n")
     (implementation / "sleep_refactor.py").write_text(
         "import os\n"
         "from pathlib import Path\n"
@@ -69,6 +75,7 @@ def _write_installation(implementation: Path, identity: str) -> None:
         "        'background_dream': kwargs['background_dream'],\n"
         "        'embedding_model': kwargs['embedding_model'],\n"
         "        'embedding_device': kwargs['embedding_device'],\n"
+        "        'embedding_client': type(kwargs['embedding_client']).__name__,\n"
         "    }\n"
     )
 
@@ -148,6 +155,7 @@ def test_generated_cron_script_runs_from_registered_installation(
     assert result["background_dream"] is False
     assert result["embedding_model"] == "test/embedding-model"
     assert result["embedding_device"] == "mps"
+    assert result["embedding_client"] == "EmbeddingSupervisor"
 
 
 @pytest.mark.parametrize("kind", ["flat", "development"])

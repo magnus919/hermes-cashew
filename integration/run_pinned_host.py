@@ -24,11 +24,14 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn
 
 HERMES_REVISION = "990473a79c6b0396b0a648fdd85ee8f7a5c267d3"
-HERMES_ARCHIVE_SHA256 = "6c8585bfcb3807b7f0c1038be080429e0465137634745b9e48e11b65a9653bda"
+HERMES_ARCHIVE_SHA256 = (
+    "6c8585bfcb3807b7f0c1038be080429e0465137634745b9e48e11b65a9653bda"
+)
 REQUIRED_HOST_FILES = (
     "agent/memory_provider.py",
     "agent/memory_manager.py",
@@ -108,7 +111,9 @@ def verify_hermes_source(source: Path, archive: Path | None) -> None:
         except subprocess.TimeoutExpired as exc:
             _error(f"git cleanliness check exceeded the 30-second bound: {exc}")
         if status.returncode != 0 or status.stdout.strip():
-            _error("Hermes git checkout is dirty; use a clean checkout of the pinned revision")
+            _error(
+                "Hermes git checkout is dirty; use a clean checkout of the pinned revision"
+            )
         return
 
     archive = archive or source.parent / f"{source.name}.tar.gz"
@@ -116,7 +121,9 @@ def verify_hermes_source(source: Path, archive: Path | None) -> None:
         _error(f"pinned Hermes archive is missing: {archive}")
     archive_hash = hashlib.sha256(archive.read_bytes()).hexdigest()
     if archive_hash != HERMES_ARCHIVE_SHA256:
-        _error(f"Hermes archive SHA256 is {archive_hash}, expected {HERMES_ARCHIVE_SHA256}")
+        _error(
+            f"Hermes archive SHA256 is {archive_hash}, expected {HERMES_ARCHIVE_SHA256}"
+        )
     metadata_path = source / ".hermes-source.json"
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -126,14 +133,22 @@ def verify_hermes_source(source: Path, archive: Path | None) -> None:
             f"and create {metadata_path} before running the offline lane ({exc})"
         )
     if metadata.get("revision") != HERMES_REVISION:
-        _error(f"archive metadata revision is {metadata.get('revision')!r}, expected {HERMES_REVISION}")
+        _error(
+            f"archive metadata revision is {metadata.get('revision')!r}, expected {HERMES_REVISION}"
+        )
     if metadata.get("archive_sha256") != HERMES_ARCHIVE_SHA256:
-        _error("archive metadata SHA256 does not match the pinned public Hermes archive")
+        _error(
+            "archive metadata SHA256 does not match the pinned public Hermes archive"
+        )
     try:
         if _file_hashes(source) != _archive_file_hashes(archive):
-            _error("extracted Hermes source contents do not match the verified pinned archive")
+            _error(
+                "extracted Hermes source contents do not match the verified pinned archive"
+            )
     except (OSError, tarfile.TarError, ValueError) as exc:
-        _error(f"cannot verify extracted Hermes source against the pinned archive: {exc}")
+        _error(
+            f"cannot verify extracted Hermes source against the pinned archive: {exc}"
+        )
 
 
 def _copy_plugin(source: Path, destination: Path) -> None:
@@ -141,7 +156,9 @@ def _copy_plugin(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, ignore=ignored)
 
 
-def _make_dev_overlay(hermes_source: Path, plugin_source: Path, destination: Path) -> None:
+def _make_dev_overlay(
+    hermes_source: Path, plugin_source: Path, destination: Path
+) -> None:
     """Expose the plugin as a bundled/dev provider without mutating Hermes source."""
     (destination / "plugins" / "memory").mkdir(parents=True)
     for relative in ("plugins/__init__.py", "plugins/plugin_loader.py"):
@@ -172,15 +189,6 @@ def _write_profile(home: Path) -> None:
     )
 
 
-class _FakeEmbeddingModel:
-    def encode(self, texts: Any, **_: Any):
-        import numpy as np
-
-        values = [texts] if isinstance(texts, str) else list(texts)
-        result = np.ones((len(values), 384), dtype="float32")
-        return result[0] if isinstance(texts, str) else result
-
-
 def _assert_host_provenance(hermes_source: Path) -> None:
     memory_provider_module = importlib.import_module("agent.memory_provider")
     memory_manager_module = importlib.import_module("agent.memory_manager")
@@ -189,7 +197,9 @@ def _assert_host_provenance(hermes_source: Path) -> None:
         if not origin.is_relative_to(hermes_source.resolve()):
             raise AssertionError(f"host module escaped pinned source: {origin}")
     if "tests._memory_manager_stub" in sys.modules:
-        raise AssertionError("test MemoryManager stub was imported into the real-host lane")
+        raise AssertionError(
+            "test MemoryManager stub was imported into the real-host lane"
+        )
     if not hasattr(memory_provider_module.MemoryProvider, "recall_status"):
         raise AssertionError("pinned Hermes MemoryProvider contract was not loaded")
 
@@ -266,7 +276,8 @@ def _exercise_real_host(mode: str, hermes_source: Path, plugin_source: Path) -> 
         for key in list(os.environ):
             if (
                 key.startswith("CASHEW_")
-                or key in {"HERMES_HOME", "HERMES_PROFILE", "HERMES_CONFIG", "HERMES_ENV"}
+                or key
+                in {"HERMES_HOME", "HERMES_PROFILE", "HERMES_CONFIG", "HERMES_ENV"}
                 or key.endswith(("_API_KEY", "_ACCESS_TOKEN", "_SECRET", "_PASSWORD"))
             ):
                 os.environ.pop(key, None)
@@ -280,14 +291,17 @@ def _exercise_real_host(mode: str, hermes_source: Path, plugin_source: Path) -> 
                 "HF_DATASETS_OFFLINE": "1",
             }
         )
-        os.environ["PYTHONPATH"] = os.pathsep.join((str(import_root), str(hermes_source)))
+        os.environ["PYTHONPATH"] = os.pathsep.join(
+            (str(import_root), str(hermes_source))
+        )
         os.chdir(temp_root)
         # The interpreter may have an editable Hermes checkout in site-packages.
         # Remove only that source path, retaining installed third-party
         # dependencies, then put the declared immutable tree first.
         normalized_host = hermes_source.resolve()
         sys.path[:] = [
-            entry for entry in sys.path
+            entry
+            for entry in sys.path
             if not entry or Path(entry).resolve() != normalized_host
         ]
         sys.path.insert(0, str(hermes_source))
@@ -297,7 +311,9 @@ def _exercise_real_host(mode: str, hermes_source: Path, plugin_source: Path) -> 
         _prioritize_import_roots(import_root, hermes_source)
         from plugins.memory import discover_memory_providers, load_memory_provider
 
-        discovered = {name: available for name, _, available in discover_memory_providers()}
+        discovered = {
+            name: available for name, _, available in discover_memory_providers()
+        }
         assert discovered.get("cashew") is True, discovered
         provider = load_memory_provider("cashew", register_skills=False)
         assert provider is not None
@@ -307,8 +323,12 @@ def _exercise_real_host(mode: str, hermes_source: Path, plugin_source: Path) -> 
         if mode == "flat":
             allowed_plugin_roots.append((home / "plugins" / "cashew").resolve())
         else:
-            allowed_plugin_roots.append((home / "hermes-agent" / "plugins" / "memory" / "cashew").resolve())
-        assert any(provider_origin.is_relative_to(root) for root in allowed_plugin_roots), provider_origin
+            allowed_plugin_roots.append(
+                (home / "hermes-agent" / "plugins" / "memory" / "cashew").resolve()
+            )
+        assert any(
+            provider_origin.is_relative_to(root) for root in allowed_plugin_roots
+        ), provider_origin
 
         provider.save_config(
             {
@@ -322,7 +342,45 @@ def _exercise_real_host(mode: str, hermes_source: Path, plugin_source: Path) -> 
             },
             str(home),
         )
-        provider_module.load_sentence_transformer = lambda *_args, **_kwargs: _FakeEmbeddingModel()
+
+        stubs = temp_root / "stubs" / "sentence_transformers"
+        stubs.mkdir(parents=True)
+        first_request = temp_root / "first-embedding-request"
+        failure = "exit" if mode == "flat" else "hang"
+        (stubs / "__init__.py").write_text(
+            "import os\n"
+            "import time\n"
+            "from pathlib import Path\n"
+            "import numpy as np\n\n"
+            f"MARKER = Path({str(first_request)!r})\n"
+            f"FAILURE = {failure!r}\n\n"
+            "class SentenceTransformer:\n"
+            "    def __init__(self, *args, **kwargs): pass\n"
+            "    def get_embedding_dimension(self): return 384\n"
+            "    def encode(self, texts, **kwargs):\n"
+            "        values = [texts] if isinstance(texts, str) else list(texts)\n"
+            "        if not MARKER.exists():\n"
+            "            MARKER.write_text(FAILURE)\n"
+            "            if FAILURE == 'exit': os._exit(23)\n"
+            "            time.sleep(60)\n"
+            "        result = np.ones((len(values), 384), dtype='float32')\n"
+            "        return result[0] if isinstance(texts, str) else result\n",
+            encoding="utf-8",
+        )
+        child_python = temp_root / "embedding-child-python"
+        child_python.write_text(
+            f"#!{sys.executable}\n"
+            "import runpy, sys\n"
+            f"sys.path.insert(0, {str(stubs.parent)!r})\n"
+            "sys.executable = __file__\n"
+            "script = sys.argv.pop(1)\n"
+            "runpy.run_path(script, run_name='__main__')\n",
+            encoding="utf-8",
+        )
+        child_python.chmod(0o700)
+        process_module = sys.modules[provider_module.EmbeddingSupervisor.__module__]
+        process_module.sys.executable = str(child_python)
+        assert "sentence_transformers" not in sys.modules
 
         from agent.memory_manager import MemoryManager
 
@@ -341,15 +399,30 @@ def _exercise_real_host(mode: str, hermes_source: Path, plugin_source: Path) -> 
 
         assert provider._retriever is not None
         assert provider._db_path is not None
+        assert provider._embedding_supervisor is not None
+        supervisor = provider._embedding_supervisor
+        supervisor.active_timeout = 0.1
+        supervisor.backoff_base = 0.0
         with sqlite3.connect(str(provider._db_path)) as connection:
             connection.execute(
                 "INSERT INTO thought_nodes (id, content, node_type, domain, timestamp) "
                 "VALUES (?, ?, ?, ?, ?)",
-                ("integration-node", "integration host contract", "fact", "integration", "2026-09-12T00:00:00"),
+                (
+                    "integration-node",
+                    "integration host contract",
+                    "fact",
+                    "integration",
+                    "2026-09-12T00:00:00",
+                ),
             )
             connection.commit()
+        started = time.monotonic()
         recall = manager.prefetch_all("integration", session_id="integration-session")
+        assert time.monotonic() - started < 2.0
         assert "integration" in recall.lower(), recall
+        assert first_request.read_text() == failure
+        assert supervisor.encode(["recovery"]).shape == (1, 384)
+        assert "sentence_transformers" not in sys.modules
         manager.sync_all(
             "integration user",
             "integration assistant",
@@ -381,12 +454,20 @@ def _exercise_real_host(mode: str, hermes_source: Path, plugin_source: Path) -> 
 
         provider.handle_tool_call = legacy_handler  # type: ignore[method-assign]
         mutant_payload = json.loads(
-            manager.handle_tool_call("cashew_query", {"query": "integration"}, session_id="integration-session")
+            manager.handle_tool_call(
+                "cashew_query",
+                {"query": "integration"},
+                session_id="integration-session",
+            )
         )
         provider.handle_tool_call = real_handler  # type: ignore[method-assign]
         assert mutant_payload.get("ok") is not True, mutant_payload
-        manager.on_session_switch("integration-session-2", parent_session_id="integration-session", reset=True)
-        assert isinstance(manager.on_pre_compress([{"role": "user", "content": "checkpoint"}]), str)
+        manager.on_session_switch(
+            "integration-session-2", parent_session_id="integration-session", reset=True
+        )
+        assert isinstance(
+            manager.on_pre_compress([{"role": "user", "content": "checkpoint"}]), str
+        )
         manager.on_session_end([])
 
         from cron.jobs import list_jobs
@@ -397,24 +478,12 @@ def _exercise_real_host(mode: str, hermes_source: Path, plugin_source: Path) -> 
         script_path = home / "scripts" / "cashew-sleep-cycle.py"
         assert script_path.is_file()
 
-        stubs = temp_root / "stubs" / "sentence_transformers"
-        stubs.mkdir(parents=True)
-        (stubs / "__init__.py").write_text(
-            "import numpy as np\n\n"
-            "class SentenceTransformer:\n"
-            "    def __init__(self, *args, **kwargs): pass\n"
-            "    def encode(self, texts, **kwargs):\n"
-            "        values = [texts] if isinstance(texts, str) else list(texts)\n"
-            "        result = np.ones((len(values), 384), dtype='float32')\n"
-            "        return result[0] if isinstance(texts, str) else result\n",
-            encoding="utf-8",
-        )
         cron_env = os.environ.copy()
         cron_env["PYTHONPATH"] = os.pathsep.join(
             (str(stubs.parent), str(import_root), str(hermes_source))
         )
         result = subprocess.run(
-            [sys.executable, str(script_path)],
+            [str(child_python), str(script_path)],
             cwd=temp_root,
             env=cron_env,
             capture_output=True,
@@ -433,10 +502,15 @@ def _exercise_real_host(mode: str, hermes_source: Path, plugin_source: Path) -> 
         # Cron jobs intentionally persist across provider/session shutdown so
         # a 12-hour schedule is not reset at every session boundary. The next
         # initialization must reconcile this same profile-owned record.
-        assert len([job for job in list_jobs() if job.get("name") == "cashew-sleep-cycle"]) == 1
+        assert (
+            len([job for job in list_jobs() if job.get("name") == "cashew-sleep-cycle"])
+            == 1
+        )
 
 
-def _run_child(mode: str, hermes_source: Path, plugin_source: Path, hermes_archive: Path | None) -> None:
+def _run_child(
+    mode: str, hermes_source: Path, plugin_source: Path, hermes_archive: Path | None
+) -> None:
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
     command = [
@@ -461,14 +535,28 @@ def _run_child(mode: str, hermes_source: Path, plugin_source: Path, hermes_archi
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--hermes-source", type=Path, help="pinned Hermes checkout or prepared archive extraction")
-    parser.add_argument("--plugin-source", type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--hermes-archive", type=Path, help="verified archive matching an extracted Hermes source")
+    parser.add_argument(
+        "--hermes-source",
+        type=Path,
+        help="pinned Hermes checkout or prepared archive extraction",
+    )
+    parser.add_argument(
+        "--plugin-source", type=Path, default=Path(__file__).resolve().parents[1]
+    )
+    parser.add_argument(
+        "--hermes-archive",
+        type=Path,
+        help="verified archive matching an extracted Hermes source",
+    )
     parser.add_argument("--scenario", choices=("flat", "dev"), help=argparse.SUPPRESS)
     args = parser.parse_args()
-    hermes_source = (args.hermes_source or Path(os.environ.get("HERMES_PINNED_SOURCE", ""))).resolve()
+    hermes_source = (
+        args.hermes_source or Path(os.environ.get("HERMES_PINNED_SOURCE", ""))
+    ).resolve()
     plugin_source = args.plugin_source.resolve()
-    verify_hermes_source(hermes_source, args.hermes_archive.resolve() if args.hermes_archive else None)
+    verify_hermes_source(
+        hermes_source, args.hermes_archive.resolve() if args.hermes_archive else None
+    )
     if not (plugin_source / "plugins" / "memory" / "cashew" / "__init__.py").is_file():
         _error(f"plugin source is not a hermes-cashew checkout: {plugin_source}")
 

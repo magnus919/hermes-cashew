@@ -40,6 +40,11 @@ class PluginMetrics:
     sync_dropped: int = 0
     sync_queue_depth: int = 0
 
+    # Background prefetch metrics
+    prefetch_coalesced: int = 0
+    prefetch_cancelled: int = 0
+    prefetch_failed: int = 0
+
     # Sleep cycle metrics
     sleep_cycle_count: int = 0
     sleep_cycle_total_ms: float = 0.0
@@ -65,6 +70,9 @@ class PluginMetrics:
                 "sync_failed": self.sync_failed,
                 "sync_dropped": self.sync_dropped,
                 "sync_queue_depth": self.sync_queue_depth,
+                "prefetch_coalesced": self.prefetch_coalesced,
+                "prefetch_cancelled": self.prefetch_cancelled,
+                "prefetch_failed": self.prefetch_failed,
                 "sleep_cycle_count": self.sleep_cycle_count,
                 "sleep_avg_ms": round(
                     self.sleep_cycle_total_ms / max(self.sleep_cycle_count, 1), 1
@@ -100,6 +108,21 @@ class PluginMetrics:
         with self._lock:
             self.sync_queue_depth = depth
 
+    def record_prefetch_coalesced(self) -> None:
+        """Record a queued prefetch replaced by a newer request."""
+        with self._lock:
+            self.prefetch_coalesced += 1
+
+    def record_prefetch_cancelled(self) -> None:
+        """Record prefetch work invalidated before its next expensive stage."""
+        with self._lock:
+            self.prefetch_cancelled += 1
+
+    def record_prefetch_failed(self) -> None:
+        """Record a prefetch worker failure without exposing query contents."""
+        with self._lock:
+            self.prefetch_failed += 1
+
     def record_sleep_cycle(self, elapsed_ms: float, nodes: int) -> None:
         """Record a completed sleep cycle tick."""
         with self._lock:
@@ -120,6 +143,9 @@ class PluginMetrics:
             "sync_failed=%(sync_failed)d "
             "sync_dropped=%(sync_dropped)d "
             "queue_depth=%(sync_queue_depth)d "
+            "prefetch_coalesced=%(prefetch_coalesced)d "
+            "prefetch_cancelled=%(prefetch_cancelled)d "
+            "prefetch_failed=%(prefetch_failed)d "
             "sleep_cycles=%(sleep_cycle_count)d "
             "sleep_avg_ms=%(sleep_avg_ms).1f "
             "sleep_nodes=%(sleep_nodes_processed)d",

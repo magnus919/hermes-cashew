@@ -7,7 +7,7 @@ deterministic without replacing persistence with a success stub.
 
 from __future__ import annotations
 
-import importlib.util
+import importlib.machinery
 import json
 import os
 import select
@@ -23,11 +23,10 @@ import pytest
 from plugins.memory.cashew import CashewMemoryProvider
 
 # The fast suite supports a missing dependency with a core.session stub.
-# These subprocess contracts require the real upstream package instead.
-try:
-    _cashew_spec = importlib.util.find_spec("core.context")
-except ModuleNotFoundError:
-    _cashew_spec = None
+# These subprocess contracts require the real upstream package instead.  Probe
+# only the top-level package: probing core.context treats a corrupt or partial
+# cashew-brain installation as absent and hides its normal import failure.
+_cashew_spec = importlib.machinery.PathFinder.find_spec("core")
 if _cashew_spec is None:
     pytest.skip(
         "cashew-brain is required for real-upstream multiprocess contracts",
@@ -36,6 +35,61 @@ if _cashew_spec is None:
 
 _READY_TIMEOUT = 10
 _EXIT_TIMEOUT = 15
+
+
+_IMPORT_GUARD_RUNNER = r"""
+import importlib.util
+import pathlib
+import runpy
+import sys
+import types
+
+import pytest
+
+repo = pathlib.Path(sys.argv[1])
+fake_root = pathlib.Path(sys.argv[2])
+mode = sys.argv[3]
+sys.modules.pop("core", None)
+
+if mode == "missing":
+    # Keep stdlib locations but hide site-packages after pytest is loaded, so
+    # the installed real core cannot satisfy the test module's probe.
+    sys.path[:] = [str(fake_root), str(repo)] + [
+        path for path in sys.path if "site-packages" not in path
+    ]
+    # Match the shared test fixture's no-dependency compatibility stub.
+    sys.modules["core"] = types.ModuleType("core")
+else:
+    # This package shadows the installed core while installed dependencies
+    # remain available to the module under test.
+    sys.path.insert(0, str(fake_root))
+    (fake_root / "core").mkdir()
+    (fake_root / "core" / "__init__.py").write_text("")
+
+try:
+    namespace = runpy.run_path(repo / "tests" / "test_multiprocess_memory_contracts.py")
+except pytest.skip.Exception:
+    if mode != "missing":
+        raise SystemExit("partial core installation was incorrectly skipped")
+    print("missing-core-skipped")
+    raise SystemExit(0)
+
+if mode == "missing":
+    raise SystemExit("missing core installation was not skipped")
+
+# Execute the generated child source itself.  It imports core.session before
+# any persistence setup, so a partial installation must fail through the
+# normal real-upstream path rather than being treated as optional.
+sys.argv[:] = ["child", str(fake_root / "profile"), "marker", "initialize"]
+try:
+    exec(namespace["_CHILD"], {"__name__": "__main__"})
+except ModuleNotFoundError as exc:
+    if exc.name != "core.session":
+        raise
+    print("partial-core-failed-naturally")
+    raise SystemExit(0)
+raise SystemExit("partial core installation unexpectedly reached child setup")
+"""
 
 
 class _KnownIssue191MissingVecRowError(AssertionError):
@@ -399,6 +453,46 @@ def _terminate(process: subprocess.Popen[str]) -> None:
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None and not stream.closed:
                 stream.close()
+
+
+def _run_import_guard_probe(
+    tmp_path: Path, mode: str
+) -> subprocess.CompletedProcess[str]:
+    """Run the module's real guard in an interpreter with a controlled core."""
+    fake_root = tmp_path / mode
+    fake_root.mkdir()
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _IMPORT_GUARD_RUNNER,
+            str(Path(__file__).parents[1]),
+            str(fake_root),
+            mode,
+        ],
+        text=True,
+        capture_output=True,
+        timeout=_EXIT_TIMEOUT,
+        check=False,
+    )
+
+
+def test_real_upstream_guard_skips_only_when_top_level_core_is_absent(
+    tmp_path: Path,
+) -> None:
+    """An environment without Cashew skips this real-upstream-only module."""
+    result = _run_import_guard_probe(tmp_path, "missing")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "missing-core-skipped"
+
+
+def test_real_upstream_guard_does_not_hide_partial_core_installation(
+    tmp_path: Path,
+) -> None:
+    """A present core package missing session fails through the child import."""
+    result = _run_import_guard_probe(tmp_path, "partial")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "partial-core-failed-naturally"
 
 
 def _result(process: subprocess.Popen[str]) -> dict[str, Any]:

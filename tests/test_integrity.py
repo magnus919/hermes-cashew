@@ -15,6 +15,11 @@ from plugins.memory.cashew.integrity import (
     apply_integrity_repairs,
     audit_integrity,
 )
+from plugins.memory.cashew.locking import (
+    SQLiteWALUnsupportedError,
+    open_readonly_verified,
+    verify_readonly_profile,
+)
 
 
 def _create_profile(path: Path) -> None:
@@ -354,6 +359,47 @@ def test_audit_plain_table_named_vec_is_unverifiable(
     assert report["vector_index"]["available"] is False
     assert report["vector_index"]["scan_complete"] is False
     assert report["reasons"]["vec_index_unverifiable"] == 1
+
+
+def test_audit_deceptive_vec_text_never_reaches_vec_loader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "deceptive-vec.db"
+    _create_profile(path)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE vec_embeddings (node_id TEXT DEFAULT 'USING vec0', embedding BLOB)"
+    )
+    conn.commit()
+    conn.close()
+
+    def fail_loader(_conn: sqlite3.Connection) -> bool:
+        raise AssertionError("deceptive ordinary table reached vec loader")
+
+    monkeypatch.setattr(integrity, "_load_vec_readonly", fail_loader)
+
+    report = audit_integrity(path)
+
+    assert report["vector_index"]["available"] is False
+    assert report["reasons"]["vec_index_unverifiable"] == 1
+
+
+def test_readonly_verifier_rejects_deceptive_vec_text_before_loading(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "deceptive-verifier.db"
+    _create_profile(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE vec_embeddings (node_id TEXT DEFAULT 'USING vec0', embedding BLOB)"
+        )
+
+    readonly, _mode = open_readonly_verified(path)
+    try:
+        with pytest.raises(SQLiteWALUnsupportedError, match="declaration"):
+            verify_readonly_profile(readonly)
+    finally:
+        readonly.close()
 
 
 def test_audit_vec_unavailable_wal_keeps_sidecars_unchanged(

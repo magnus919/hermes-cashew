@@ -11,7 +11,6 @@ import pathlib
 import queue
 import re
 import sqlite3
-import tempfile
 import threading
 import time
 from typing import Any, Callable, Dict, List
@@ -179,107 +178,6 @@ def _ensure_config_file(hermes_home: pathlib.Path) -> None:
     from .config import generate_default_config
 
     generate_default_config(hermes_home)
-
-
-def _ensure_auxiliary_memory(hermes_home: pathlib.Path) -> None:
-    """Auto-populate auxiliary.memory in Hermes config.yaml if absent.
-
-    When llm_aux_role="memory" is set (the new default) but the user has
-    no auxiliary.memory section in their Hermes config.yaml, the plugin
-    reads the main model config (provider, model, base_url) and creates an
-    auxiliary.memory section with matching settings. This makes LLM-powered
-    extraction work out of the box without manual config editing.
-
-    Safe to call repeatedly — only writes when auxiliary.memory is absent
-    and the main model config provides usable values. Never overwrites an
-    existing auxiliary.memory section.
-    """
-    config_path = hermes_home / "config.yaml"
-    if not config_path.exists():
-        return
-
-    try:
-        import yaml  # type: ignore[import-untyped, unused-ignore]
-
-        raw = config_path.read_text(encoding="utf-8")
-        data = yaml.safe_load(raw) or {}
-    except Exception:
-        logger.warning(
-            "failed to read %s for auxiliary.memory auto-population",
-            config_path,
-            exc_info=True,
-        )
-        return
-
-    # Don't touch existing auxiliary.memory config
-    aux = data.get("auxiliary", {})
-    if "memory" in aux:
-        return
-
-    model_section = data.get("model", {})
-    provider = model_section.get("provider")
-    default_model = model_section.get("default")
-    base_url = model_section.get("base_url")
-
-    if not provider or not default_model:
-        logger.info(
-            "cannot auto-populate auxiliary.memory: model.provider=%r model.default=%r",
-            provider,
-            default_model,
-        )
-        return
-
-    # Build the auxiliary.memory section
-    memory_config: dict[str, str | int] = {
-        "provider": provider,
-        "model": default_model,
-    }
-    if base_url:
-        memory_config["base_url"] = base_url
-
-    try:
-        if "auxiliary" in data:
-            from utils import atomic_roundtrip_yaml_update
-
-            atomic_roundtrip_yaml_update(config_path, "auxiliary.memory", memory_config)
-        else:
-            fragment = yaml.safe_dump(
-                {"auxiliary": {"memory": memory_config}},
-                default_flow_style=False,
-                sort_keys=False,
-                allow_unicode=True,
-            )
-            separator = "" if not raw or raw.endswith("\n\n") else "\n"
-            updated = raw + separator + fragment
-            mode = config_path.stat().st_mode
-            fd, staged_name = tempfile.mkstemp(
-                dir=config_path.parent,
-                prefix=".config_",
-                suffix=".yaml.tmp",
-            )
-            staged = pathlib.Path(staged_name)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    handle.write(updated)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                staged.chmod(mode)
-                staged.replace(config_path)
-            except BaseException:
-                staged.unlink(missing_ok=True)
-                raise
-        logger.info(
-            "auto-populated auxiliary.memory from main model config: "
-            "provider=%s model=%s",
-            provider,
-            default_model,
-        )
-    except Exception:
-        logger.warning(
-            "failed to write auxiliary.memory to %s",
-            config_path,
-            exc_info=True,
-        )
 
 
 # ── Upstream embedding model patching ──────────────────────────────────
@@ -560,12 +458,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 _patch_upstream_embedding(
                     self._config.embedding_model, self._config.embedding_device
                 )
-                # First-load bootstrap: generate default cashew.json and
-                # auto-populate auxiliary.memory if absent. Safe to call
-                # on every initialize() — no-op after the first run.
+                # First-load bootstrap creates only Cashew's own config. The
+                # user explicitly opts into host-backed LLM work by adding an
+                # auxiliary role to Hermes config.yaml.
                 _ensure_config_file(self._hermes_home)
-                if self._config.llm_aux_role:
-                    _ensure_auxiliary_memory(self._hermes_home)
                 self._db_path = resolve_db_path(
                     self._hermes_home, self._config.cashew_db_path
                 )
@@ -1633,9 +1529,13 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._shutdown_started.set()
                 self._prefetch_generation += 1
                 self._prefetch_pending = None
+                model_fn = self._model_fn
                 q = self._sync_queue
                 assert q is not None
                 prefetch_threads = tuple(self._prefetch_threads)
+        close_model = getattr(model_fn, "_cashew_close", None)
+        if callable(close_model):
+            close_model()
         _METRICS.emit()
         # Items already in the queue remain ahead of the sentinel and receive a
         # bounded opportunity to persist before the worker exits.
@@ -2198,9 +2098,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         """
         return [CASHEW_QUERY_SCHEMA, CASHEW_EXTRACT_SCHEMA]
 
-    def handle_tool_call(
-        self, name: str, args: Dict[str, Any], **kwargs: Any
-    ) -> str:
+    def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs: Any) -> str:
         """Route an LLM tool call to the Cashew backend.
 
         Two tools are handled:

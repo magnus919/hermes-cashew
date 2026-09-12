@@ -439,70 +439,25 @@ def test_ensure_config_file_writes_defaults(tmp_path):
     assert (tmp_path / "cashew.json").stat().st_mtime_ns == mtime
 
 
-def test_ensure_auxiliary_memory_populates_from_main_model(tmp_path):
-    """_ensure_auxiliary_memory creates auxiliary.memory from model section."""
-    from plugins.memory.cashew import _ensure_auxiliary_memory
-
-    config_yaml = tmp_path / "config.yaml"
-    config_yaml.write_text("""model:
-  provider: openrouter
-  default: openrouter/auto
-  base_url: https://openrouter.ai/api/v1
-""")
-    assert not (tmp_path / "cashew.json").exists()
-    _ensure_auxiliary_memory(tmp_path)
-    import yaml
-
-    data = yaml.safe_load(config_yaml.read_text())
-    aux_memory = data.get("auxiliary", {}).get("memory", {})
-    assert aux_memory["provider"] == "openrouter"
-    assert aux_memory["model"] == "openrouter/auto"
-    assert aux_memory["base_url"] == "https://openrouter.ai/api/v1"
-
-
-def test_ensure_auxiliary_memory_preserves_user_yaml_text_and_mode(tmp_path):
-    from plugins.memory.cashew import _ensure_auxiliary_memory
-
+def test_initialize_never_bootstraps_auxiliary_memory(tmp_path):
+    """Initializing Cashew leaves the user-owned Hermes config byte-for-byte intact."""
     config_yaml = tmp_path / "config.yaml"
     original = (
-        "# keep this comment\n"
+        "# user-owned comment\n"
         "model:\n"
-        "  provider: 'openrouter'  # preserve quotes\n"
+        "  provider: 'openrouter'\n"
         "  default: &chosen 'openrouter/auto'\n"
         "display:\n"
         "  selected: *chosen\n"
     )
     config_yaml.write_text(original)
-    config_yaml.chmod(0o640)
 
-    _ensure_auxiliary_memory(tmp_path)
-
-    updated = config_yaml.read_text()
-    assert updated.startswith(original)
-    assert "# keep this comment" in updated
-    assert "&chosen 'openrouter/auto'" in updated
-    assert config_yaml.stat().st_mode & 0o777 == 0o640
-
-
-def test_ensure_auxiliary_memory_does_not_overwrite_existing(tmp_path):
-    """_ensure_auxiliary_memory never overwrites existing auxiliary.memory."""
-    from plugins.memory.cashew import _ensure_auxiliary_memory
-
-    config_yaml = tmp_path / "config.yaml"
-    config_yaml.write_text("""model:
-  provider: openrouter
-  default: openrouter/auto
-auxiliary:
-  memory:
-    provider: custom
-    model: custom-model
-""")
-    _ensure_auxiliary_memory(tmp_path)
-    import yaml
-
-    data = yaml.safe_load(config_yaml.read_text())
-    assert data["auxiliary"]["memory"]["provider"] == "custom"
-    assert data["auxiliary"]["memory"]["model"] == "custom-model"
+    provider = CashewMemoryProvider()
+    provider.initialize("s", hermes_home=str(tmp_path))
+    try:
+        assert config_yaml.read_text() == original
+    finally:
+        provider.shutdown()
 
 
 def test_ensure_config_file_called_from_initialize(tmp_path):

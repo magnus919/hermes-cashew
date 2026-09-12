@@ -159,6 +159,34 @@ def test_audit_reports_fixed_row_and_byte_budgets(
     assert report["status"] == "audit_incomplete"
     assert report["reasons"]["audit_row_cap"] >= 1
     assert report["limits"]["rows_scanned"] == 1
+    assert report["limits"]["complete"] is False
+    assert report["completeness"]
+
+
+def test_audit_marks_graph_scan_incomplete_without_leaking_schema_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "graph-budget.db"
+    _create_profile(path)
+    conn = sqlite3.connect(path)
+    for index in range(4):
+        _add_node(conn, f"n{index}")
+        conn.execute(
+            "INSERT INTO derivation_edges VALUES (?, ?, 1.0, 'edge', 'now')",
+            (f"n{index}", "missing-node"),
+        )
+    conn.execute('CREATE TABLE "SECRET-CANARY-schema" (payload TEXT)')
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(integrity, "_MAX_AUDIT_ROWS", 2)
+
+    report = audit_integrity(path)
+
+    encoded = json.dumps(report, sort_keys=True)
+    assert report["status"] == "audit_incomplete"
+    assert report["limits"]["complete"] is False
+    assert "SECRET-CANARY-schema" not in encoded
+    assert "unexpected_table_fingerprint" in report["schema"]
 
 
 def test_audit_reports_aggregate_byte_budget(
@@ -218,6 +246,39 @@ def test_audit_loaded_vec_parity_is_read_only(tmp_path: Path) -> None:
     assert _snapshot(path) == before
 
 
+def test_audit_loaded_vec_wal_sidecars_remain_byte_identical(tmp_path: Path) -> None:
+    path = tmp_path / "vec-wal.db"
+    _create_profile(path)
+    writer = sqlite3.connect(path)
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+        writer.enable_load_extension(True)
+        import sqlite_vec
+
+        sqlite_vec.load(writer)
+        writer.enable_load_extension(False)
+        writer.execute(
+            "CREATE VIRTUAL TABLE vec_embeddings USING vec0(node_id TEXT PRIMARY KEY, embedding float[4])"
+        )
+        _add_node(writer, "wal-vec")
+        blob = struct.pack("<4f", 1.0, 0.0, 0.0, 0.0)
+        writer.execute(
+            "INSERT INTO embeddings VALUES (?, ?, ?, '2026-09-12')",
+            ("wal-vec", blob, "model-a"),
+        )
+        writer.execute("INSERT INTO vec_embeddings VALUES (?, ?)", ("wal-vec", blob))
+        writer.commit()
+        before = _snapshot(path)
+
+        report = audit_integrity(path)
+
+        assert report["vector_index"]["available"] is True
+        assert _snapshot(path) == before
+        assert set(before) >= {str(path), f"{path}-wal", f"{path}-shm"}
+    finally:
+        writer.close()
+
+
 def test_audit_vec_unavailable_fallback_preserves_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -233,6 +294,29 @@ def test_audit_vec_unavailable_fallback_preserves_files(
     assert report["vector_index"]["available"] is False
     assert report["reasons"]["vec_index_unverifiable"] == 1
     assert _snapshot(path) == before
+
+
+def test_audit_vec_unavailable_wal_keeps_sidecars_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "vec-unavailable-wal.db"
+    _create_profile(path)
+    writer = sqlite3.connect(path)
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+        writer.execute("CREATE TABLE vec_embeddings (node_id TEXT, embedding BLOB)")
+        _add_node(writer, "wal-ordinary")
+        writer.commit()
+        before = _snapshot(path)
+        monkeypatch.setattr(integrity, "_load_vec_readonly", lambda conn: False)
+
+        report = audit_integrity(path)
+
+        assert report["vector_index"]["available"] is False
+        assert _snapshot(path) == before
+        assert set(before) >= {str(path), f"{path}-wal", f"{path}-shm"}
+    finally:
+        writer.close()
 
 
 def test_audit_keeps_live_wal_and_shm_bytes_unchanged(

@@ -6,6 +6,8 @@ import hashlib
 import json
 import sqlite3
 import struct
+import time
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -162,7 +164,7 @@ def test_audit_reports_fixed_row_and_byte_budgets(
     monkeypatch.setattr(integrity, "_MAX_AUDIT_ROWS", 1)
     report = audit_integrity(path)
     assert report["status"] == "audit_incomplete"
-    assert report["reasons"]["audit_row_cap"] >= 1
+    assert report["reasons"]["audit_row_cap"] == 1
     assert report["limits"]["rows_scanned"] == 1
     assert report["limits"]["complete"] is False
     assert report["completeness"]
@@ -210,7 +212,7 @@ def test_audit_reports_aggregate_byte_budget(
     monkeypatch.setattr(integrity, "_MAX_AUDIT_BYTES", 8)
     report = audit_integrity(path)
     assert report["status"] == "audit_incomplete"
-    assert report["reasons"]["audit_byte_cap"] >= 1
+    assert report["reasons"]["audit_byte_cap"] == 1
     assert report["limits"]["bytes_scanned"] == 0
 
 
@@ -263,6 +265,28 @@ def test_audit_installs_deadline_before_profile_verification(
     assert any(observed)
 
 
+def test_profile_verification_preserves_non_deadline_budget_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "verify-row-cap.db"
+    _create_profile(path)
+
+    def fail_at_row_cap(_connection, *, budget):
+        budget.incomplete_reasons.add("audit_row_cap")
+        raise sqlite3.OperationalError("interrupted")
+
+    monkeypatch.setattr(integrity, "verify_readonly_profile", fail_at_row_cap)
+    monkeypatch.setattr(
+        integrity,
+        "_inspect_profile",
+        lambda _conn, _mode, _budget: {"reasons": {}},
+    )
+
+    report = audit_integrity(path)
+
+    assert report["reasons"] == {"audit_row_cap": 1}
+
+
 def test_audit_loaded_vec_parity_is_read_only(tmp_path: Path) -> None:
     path = tmp_path / "vec.db"
     _create_profile(path)
@@ -290,6 +314,55 @@ def test_audit_loaded_vec_parity_is_read_only(tmp_path: Path) -> None:
     assert report["vector_index"]["entries"] == 1
     assert "vec_entry_missing" not in report["reasons"]
     assert _snapshot(path) == before
+
+
+def test_incomplete_vec_scan_does_not_report_parity(tmp_path: Path) -> None:
+    path = tmp_path / "partial-vec.db"
+    _create_profile(path)
+    conn = sqlite3.connect(path)
+    conn.enable_load_extension(True)
+    import sqlite_vec
+
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+    conn.execute(
+        "CREATE VIRTUAL TABLE vec_embeddings USING vec0(node_id TEXT PRIMARY KEY, embedding float[4])"
+    )
+    blob = struct.pack("<4f", 1.0, 0.0, 0.0, 0.0)
+    conn.execute("INSERT INTO vec_embeddings VALUES (?, ?)", ("one", blob))
+    conn.execute("INSERT INTO vec_embeddings VALUES (?, ?)", ("two", blob))
+    conn.commit()
+    budget = integrity._AuditBudget(
+        deadline=time.monotonic() + 5,
+        rows=integrity._MAX_AUDIT_ROWS - 1,
+    )
+    reasons: Counter[str] = Counter()
+
+    result = integrity._inspect_vec(conn, {"one", "two", "three"}, 4, reasons, budget)
+
+    conn.close()
+    assert result["scan_complete"] is False
+    assert result["missing_entries"] is None
+    assert result["stale_entries"] is None
+    assert "vec_entry_missing" not in reasons
+
+
+def test_missing_expected_model_is_unverifiable_not_a_mismatch(tmp_path: Path) -> None:
+    path = tmp_path / "missing-model.db"
+    _create_profile(path)
+    conn = sqlite3.connect(path)
+    _add_node(conn, "node")
+    conn.execute("DELETE FROM hermes_provider_meta WHERE key='embedding_model'")
+    conn.execute(
+        "INSERT INTO embeddings VALUES (?, ?, ?, '2026-09-12')",
+        ("node", struct.pack("<4f", 1.0, 0.0, 0.0, 0.0), "model-a"),
+    )
+    conn.commit()
+    conn.close()
+
+    report = audit_integrity(path)
+
+    assert "embedding_model_mismatch" not in report["reasons"]
 
 
 def test_audit_loaded_vec_wal_sidecars_remain_byte_identical(tmp_path: Path) -> None:

@@ -9,6 +9,7 @@ failures therefore remain ordinary test failures.
 
 from __future__ import annotations
 
+import importlib.util
 import math
 import sqlite3
 from pathlib import Path
@@ -17,10 +18,24 @@ from typing import Any
 import numpy as np
 import pytest
 import sqlite_vec
-from core.db import ensure_schema
-from core.model_profiles import get_profile
 
 import plugins.memory.cashew.sleep_refactor as sleep
+
+# The fast suite intentionally supports running without cashew-brain. These
+# contracts require its real schema and calibrated profiles. Guard only the
+# confirmed-absent case; a present but broken installation must fail import.
+try:
+    _cashew_spec = importlib.util.find_spec("core.context")
+except ModuleNotFoundError:
+    _cashew_spec = None
+if _cashew_spec is None:
+    pytest.skip(
+        "cashew-brain is required for consolidation safety contracts",
+        allow_module_level=True,
+    )
+
+from core.db import ensure_schema
+from core.model_profiles import get_profile
 
 GTE_LARGE = "thenlper/gte-large"
 _REAL_CONNECT = sqlite3.connect
@@ -692,9 +707,11 @@ def test_scheduled_cycle_orphan_embeddings_keep_real_vec_index_consistent(
     conn = _REAL_CONNECT(db_path)
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)
+    anchor_blobs: dict[str, bytes] = {}
     for index, node_id in enumerate(("anchor-a", "anchor-b")):
         vector = np.zeros(4, dtype=np.float32)
         vector[index] = 1.0
+        anchor_blobs[node_id] = vector.tobytes()
         _insert_node(conn, node_id, node_id, permanent=1)
         _insert_embedding(conn, node_id, vector, index=True)
     for node_id, content in (
@@ -704,20 +721,24 @@ def test_scheduled_cycle_orphan_embeddings_keep_real_vec_index_consistent(
     ):
         _insert_node(conn, node_id, content, permanent=1)
     conn.commit()
-    assert conn.execute("SELECT COUNT(*) FROM embeddings").fetchone() == (2,)
-    assert conn.execute("SELECT COUNT(*) FROM vec_embeddings").fetchone() == (2,)
+    assert dict(conn.execute("SELECT node_id, vector FROM embeddings")) == anchor_blobs
+    assert (
+        dict(conn.execute("SELECT node_id, embedding FROM vec_embeddings"))
+        == anchor_blobs
+    )
     conn.close()
+
+    orphan_vectors = {
+        "valid orphan vector": np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32),
+        "empty orphan vector": np.array([], dtype=np.float32),
+        "invalid orphan vector": np.array([np.nan, 0.0, 0.0, 1.0], dtype=np.float32),
+    }
 
     class FakeModel:
         def encode(self, content: str, normalize_embeddings: bool = True) -> np.ndarray:
             assert normalize_embeddings is True
-            if content == "valid orphan vector":
-                return np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)
-            if content == "empty orphan vector":
-                return np.array([], dtype=np.float32)
-            if content == "invalid orphan vector":
-                return np.array([np.nan, 0.0, 0.0, 1.0], dtype=np.float32)
-            raise AssertionError(f"unexpected model input: {content!r}")
+            assert content in orphan_vectors, f"unexpected model input: {content!r}"
+            return orphan_vectors[content].copy()
 
     model_calls: list[tuple[str, str | None]] = []
 
@@ -748,23 +769,35 @@ def test_scheduled_cycle_orphan_embeddings_keep_real_vec_index_consistent(
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)
     ordinary = dict(
-        conn.execute(
-            "SELECT node_id, LENGTH(vector) FROM embeddings "
-            "WHERE node_id LIKE '%-orphan' ORDER BY node_id"
-        )
+        conn.execute("SELECT node_id, vector FROM embeddings ORDER BY node_id")
     )
     indexed = dict(
-        conn.execute(
-            "SELECT node_id, LENGTH(embedding) FROM vec_embeddings "
-            "WHERE node_id LIKE '%-orphan' ORDER BY node_id"
-        )
+        conn.execute("SELECT node_id, embedding FROM vec_embeddings ORDER BY node_id")
     )
     conn.close()
 
+    allowed_ids = {*anchor_blobs, "valid-orphan", "empty-orphan", "invalid-orphan"}
+    assert set(ordinary) <= allowed_ids
+    assert set(indexed) <= allowed_ids
+    for node_id, blob in anchor_blobs.items():
+        assert ordinary.get(node_id) == blob
+        assert indexed.get(node_id) == blob
+
+    expected_orphan_blobs = {
+        "valid-orphan": orphan_vectors["valid orphan vector"].tobytes(),
+        "empty-orphan": orphan_vectors["empty orphan vector"].tobytes(),
+        "invalid-orphan": orphan_vectors["invalid orphan vector"].tobytes(),
+    }
+    for node_id, expected_blob in expected_orphan_blobs.items():
+        if node_id in ordinary:
+            assert ordinary[node_id] == expected_blob
+        if node_id in indexed:
+            assert indexed[node_id] == expected_blob
+
     current_list_binding_signature = (
         result["orphans_embedded"] == 0
-        and ordinary == {"empty-orphan": 0, "invalid-orphan": 16, "valid-orphan": 16}
-        and indexed == {}
+        and set(ordinary) == allowed_ids
+        and set(indexed) == set(anchor_blobs)
     )
     if current_list_binding_signature:
         raise KnownConsolidationDebt(
@@ -772,8 +805,8 @@ def test_scheduled_cycle_orphan_embeddings_keep_real_vec_index_consistent(
         )
 
     invalid_vector_signature = (
-        ordinary.get("valid-orphan") == 16
-        and indexed.get("valid-orphan") == 16
+        ordinary.get("valid-orphan") == expected_orphan_blobs["valid-orphan"]
+        and indexed.get("valid-orphan") == expected_orphan_blobs["valid-orphan"]
         and "empty-orphan" not in ordinary
         and "empty-orphan" not in indexed
         and "invalid-orphan" in ordinary
@@ -784,5 +817,9 @@ def test_scheduled_cycle_orphan_embeddings_keep_real_vec_index_consistent(
         )
 
     assert result["orphans_embedded"] == 1
-    assert ordinary == {"valid-orphan": 16}
-    assert indexed == {"valid-orphan": 16}
+    expected_final = {
+        **anchor_blobs,
+        "valid-orphan": expected_orphan_blobs["valid-orphan"],
+    }
+    assert ordinary == expected_final
+    assert indexed == expected_final

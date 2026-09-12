@@ -71,6 +71,25 @@ def _wait_for_prefetch_idle(
         return True
 
 
+@pytest.fixture
+def prefetch_provider(tmp_path, request):
+    """Provide a worker-owning provider and prove its worker is released."""
+    provider = _provider_with_mock_config(tmp_path)
+    provider._sync_queue = queue.Queue()
+
+    def _cleanup() -> None:
+        provider.shutdown()
+        deadline = time.monotonic() + 2.0
+        while provider._prefetch_threads and time.monotonic() < deadline:
+            for worker in tuple(provider._prefetch_threads):
+                worker.join(timeout=0.01)
+        assert provider._prefetch_threads == set()
+        assert provider._prefetch_worker is None
+
+    request.addfinalizer(_cleanup)
+    return provider
+
+
 # ── queue_prefetch half-state guards ──────────────────────────────────────
 
 
@@ -310,10 +329,10 @@ def test_late_prefetch_rejects_each_same_session_identity_change(
 
 
 def test_queue_prefetch_roundtrip_hits_warm_cache_without_second_retrieval(
-    tmp_path, monkeypatch
+    prefetch_provider, monkeypatch
 ):
     """The public queue hook stages a reusable unfiltered result asynchronously."""
-    provider = _provider_with_mock_config(tmp_path)
+    provider = prefetch_provider
     calls: list[dict] = []
 
     def retrieve(**kwargs):
@@ -340,10 +359,10 @@ def test_queue_prefetch_roundtrip_hits_warm_cache_without_second_retrieval(
 
 
 def test_queue_prefetch_filtered_request_cold_falls_through_staged_result(
-    tmp_path, monkeypatch
+    prefetch_provider, monkeypatch
 ):
     """A queued unfiltered result cannot satisfy a later domain-constrained recall."""
-    provider = _provider_with_mock_config(tmp_path)
+    provider = prefetch_provider
     calls: list[dict] = []
 
     def retrieve(**kwargs):
@@ -385,14 +404,13 @@ def test_prefetch_half_state_skips_warm_cache():
 
 
 def test_queue_prefetch_dispatches_tracked_background_thread(
-    tmp_path, monkeypatch, request
+    prefetch_provider, monkeypatch, request
 ):
     """queue_prefetch tracks one persistent daemon until shutdown."""
-    provider = _provider_with_mock_config(tmp_path)
-    request.addfinalizer(provider.shutdown)
-    provider._sync_queue = queue.Queue()
+    provider = prefetch_provider
     started = threading.Event()
     release = threading.Event()
+    request.addfinalizer(release.set)
 
     def blocked_retrieval(**kwargs):
         started.set()
@@ -416,14 +434,13 @@ def test_queue_prefetch_dispatches_tracked_background_thread(
 
 
 def test_queue_prefetch_burst_has_one_active_and_one_latest_pending(
-    tmp_path, monkeypatch, request
+    prefetch_provider, monkeypatch, request
 ):
     """A burst coalesces behind one active worker and one latest request."""
-    provider = _provider_with_mock_config(tmp_path)
-    request.addfinalizer(provider.shutdown)
-    provider._sync_queue = queue.Queue()
+    provider = prefetch_provider
     started = threading.Event()
     release = threading.Event()
+    request.addfinalizer(release.set)
     calls: list[str] = []
     active = 0
     max_active = 0
@@ -466,15 +483,14 @@ def test_queue_prefetch_burst_has_one_active_and_one_latest_pending(
 
 
 def test_superseded_active_prefetch_skips_retrieval_after_cue_extraction(
-    tmp_path, monkeypatch, request
+    prefetch_provider, monkeypatch, request
 ):
     """An active request invalidated during cue extraction does no retrieval."""
-    provider = _provider_with_mock_config(tmp_path)
-    request.addfinalizer(provider.shutdown)
-    provider._sync_queue = queue.Queue()
+    provider = prefetch_provider
     provider._config.prefetch_cues = 1
     cue_started = threading.Event()
     release = threading.Event()
+    request.addfinalizer(release.set)
     retrieval_queries: list[str] = []
     model_calls = 0
     cancelled_before = _METRICS._snapshot()["prefetch_cancelled"]
@@ -505,15 +521,14 @@ def test_superseded_active_prefetch_skips_retrieval_after_cue_extraction(
 
 
 def test_active_prefetch_drops_result_after_runtime_identity_change(
-    tmp_path, monkeypatch, request
+    prefetch_provider, monkeypatch, request
 ):
     """A config identity change prevents late active publication."""
-    provider = _provider_with_mock_config(tmp_path)
-    request.addfinalizer(provider.shutdown)
+    provider = prefetch_provider
     provider._config = CashewConfig()
-    provider._sync_queue = queue.Queue()
     started = threading.Event()
     release = threading.Event()
+    request.addfinalizer(release.set)
     cancelled_before = _METRICS._snapshot()["prefetch_cancelled"]
 
     def blocked_retrieval(**kwargs):
@@ -552,13 +567,77 @@ def test_queue_prefetch_rejects_new_worker_after_shutdown_starts(tmp_path):
     assert provider._prefetch_threads == set()
 
 
-def test_shutdown_waits_for_accepted_prefetch_before_clearing_state(
-    tmp_path, monkeypatch
+def test_idle_prefetch_worker_is_reused_for_the_next_request(
+    prefetch_provider, monkeypatch
 ):
-    provider = _provider_with_mock_config(tmp_path)
-    provider._sync_queue = queue.Queue()
+    """A completed request leaves one worker ready for the next request."""
+    provider = prefetch_provider
+    calls: list[str] = []
+
+    def retrieve(**kwargs):
+        calls.append(kwargs["query"])
+        return []
+
+    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", retrieve)
+
+    provider.queue_prefetch("first request")
+    assert _wait_for_prefetch_idle(provider)
+    worker = provider._prefetch_worker
+    assert worker is not None and worker.is_alive()
+
+    provider.queue_prefetch("second request")
+    assert _wait_for_prefetch_idle(provider)
+
+    assert provider._prefetch_worker is worker
+    assert calls == ["first request", "second request"]
+
+
+def test_prefetch_worker_restarts_after_shutdown_and_reinitialize(
+    tmp_path, monkeypatch, request
+):
+    """A new initialized generation owns a fresh worker after shutdown."""
+    provider = CashewMemoryProvider()
+    request.addfinalizer(provider.shutdown)
+    calls: list[tuple[str, str]] = []
+
+    def retrieve(**kwargs):
+        calls.append((kwargs["query"], kwargs["db_path"]))
+        return []
+
+    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", retrieve)
+
+    provider.initialize("first-session", hermes_home=str(tmp_path))
+    provider.queue_prefetch("first request")
+    assert _wait_for_prefetch_idle(provider)
+    first_worker = provider._prefetch_worker
+    assert first_worker is not None and first_worker.is_alive()
+
+    provider.shutdown()
+    assert not first_worker.is_alive()
+    assert provider._prefetch_threads == set()
+
+    provider.initialize("second-session", hermes_home=str(tmp_path))
+    provider.queue_prefetch("second request")
+    assert _wait_for_prefetch_idle(provider)
+    second_worker = provider._prefetch_worker
+
+    assert second_worker is not None and second_worker.is_alive()
+    assert second_worker is not first_worker
+    assert provider._session_id == "second-session"
+    assert [query for query, _ in calls] == ["first request", "second request"]
+
+    provider.shutdown()
+    assert not second_worker.is_alive()
+    assert provider._prefetch_threads == set()
+
+
+def test_shutdown_waits_for_accepted_prefetch_before_clearing_state(
+    prefetch_provider, monkeypatch, request
+):
+    provider = prefetch_provider
     started = threading.Event()
     release = threading.Event()
+    request.addfinalizer(release.set)
 
     def blocked_retrieval(**kwargs):
         started.set()
@@ -568,6 +647,7 @@ def test_shutdown_waits_for_accepted_prefetch_before_clearing_state(
     monkeypatch.setattr(
         "core.retrieval.retrieve_recursive_bfs", blocked_retrieval, raising=False
     )
+    expected_db = provider._db_path
     provider.queue_prefetch("test query")
     assert started.wait(timeout=1.0)
 
@@ -577,7 +657,7 @@ def test_shutdown_waits_for_accepted_prefetch_before_clearing_state(
     time.sleep(0.02)
 
     assert shutdown_thread.is_alive()
-    assert provider._db_path == tmp_path / "brain.db"
+    assert provider._db_path == expected_db
 
     release.set()
     shutdown_thread.join(timeout=1.0)
@@ -589,13 +669,13 @@ def test_shutdown_waits_for_accepted_prefetch_before_clearing_state(
 
 
 def test_shutdown_timeout_retains_state_until_prefetch_exits(
-    tmp_path, monkeypatch, caplog
+    prefetch_provider, monkeypatch, caplog, request
 ):
-    provider = _provider_with_mock_config(tmp_path)
+    provider = prefetch_provider
     provider._config.sync_queue_timeout = 0.05
-    provider._sync_queue = queue.Queue()
     started = threading.Event()
     release = threading.Event()
+    request.addfinalizer(release.set)
 
     def blocked_retrieval(**kwargs):
         started.set()
@@ -605,13 +685,14 @@ def test_shutdown_timeout_retains_state_until_prefetch_exits(
     monkeypatch.setattr(
         "core.retrieval.retrieve_recursive_bfs", blocked_retrieval, raising=False
     )
+    expected_db = provider._db_path
     provider.queue_prefetch("test query")
     assert started.wait(timeout=1.0)
 
     with caplog.at_level(logging.WARNING, logger="plugins.memory.cashew"):
         provider.shutdown()
 
-    assert provider._db_path == tmp_path / "brain.db"
+    assert provider._db_path == expected_db
     assert provider._config is not None
     assert "prefetch worker(s) did not exit" in caplog.text
 

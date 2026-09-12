@@ -19,9 +19,11 @@ python -m plugins.memory.cashew.integrity /path/to/brain.db
 ```
 
 The audit uses a canonical shared maintenance lease and SQLite URI read-only
-mode. It reports schema and provider provenance, ordinary embedding validity,
-vector-index parity when the installed extension can be verified, orphan rows,
-referential graph defects, and permanence contradictions. It never runs schema
+mode. It reports schema and privacy-safe provider fingerprints, ordinary
+embedding validity, vector-index parity when the installed extension can be
+verified, orphan rows, referential graph defects, and permanence contradictions.
+Large scans use fixed row, byte, and deadline budgets; a cutoff is reported as
+`audit_incomplete` rather than presented as a complete audit. It never runs schema
 migrations, decay, consolidation, embedding services, or repair as a side
 effect. Reports include only bounded counts and reason codes; historical merge
 intent remains an explicit manual-review item because it cannot be reconstructed

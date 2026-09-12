@@ -879,6 +879,44 @@ def test_run_sleep_cycle_skips_held_custom_database_lock(small_graph):
         assert run_sleep_cycle(small_graph, model_fn=None) == {}
 
 
+def test_run_sleep_cycle_returns_neutral_result_on_lock_acquisition_failure(
+    small_graph, monkeypatch, caplog
+):
+    """Unexpected acquisition errors are observable skips, not cycle contention."""
+    import errno
+
+    import plugins.memory.cashew.locking as locking
+
+    real_flock = locking.fcntl.flock
+
+    def denied_lock(handle, operation):
+        if operation == locking.fcntl.LOCK_EX | locking.fcntl.LOCK_NB:
+            raise OSError(errno.EPERM, "permission denied")
+        return real_flock(handle, operation)
+
+    monkeypatch.setattr(locking.fcntl, "flock", denied_lock)
+
+    assert run_sleep_cycle(small_graph, model_fn=None) == {}
+    assert "unable to acquire maintenance lock" in caplog.text
+    assert "another cycle is already running" not in caplog.text
+
+
+def test_run_sleep_cycle_returns_neutral_result_when_lock_open_fails(
+    small_graph, monkeypatch, caplog
+):
+    """A lock-file permission failure is distinct from ordinary lock contention."""
+    import plugins.memory.cashew.locking as locking
+
+    def denied_open(*_args, **_kwargs):
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(locking.pathlib.Path, "open", denied_open)
+
+    assert run_sleep_cycle(small_graph, model_fn=None) == {}
+    assert "unable to acquire maintenance lock" in caplog.text
+    assert "another cycle is already running" not in caplog.text
+
+
 class _TrackedConnection:
     def __init__(self, connection):
         self._connection = connection
@@ -951,10 +989,10 @@ def test_run_sleep_cycle_closes_resources_when_wal_setup_fails(db_path, monkeypa
 
     monkeypatch.setattr(sleep.sqlite3, "connect", tracked_connect)
     monkeypatch.setattr(
-        sleep, "_set_wal", lambda _: (_ for _ in ()).throw(RuntimeError("wal"))
+        sleep, "_set_wal", lambda _: (_ for _ in ()).throw(OSError("wal"))
     )
 
-    with pytest.raises(RuntimeError, match="wal"):
+    with pytest.raises(OSError, match="wal"):
         run_sleep_cycle(db_path, model_fn=None)
     assert len(opened) == 1
     assert opened[0].closed is True

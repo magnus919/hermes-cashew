@@ -18,6 +18,10 @@ from typing import Iterator, TextIO
 logger = logging.getLogger(__name__)
 
 
+class MaintenanceLockAcquisitionError(OSError):
+    """Opening or acquiring the maintenance lock failed unexpectedly."""
+
+
 def lock_path_for_db(db_path: str | pathlib.Path) -> pathlib.Path:
     """Return the canonical, stable advisory-lock path for a configured DB."""
     canonical_db = pathlib.Path(db_path).resolve(strict=False)
@@ -35,14 +39,17 @@ def try_maintenance_lock(db_path: str | pathlib.Path) -> Iterator[TextIO | None]
     exception.
     """
     lock_path = lock_path_for_db(db_path)
-    lock_fd = lock_path.open("a+")
+    try:
+        lock_fd = lock_path.open("a+")
+    except OSError as exc:
+        raise MaintenanceLockAcquisitionError(lock_path) from exc
     acquired = False
     try:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
-                raise
+                raise MaintenanceLockAcquisitionError(lock_path) from exc
             yield None
             return
         acquired = True

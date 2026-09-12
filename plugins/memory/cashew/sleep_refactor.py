@@ -40,7 +40,7 @@ from typing import Any, Optional
 import numpy as np
 
 from .embedding import load_sentence_transformer
-from .locking import try_maintenance_lock
+from .locking import MaintenanceLockAcquisitionError, try_maintenance_lock
 
 logger = logging.getLogger(__name__)
 
@@ -759,50 +759,58 @@ def run_sleep_cycle(
     # This lock serializes migration and the synchronous portion of sleep.
     # Background dream work is observable through dream_pending and has a
     # separate connection; broader writer coordination belongs to issue #191.
-    with try_maintenance_lock(db_path) as lock_fd:
-        if lock_fd is None:
-            logger.info("sleep: another cycle is already running — skipping")
-            return {}
+    try:
+        with try_maintenance_lock(db_path) as lock_fd:
+            if lock_fd is None:
+                logger.info("sleep: another cycle is already running — skipping")
+                return {}
 
-        t_start = time.perf_counter()
-        with closing(sqlite3.connect(db_path)) as conn:
-            conn.execute("PRAGMA busy_timeout=5000")
-            _set_wal(conn)
+            t_start = time.perf_counter()
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute("PRAGMA busy_timeout=5000")
+                _set_wal(conn)
 
-            # Select nodes for this cycle (lowest-degree-first heuristic)
-            rows = conn.execute(
-                "SELECT e.node_id FROM embeddings e "
-                "JOIN thought_nodes tn ON e.node_id = tn.id "
-                "WHERE (tn.decayed IS NULL OR tn.decayed = 0) "
-                "ORDER BY ("
-                "  SELECT COUNT(*) FROM derivation_edges "
-                "  WHERE parent_id = e.node_id OR child_id = e.node_id"
-                ") ASC, tn.timestamp ASC "
-                "LIMIT ?",
-                (limit,),
-            ).fetchall()
+                # Select nodes for this cycle (lowest-degree-first heuristic)
+                rows = conn.execute(
+                    "SELECT e.node_id FROM embeddings e "
+                    "JOIN thought_nodes tn ON e.node_id = tn.id "
+                    "WHERE (tn.decayed IS NULL OR tn.decayed = 0) "
+                    "ORDER BY ("
+                    "  SELECT COUNT(*) FROM derivation_edges "
+                    "  WHERE parent_id = e.node_id OR child_id = e.node_id"
+                    ") ASC, tn.timestamp ASC "
+                    "LIMIT ?",
+                    (limit,),
+                ).fetchall()
 
-            ids = [r[0] for r in rows]
-            logger.info("sleep: selected %d nodes (limit=%d)", len(ids), limit)
+                ids = [r[0] for r in rows]
+                logger.info("sleep: selected %d nodes (limit=%d)", len(ids), limit)
 
-            valid_ids, matrix = _load_embedding_matrix(conn, ids)
-            if len(valid_ids) < 2:
-                logger.warning("sleep: too few valid embeddings — aborting")
-                return {"error": "too few nodes", "nodes_selected": len(ids)}
+                valid_ids, matrix = _load_embedding_matrix(conn, ids)
+                if len(valid_ids) < 2:
+                    logger.warning("sleep: too few valid embeddings — aborting")
+                    return {"error": "too few nodes", "nodes_selected": len(ids)}
 
-            return _run_sleep_cycle_locked(
-                conn,
-                db_path=db_path,
-                ids=ids,
-                valid_ids=valid_ids,
-                matrix=matrix,
-                max_edges=max_edges,
-                model_fn=model_fn,
-                background_dream=background_dream,
-                embedding_model=embedding_model,
-                embedding_device=embedding_device,
-                t_start=t_start,
-            )
+                return _run_sleep_cycle_locked(
+                    conn,
+                    db_path=db_path,
+                    ids=ids,
+                    valid_ids=valid_ids,
+                    matrix=matrix,
+                    max_edges=max_edges,
+                    model_fn=model_fn,
+                    background_dream=background_dream,
+                    embedding_model=embedding_model,
+                    embedding_device=embedding_device,
+                    t_start=t_start,
+                )
+    except MaintenanceLockAcquisitionError:
+        logger.warning(
+            "sleep: unable to acquire maintenance lock %s; skipping",
+            db_path,
+            exc_info=True,
+        )
+        return {}
 
 
 def _run_sleep_cycle_locked(

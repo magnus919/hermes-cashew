@@ -14,7 +14,11 @@ from pathlib import Path
 import pytest
 
 from plugins.memory.cashew import CashewMemoryProvider, locking
-from plugins.memory.cashew.locking import lock_path_for_db, try_maintenance_lock
+from plugins.memory.cashew.locking import (
+    MaintenanceLockAcquisitionError,
+    lock_path_for_db,
+    try_maintenance_lock,
+)
 
 _HOLDER = """
 import sys
@@ -165,9 +169,87 @@ def test_unexpected_lock_acquisition_error_is_not_reported_as_contention(
 
     monkeypatch.setattr(locking.fcntl, "flock", denied_lock)
 
-    with pytest.raises(PermissionError):
+    with pytest.raises(MaintenanceLockAcquisitionError) as error:
         with try_maintenance_lock(tmp_path / "brain.db"):
             pass
+    assert isinstance(error.value.__cause__, PermissionError)
+
+
+def test_initialize_survives_acquisition_failure_when_inspection_needs_no_migration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A healthy database remains usable when only maintenance lock access fails."""
+    import plugins.memory.cashew as cashew_module
+
+    (tmp_path / "cashew.json").write_text("{}")
+    real_flock = locking.fcntl.flock
+
+    def denied_lock(handle, operation):
+        if operation == locking.fcntl.LOCK_EX | locking.fcntl.LOCK_NB:
+            raise OSError(errno.EPERM, "permission denied")
+        return real_flock(handle, operation)
+
+    monkeypatch.setattr(locking.fcntl, "flock", denied_lock)
+    monkeypatch.setattr(cashew_module, "_patch_upstream_embedding", lambda *_: None)
+    monkeypatch.setattr(CashewMemoryProvider, "_ensure_db_schema", lambda *_: None)
+    monkeypatch.setattr(
+        CashewMemoryProvider, "_embedding_dimensions", lambda *_: (set(), None)
+    )
+    monkeypatch.setattr(
+        CashewMemoryProvider,
+        "_repair_embedding_dimension_locked",
+        lambda *_: pytest.fail("migration must not run without the maintenance lock"),
+    )
+    monkeypatch.setattr(cashew_module, "ContextRetriever", lambda **_: object())
+    monkeypatch.setattr(CashewMemoryProvider, "_build_model_fn", lambda _: None)
+    monkeypatch.setattr(CashewMemoryProvider, "_start_sync_worker", lambda _: None)
+
+    provider = CashewMemoryProvider()
+    try:
+        provider.initialize("session", hermes_home=str(tmp_path))
+        assert provider._config is not None
+        assert provider._retriever is not None
+        assert "migration not needed; unable to acquire" in caplog.text
+    finally:
+        provider.shutdown()
+
+
+def test_initialize_degrades_when_acquisition_failure_hides_required_migration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Initialization fails closed if a lock failure prevents needed migration."""
+    import core.embedding_service
+
+    import plugins.memory.cashew as cashew_module
+
+    (tmp_path / "cashew.json").write_text("{}")
+    real_flock = locking.fcntl.flock
+
+    def denied_lock(handle, operation):
+        if operation == locking.fcntl.LOCK_EX | locking.fcntl.LOCK_NB:
+            raise OSError(errno.EPERM, "permission denied")
+        return real_flock(handle, operation)
+
+    monkeypatch.setattr(locking.fcntl, "flock", denied_lock)
+    monkeypatch.setattr(cashew_module, "_patch_upstream_embedding", lambda *_: None)
+    monkeypatch.setattr(CashewMemoryProvider, "_ensure_db_schema", lambda *_: None)
+    monkeypatch.setattr(
+        CashewMemoryProvider, "_embedding_dimensions", lambda *_: ({384}, 384)
+    )
+    monkeypatch.setattr(core.embedding_service, "resolve_embedding_dim", lambda _: 1024)
+    monkeypatch.setattr(cashew_module, "ContextRetriever", lambda **_: object())
+    monkeypatch.setattr(CashewMemoryProvider, "_build_model_fn", lambda _: None)
+    monkeypatch.setattr(CashewMemoryProvider, "_start_sync_worker", lambda _: None)
+
+    provider = CashewMemoryProvider()
+    try:
+        provider.initialize("session", hermes_home=str(tmp_path))
+        assert provider._config is None
+        assert provider._db_path is None
+        assert provider._retriever is None
+        assert "provider will report unavailable" in caplog.text
+    finally:
+        provider.shutdown()
 
 
 @pytest.mark.parametrize("configured_path", ["cashew/brain.db", "state/custom.sqlite"])

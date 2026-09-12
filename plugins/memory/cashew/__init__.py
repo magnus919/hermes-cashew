@@ -19,7 +19,11 @@ from .embedding import (
     normalize_embedding_device,
 )
 from .error_tracking import capture_exception, set_plugin_context
-from .locking import lock_path_for_db, try_maintenance_lock
+from .locking import (
+    MaintenanceLockAcquisitionError,
+    lock_path_for_db,
+    try_maintenance_lock,
+)
 from .log_filter import add_scrub_filter
 from .metrics import _METRICS
 from .tracing import trace_operation
@@ -891,15 +895,43 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         deliberately outside this helper's scope.
         """
         lock_path = lock_path_for_db(db_path)
-        with try_maintenance_lock(db_path) as lock_fd:
-            if lock_fd is None:
-                logger.warning(
-                    "embedding dimension migration deferred; another Cashew process "
-                    "holds %s",
-                    lock_path,
-                )
-                return
-            self._repair_embedding_dimension_locked(db_path)
+        try:
+            with try_maintenance_lock(db_path) as lock_fd:
+                if lock_fd is None:
+                    logger.warning(
+                        "embedding dimension migration deferred; another Cashew process holds %s",
+                        lock_path,
+                    )
+                    return
+                self._repair_embedding_dimension_locked(db_path)
+        except MaintenanceLockAcquisitionError:
+            if self._embedding_migration_required(db_path):
+                raise
+            logger.warning(
+                "embedding dimension migration not needed; unable to acquire %s",
+                lock_path,
+                exc_info=True,
+            )
+
+    def _embedding_migration_required(self, db_path: pathlib.Path) -> bool:
+        """Fail closed unless a read-only inspection proves migration is unnecessary."""
+        if self._config is None:
+            return True
+        try:
+            from core.embedding_service import resolve_embedding_dim
+
+            expected_dim = resolve_embedding_dim(self._config.embedding_model)
+            stored_dims, vec_dim = self._embedding_dimensions(db_path)
+        except Exception:
+            logger.warning(
+                "could not inspect embedding dimensions after lock acquisition failure",
+                exc_info=True,
+            )
+            return True
+
+        stored_mismatch = bool(stored_dims) and stored_dims != {expected_dim}
+        vec_mismatch = vec_dim is not None and vec_dim != expected_dim
+        return stored_mismatch or vec_mismatch
 
     def _repair_embedding_dimension_locked(self, db_path: pathlib.Path) -> None:
         """Repair dimensions while the cross-process Cashew lock is held."""

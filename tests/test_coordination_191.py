@@ -178,6 +178,38 @@ def test_affected_fresh_db_stays_delete(tmp_path, monkeypatch):
         conn.close()
 
 
+def test_affected_async_dream_guards_journal_without_flipping_wal(
+    tmp_path, monkeypatch
+):
+    """Deferred dream work preserves DELETE on a vulnerable SQLite runtime."""
+    import plugins.memory.cashew.sleep_refactor as sleep_module
+
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 50, 4))
+    db = tmp_path / "async-delete.db"
+    started = threading.Event()
+    set_wal_called = threading.Event()
+    modes: list[str] = []
+
+    def forbidden_set_wal(_conn):
+        set_wal_called.set()
+
+    def observe_dream(conn, *_args, **_kwargs):
+        modes.append(str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower())
+        started.set()
+        return None
+
+    monkeypatch.setattr(sleep_module, "_set_wal", forbidden_set_wal)
+    monkeypatch.setattr(sleep_module, "_generate_dream", observe_dream)
+    monkeypatch.setattr(sleep_module, "_embed_orphans", lambda *_args, **_kwargs: 0)
+    sleep_module._run_dream_async(str(db), [], model_fn=None)
+
+    assert started.wait(timeout=5)
+    assert not set_wal_called.is_set()
+    assert modes == ["delete"]
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+
+
 def test_fixed_bootstrap_enables_wal_and_ordinary_guard_preserves_mode(
     tmp_path, monkeypatch
 ):
@@ -192,6 +224,34 @@ def test_fixed_bootstrap_enables_wal_and_ordinary_guard_preserves_mode(
     assert report["sqlite_version"]
     assert report["sqlite_source_id"]
     assert report["journal_mode"] == "wal"
+
+
+def test_readonly_uri_escapes_literal_percent_sequences_and_missing_is_readonly(
+    tmp_path,
+):
+    """Literal ``%2e%2e`` path components cannot select another profile."""
+    intended_dir = tmp_path / "literal%2e%2e"
+    decoy_dir = tmp_path / "literal.."
+    intended_dir.mkdir()
+    decoy_dir.mkdir()
+    intended = intended_dir / "profile.db"
+    decoy = decoy_dir / "profile.db"
+    for path, marker in ((intended, "intended"), (decoy, "decoy")):
+        with sqlite3.connect(path) as conn:
+            conn.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+            conn.execute("INSERT INTO marker VALUES (?)", (marker,))
+
+    conn, _mode = open_readonly_verified(intended)
+    try:
+        assert conn.execute("SELECT value FROM marker").fetchone() == ("intended",)
+        assert conn.execute("PRAGMA query_only").fetchone() == (1,)
+    finally:
+        conn.close()
+
+    missing = intended_dir / "missing.db"
+    with pytest.raises(sqlite3.OperationalError):
+        sqlite_journal_report(missing)
+    assert not missing.exists()
 
 
 def test_affected_existing_wal_is_write_refused(tmp_path, monkeypatch):
@@ -1227,6 +1287,42 @@ def test_think_claim_failure_is_uncertain_and_blocks_replay(tmp_path, monkeypatc
         ).fetchone()
     assert calls == 1
     assert state == ("uncertain",)
+
+
+def test_corrupt_think_counter_is_reset_without_opaque_call(tmp_path, monkeypatch):
+    """Malformed persistent counter metadata is contained at the sync boundary."""
+    db = tmp_path / "corrupt-think-counter.db"
+    _prepare_think_db(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE hermes_provider_meta SET value='not-a-number' "
+            "WHERE key='think_counter'"
+        )
+
+    provider = CashewMemoryProvider()
+    provider._db_path = db
+    provider._config = CashewConfig(
+        embedding_model="model-a", think_cycles=True, think_interval=1
+    )
+    provider._cache_writes_disabled = True
+    provider._embedding_identity_ready = True
+    provider._embedding_generation = "g1"
+    provider._runtime_epoch = 1
+    provider._model_fn = lambda _prompt: ""
+    provider._embedding_supervisor = types.SimpleNamespace(
+        dimension=384, generation="g1"
+    )
+
+    def forbidden(**_kwargs):
+        raise AssertionError("corrupt metadata must not invoke think_cycle")
+
+    monkeypatch.setattr("core.session.think_cycle", forbidden, raising=False)
+    provider._run_think_cycle_if_due()
+
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT value FROM hermes_provider_meta WHERE key='think_counter'"
+        ).fetchone() == ("0",)
 
 
 def test_persisted_model_mismatch_requires_migration_even_with_null_rows(tmp_path):

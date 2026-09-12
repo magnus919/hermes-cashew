@@ -92,7 +92,10 @@ def open_readonly_verified(
 ) -> tuple[sqlite3.Connection, str]:
     """Open an existing DB through URI read-only and verify query_only."""
     path = pathlib.Path(db_path).resolve(strict=False)
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    # ``Path.as_uri`` escapes literal percent sequences in a filename.  Building
+    # ``file:{path}`` directly lets SQLite URI parsing reinterpret ``%2e`` and
+    # similar bytes as path traversal or a different profile.
+    conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
     conn.execute("PRAGMA query_only=ON")
     if conn.execute("PRAGMA query_only").fetchone()[0] != 1:
         conn.close()
@@ -289,12 +292,15 @@ def verify_readonly_profile(conn: object) -> dict[str, str]:  # noqa: C901
 
 
 def sqlite_journal_report(db_path: str | pathlib.Path) -> dict[str, str]:
-    """Return linked-runtime and journal evidence without changing the DB."""
+    """Return linked-runtime and journal evidence through a read-only URI."""
     import sqlite3
 
     path = pathlib.Path(db_path).resolve(strict=False)
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
     try:
+        conn.execute("PRAGMA query_only=ON")
+        if conn.execute("PRAGMA query_only").fetchone()[0] != 1:
+            raise SQLiteWALUnsupportedError("query-only verification failed")
         return {
             "sqlite_version": sqlite3.sqlite_version,
             "sqlite_source_id": str(

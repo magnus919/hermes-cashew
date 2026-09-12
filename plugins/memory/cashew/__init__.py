@@ -2568,7 +2568,22 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     if state in {"in_flight", "failed", "partial", "uncertain"}:
                         conn.rollback()
                         return
-                    counter = int(values.get("think_counter", "0")) + 1
+                    raw_counter = values.get("think_counter", "0")
+                    try:
+                        counter = int(raw_counter) + 1
+                    except (TypeError, ValueError):
+                        # Corrupt metadata must not escape through sync_turn or
+                        # accidentally trigger an opaque think call. Reset it
+                        # deterministically and wait for the next admitted turn.
+                        logger.warning(
+                            "think cycle counter metadata invalid; resetting counter"
+                        )
+                        conn.execute(
+                            "INSERT OR REPLACE INTO hermes_provider_meta (key,value) "
+                            "VALUES ('think_counter', '0')"
+                        )
+                        conn.commit()
+                        return
                     if counter < self._config.think_interval:
                         conn.execute(
                             "INSERT OR REPLACE INTO hermes_provider_meta (key,value) "

@@ -50,6 +50,7 @@ from .admission import (
 from .locking import (
     MaintenanceLockAcquisitionError,
     guard_sqlite_journal,
+    sqlite_wal_reset_vulnerable,
     try_maintenance_lock,
 )
 
@@ -755,7 +756,12 @@ def _run_dream_async(
             ):
                 with closing(sqlite3.connect(db_path)) as conn:
                     conn.execute("PRAGMA busy_timeout=5000")
-                    _set_wal(conn)
+                    if sqlite_wal_reset_vulnerable(sqlite3.sqlite_version_info):
+                        # Affected SQLite runtimes must never reset an existing
+                        # journal while deferred work is opening its connection.
+                        guard_sqlite_journal(conn)
+                    else:
+                        _set_wal(conn)
                     dream_id = _generate_dream(
                         conn, cross_link_tuples, model_fn=model_fn
                     )

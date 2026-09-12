@@ -903,6 +903,46 @@ def test_migration_rolls_back_wrong_model_or_vec_identity(
     assert "restoring pre-migration backup" in caplog.text
 
 
+def test_vec_only_postcondition_mismatch_rolls_back_to_identity_unresolved(
+    tmp_path, monkeypatch, caplog
+):
+    """A loaded vec table must still contain every ordinary active node ID."""
+    db_path = tmp_path / "cashew" / "brain.db"
+    db_path.parent.mkdir(parents=True)
+    _make_dimension_mismatch_db(db_path)
+    before = _logical_embedding_snapshot(db_path)
+
+    def wrong_vec_only(path, *, confirm, quiet):
+        summary = _fake_migrate_to_1024(path, confirm=confirm, quiet=quiet)
+        conn = sqlite3.connect(str(path))
+        try:
+            _load_sqlite_vec(conn)
+            vector = conn.execute(
+                "SELECT embedding FROM vec_embeddings WHERE node_id = 'n1'"
+            ).fetchone()[0]
+            conn.execute("DELETE FROM vec_embeddings WHERE node_id = 'n1'")
+            conn.execute(
+                "INSERT INTO vec_embeddings (node_id, embedding) VALUES ('wrong-id', ?)",
+                (vector,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return summary
+
+    monkeypatch.setattr("scripts.migrate_embeddings.migrate_embeddings", wrong_vec_only)
+    provider = CashewMemoryProvider()
+    provider.save_config({"embedding_model": "thenlper/gte-large"}, str(tmp_path))
+    provider.initialize("vec-only-mismatch", hermes_home=str(tmp_path))
+    try:
+        assert provider._embedding_identity_ready is False
+        assert provider.health_status()["reason_code"] == "identity_unresolved"
+        assert _logical_embedding_snapshot(db_path) == before
+        assert "restoring pre-migration backup" in caplog.text
+    finally:
+        provider.shutdown()
+
+
 def test_embedding_migration_defers_while_sleep_lock_is_held(
     tmp_path, monkeypatch, caplog
 ):

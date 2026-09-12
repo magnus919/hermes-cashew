@@ -419,6 +419,23 @@ class _GenerationBoundEmbeddingCache:
             )
         if admission.cache_lease is None:
             raise OperationAdmissionError("embedding cache lease is not owned")
+        # The child handshake is the source of truth for dimensions.  Keep the
+        # per-model cache record in the same file scoped to this admission so a
+        # stale facade cannot publish a vector before identity is durable.
+        try:
+            with sqlite3.connect(str(self._path)) as conn:
+                row = conn.execute(
+                    "SELECT embedding_dim FROM hermes_cashew_cache_meta WHERE model=?",
+                    (model,),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            raise OperationAdmissionError(
+                "embedding cache identity metadata is unavailable"
+            ) from exc
+        if row is None or int(row[0]) != self._embedding_dim:
+            raise OperationAdmissionError(
+                "embedding cache model dimension metadata mismatch"
+            )
 
     def get_many(self, model: str, texts: list[str]) -> Any:
         self._check(model)
@@ -504,6 +521,21 @@ def _bind_upstream_embedding(
             if cache_disabled
             else _open_profile_embedding_cache(cache_path)
         )
+        if not cache_disabled:
+            # Persist the child handshake before exposing the service.  The
+            # short cache-only admission protects direct bindings; initialize
+            # repeats this under its continuous graph-to-cache admission before
+            # runtime identity publication.
+            with admit_operation(
+                cache_path=cache_path,
+                model=model_name,
+                embedding_dim=dim,
+                supervisor=supervisor,
+                embedding_generation=getattr(supervisor, "generation", None),
+                cache_exclusive=True,
+                deadline=1.5,
+            ):
+                _persist_cache_identity(cache_path, model=model_name, embedding_dim=dim)
         cache = _GenerationBoundEmbeddingCache(
             raw_cache,
             path=cache_path,
@@ -620,6 +652,44 @@ def _bootstrap_sqlite_profile(
                     cache_conn.commit()
             finally:
                 cache_conn.close()
+
+
+def _persist_cache_identity(
+    cache_path: pathlib.Path | None,
+    *,
+    model: str | None,
+    embedding_dim: int | None,
+) -> None:
+    """Persist a child-discovered cache dimension before publication.
+
+    The caller owns the continuous graph-to-cache exclusive admission.  This
+    helper deliberately performs no lock acquisition of its own, so publishing
+    an unknown-model handshake cannot race a cache put or another initializer.
+    """
+    if cache_path is None or not model or embedding_dim is None or embedding_dim <= 0:
+        raise OperationAdmissionError("embedding cache identity is unavailable")
+    conn = sqlite3.connect(str(cache_path))
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS hermes_cashew_cache_meta "
+            "(model TEXT PRIMARY KEY, embedding_dim INTEGER NOT NULL)"
+        )
+        prior = conn.execute(
+            "SELECT embedding_dim FROM hermes_cashew_cache_meta WHERE model=?",
+            (model,),
+        ).fetchone()
+        if prior is not None and int(prior[0]) != embedding_dim:
+            raise OperationAdmissionError(
+                "embedding cache model dimension metadata mismatch"
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO hermes_cashew_cache_meta "
+            "(model, embedding_dim) VALUES (?, ?)",
+            (model, embedding_dim),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # Import-time model construction is intentionally avoided. The provider binds
@@ -1099,6 +1169,12 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                             self._validate_runtime_identity(
                                 bootstrap_admission, allow_metadata_mismatch=True
                             )
+                            if not self._cache_writes_disabled:
+                                _persist_cache_identity(
+                                    self._embedding_cache_path,
+                                    model=self._config.embedding_model,
+                                    embedding_dim=self._active_embedding_dimension(),
+                                )
                             self._write_runtime_identity(self._db_path)
                 try:
                     if self._read_only_mode:
@@ -2399,12 +2475,21 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 except Exception:
                     before_nodes = None
                 try:
-                    end_session(
+                    extraction_result = end_session(
                         db_path=str(self._db_path),
                         session_id=session_id or self._session_id,
                         conversation_text=f"User: {user}\nAssistant: {assistant}",
                         model_fn=self._model_fn,
                     )
+                    # The pinned upstream contract returns an ExtractionResult.
+                    # A swallowed internal failure or wrapper that returns no
+                    # result gives us no evidence about committed progress and
+                    # must remain uncertain rather than being replayed.
+                    if extraction_result is None or not all(
+                        hasattr(extraction_result, field)
+                        for field in ("new_nodes", "new_edges", "updated_nodes")
+                    ):
+                        raise _OpaqueUpstreamError(partial=False)
                 except Exception as exc:
                     # Interpreter finalization is a terminal local condition,
                     # not an opaque upstream persistence outcome.  Preserve

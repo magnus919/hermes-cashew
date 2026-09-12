@@ -14,6 +14,7 @@ import pytest
 
 from plugins.memory.cashew import (
     CashewMemoryProvider,
+    _bootstrap_sqlite_profile,
     _GenerationBoundEmbeddingCache,
     _NoopEmbeddingCache,
     _sqlite_profile_policy,
@@ -110,6 +111,29 @@ def _prepare_think_db(db: Path) -> None:
             INSERT INTO hermes_provider_meta VALUES ('think_claim_state', 'none');
             """
         )
+
+
+_FORK_ADMISSION = None
+
+
+def _run_inherited_async_dream(ready) -> None:
+    """Run the actual async dream entrypoint with an inherited admission token."""
+    import plugins.memory.cashew.sleep_refactor as sleep_module
+    from plugins.memory.cashew.admission import current_admission
+
+    admission = _FORK_ADMISSION
+    assert admission is not None
+
+    def paused_dream(*_args, **_kwargs):
+        assert current_admission() is admission
+        ready.set()
+        time.sleep(30)
+
+    sleep_module._generate_dream = paused_dream
+    sleep_module._run_dream_async(
+        str(admission.graph_path), [], model_fn=None, admission=admission
+    )
+    time.sleep(30)
 
 
 @pytest.mark.parametrize(
@@ -242,6 +266,15 @@ def test_graph_lease_releases_when_cache_admission_fails(tmp_path):
 def test_generation_bound_cache_rejects_stale_put_without_exact_admission(tmp_path):
     cache_path = tmp_path / "embedding-cache.db"
     calls: list[tuple[str, str]] = []
+    with sqlite3.connect(cache_path) as conn:
+        conn.execute(
+            "CREATE TABLE hermes_cashew_cache_meta "
+            "(model TEXT PRIMARY KEY, embedding_dim INTEGER NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO hermes_cashew_cache_meta VALUES (?, ?)",
+            ("model-a", 384),
+        )
 
     class RawCache:
         def put(self, model, text, _vector):
@@ -268,6 +301,62 @@ def test_generation_bound_cache_rejects_stale_put_without_exact_admission(tmp_pa
     ):
         cache.put("model-a", "fresh", [0.0])
     assert calls == [("model-a", "fresh")]
+
+
+def test_real_cache_facade_get_compute_put_preserves_per_model_metadata(tmp_path):
+    """The pinned EmbeddingCache uses one leased file with model-scoped metadata."""
+    from core.embedding_cache import EmbeddingCache
+
+    cache_path = tmp_path / "shared-cache.db"
+    graph_a = tmp_path / "graph-a.db"
+    graph_b = tmp_path / "graph-b.db"
+    _bootstrap_sqlite_profile(
+        graph_a, cache_path, cache_disabled=False, model="model-a", embedding_dim=4
+    )
+    _bootstrap_sqlite_profile(
+        graph_b, cache_path, cache_disabled=False, model="model-b", embedding_dim=5
+    )
+    raw = EmbeddingCache(str(cache_path))
+    supervisor = object()
+    facade_a = _GenerationBoundEmbeddingCache(
+        raw,
+        path=cache_path,
+        model="model-a",
+        embedding_dim=4,
+        supervisor=supervisor,
+        generation="a",
+    )
+    with admit_operation(
+        graph_path=graph_a,
+        cache_path=cache_path,
+        model="model-a",
+        embedding_dim=4,
+        supervisor=supervisor,
+        embedding_generation="a",
+        cache_exclusive=True,
+    ):
+        assert facade_a.get_many("model-a", ["text"]) == [None]
+        assert facade_a.put_many("model-a", [("text", [1, 2, 3, 4])]) == 1
+        assert len(facade_a.get_many("model-a", ["text"])[0]) == 4
+    with sqlite3.connect(cache_path) as conn:
+        metadata = dict(
+            conn.execute(
+                "SELECT model, embedding_dim FROM hermes_cashew_cache_meta"
+            ).fetchall()
+        )
+    assert metadata == {"model-a": 4, "model-b": 5}
+
+    with pytest.raises(OperationAdmissionError, match="model mismatch"):
+        with admit_operation(
+            graph_path=graph_b,
+            cache_path=cache_path,
+            model="model-b",
+            embedding_dim=5,
+            supervisor=supervisor,
+            embedding_generation="b",
+            cache_exclusive=True,
+        ):
+            facade_a.put_many("model-a", [("stale", [0, 0, 0, 0])])
 
 
 def test_nested_cache_mismatch_is_rejected_without_reacquiring(tmp_path):
@@ -403,6 +492,45 @@ def test_async_admission_start_failure_releases_transferred_owner_once(
         assert cache_lease is not None
 
 
+def test_async_dream_transfers_exact_token_and_process_death_releases_leases(
+    tmp_path,
+):
+    """The real async entrypoint installs the token and dies without stranding locks."""
+    global _FORK_ADMISSION
+    context = multiprocessing.get_context("fork")
+    graph = tmp_path / "brain.db"
+    cache = tmp_path / "cache.db"
+    ready = context.Event()
+    with admit_operation(
+        graph_path=graph,
+        cache_path=cache,
+        model="model-a",
+        embedding_dim=384,
+        vec_dim=384,
+        exclusive=True,
+        cache_exclusive=True,
+    ) as admission:
+        _FORK_ADMISSION = admission
+        child = context.Process(target=_run_inherited_async_dream, args=(ready,))
+        child.start()
+        try:
+            assert ready.wait(timeout=10)
+            assert admission.lease_owner is not None
+            admission.lease_owner.close()
+            child.terminate()
+            child.join(timeout=10)
+            assert child.exitcode is not None
+        finally:
+            if child.is_alive():
+                child.kill()
+                child.join(timeout=10)
+        _FORK_ADMISSION = None
+    with try_maintenance_lock(graph) as graph_lease:
+        assert graph_lease is not None
+    with try_maintenance_lock(cache) as cache_lease:
+        assert cache_lease is not None
+
+
 def test_two_process_think_claim_has_one_opaque_call_and_no_duplicate(
     tmp_path, monkeypatch
 ):
@@ -513,16 +641,22 @@ def test_readonly_profile_verifies_persisted_identity_and_dimensions(tmp_path):
     with sqlite3.connect(db) as conn:
         conn.executescript(
             """
-            CREATE TABLE thought_nodes (id TEXT PRIMARY KEY, content TEXT, domain TEXT);
-            CREATE TABLE derivation_edges (parent_id TEXT, child_id TEXT);
-            CREATE TABLE embeddings (node_id TEXT PRIMARY KEY, vector BLOB, model TEXT);
+            CREATE TABLE thought_nodes (
+                id TEXT PRIMARY KEY, content TEXT, node_type TEXT, domain TEXT,
+                timestamp TEXT, access_count INTEGER, last_accessed TEXT,
+                source_file TEXT, decayed INTEGER, metadata TEXT, last_updated TEXT,
+                mood_state TEXT, permanent INTEGER, tags TEXT, referent_time TEXT
+            );
+            CREATE TABLE derivation_edges (parent_id TEXT, child_id TEXT, weight REAL, reasoning TEXT, timestamp TEXT);
+            CREATE TABLE embeddings (node_id TEXT PRIMARY KEY, vector BLOB, model TEXT, updated_at TEXT);
             CREATE TABLE hermes_provider_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            INSERT INTO thought_nodes VALUES ('n1', 'memory', 'user');
-            INSERT INTO embeddings VALUES ('n1', zeroblob(16), 'model-a');
+                INSERT INTO thought_nodes (id, content, domain) VALUES ('n1', 'memory', 'user');
+            INSERT INTO embeddings VALUES ('n1', zeroblob(16), 'model-a', NULL);
             INSERT INTO hermes_provider_meta VALUES ('embedding_model', 'model-a');
             INSERT INTO hermes_provider_meta VALUES ('embedding_dim', '4');
             INSERT INTO hermes_provider_meta VALUES ('vec_dim', '4');
             INSERT INTO hermes_provider_meta VALUES ('maintenance_epoch', '2');
+            PRAGMA user_version = 3;
             """
         )
     conn, mode = open_readonly_verified(db)
@@ -545,17 +679,23 @@ def test_readonly_vec_profile_loads_extension_without_profile_mutation(tmp_path)
         sqlite_vec.load(conn)
         conn.executescript(
             """
-            CREATE TABLE thought_nodes (id TEXT PRIMARY KEY, content TEXT, domain TEXT);
-            CREATE TABLE derivation_edges (parent_id TEXT, child_id TEXT);
-            CREATE TABLE embeddings (node_id TEXT PRIMARY KEY, vector BLOB, model TEXT);
+            CREATE TABLE thought_nodes (
+                id TEXT PRIMARY KEY, content TEXT, node_type TEXT, domain TEXT,
+                timestamp TEXT, access_count INTEGER, last_accessed TEXT,
+                source_file TEXT, decayed INTEGER, metadata TEXT, last_updated TEXT,
+                mood_state TEXT, permanent INTEGER, tags TEXT, referent_time TEXT
+            );
+            CREATE TABLE derivation_edges (parent_id TEXT, child_id TEXT, weight REAL, reasoning TEXT, timestamp TEXT);
+            CREATE TABLE embeddings (node_id TEXT PRIMARY KEY, vector BLOB, model TEXT, updated_at TEXT);
             CREATE TABLE hermes_provider_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE VIRTUAL TABLE vec_embeddings USING vec0(node_id TEXT PRIMARY KEY, embedding float[4]);
-            INSERT INTO thought_nodes VALUES ('n1', 'memory', 'user');
-            INSERT INTO embeddings VALUES ('n1', zeroblob(16), 'model-a');
+                INSERT INTO thought_nodes (id, content, domain) VALUES ('n1', 'memory', 'user');
+            INSERT INTO embeddings VALUES ('n1', zeroblob(16), 'model-a', NULL);
             INSERT INTO hermes_provider_meta VALUES ('embedding_model', 'model-a');
             INSERT INTO hermes_provider_meta VALUES ('embedding_dim', '4');
             INSERT INTO hermes_provider_meta VALUES ('vec_dim', '4');
             INSERT INTO hermes_provider_meta VALUES ('maintenance_epoch', '2');
+            PRAGMA user_version = 3;
             """
         )
         conn.execute(
@@ -591,6 +731,110 @@ def test_affected_profile_that_cannot_be_verified_is_unavailable(tmp_path, monke
     )
     with pytest.raises(SQLiteWALUnsupportedError, match="verification failed"):
         _sqlite_profile_policy(db)
+
+
+def test_readonly_verifier_rejects_declared_vec_dimension_mismatch(tmp_path):
+    db = tmp_path / "vec-mismatch.db"
+    with sqlite3.connect(db) as conn:
+        import sqlite_vec
+
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.executescript(
+            """
+            CREATE TABLE thought_nodes (
+                id TEXT PRIMARY KEY, content TEXT, node_type TEXT, domain TEXT,
+                timestamp TEXT, access_count INTEGER, last_accessed TEXT,
+                source_file TEXT, decayed INTEGER, metadata TEXT, last_updated TEXT,
+                mood_state TEXT, permanent INTEGER, tags TEXT, referent_time TEXT
+            );
+            CREATE TABLE derivation_edges (parent_id TEXT, child_id TEXT, weight REAL, reasoning TEXT, timestamp TEXT);
+            CREATE TABLE embeddings (node_id TEXT PRIMARY KEY, vector BLOB, model TEXT, updated_at TEXT);
+            CREATE TABLE hermes_provider_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE VIRTUAL TABLE vec_embeddings USING vec0(node_id TEXT PRIMARY KEY, embedding float[5]);
+            INSERT INTO hermes_provider_meta VALUES ('embedding_model', 'model-a');
+            INSERT INTO hermes_provider_meta VALUES ('embedding_dim', '4');
+            INSERT INTO hermes_provider_meta VALUES ('vec_dim', '4');
+            INSERT INTO hermes_provider_meta VALUES ('maintenance_epoch', '2');
+            PRAGMA user_version = 3;
+            """
+        )
+    conn, _mode = open_readonly_verified(db)
+    try:
+        with pytest.raises(
+            SQLiteWALUnsupportedError, match="vec dimension is inconsistent"
+        ):
+            verify_readonly_profile(conn)
+    finally:
+        conn.close()
+
+
+def test_affected_wal_provider_never_enters_write_or_upstream_paths(
+    tmp_path, monkeypatch
+):
+    """A verified affected-WAL profile remains read-only across provider APIs."""
+    from core.db import ensure_schema
+
+    db = tmp_path / "affected-live-wal.db"
+    ensure_schema(str(db))
+    (tmp_path / "cashew.json").write_text(
+        '{"cashew_db_path": "affected-live-wal.db"}', encoding="utf-8"
+    )
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE hermes_provider_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        conn.executemany(
+            "INSERT OR REPLACE INTO hermes_provider_meta (key, value) VALUES (?, ?)",
+            [
+                ("embedding_model", "all-MiniLM-L6-v2"),
+                ("embedding_dim", "384"),
+                ("vec_dim", "384"),
+                ("maintenance_epoch", "1"),
+            ],
+        )
+        conn.commit()
+    holder = sqlite3.connect(db)
+    assert holder.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    holder.execute("SELECT 1").fetchone()
+    tracked = {
+        path: (path.stat().st_size, sha256(path.read_bytes()).hexdigest())
+        for path in (db, Path(f"{db}-wal"), Path(f"{db}-shm"))
+        if path.exists()
+    }
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 50, 4))
+    calls: list[str] = []
+
+    def forbidden(name):
+        def fail(*_args, **_kwargs):
+            calls.append(name)
+            raise AssertionError(f"forbidden affected-WAL path: {name}")
+
+        return fail
+
+    monkeypatch.setattr("core.embedding_cache.EmbeddingCache", forbidden("cache"))
+    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", forbidden("bfs"))
+    monkeypatch.setattr("core.session.end_session", forbidden("extract"))
+    monkeypatch.setattr("core.session.think_cycle", forbidden("think"))
+    monkeypatch.setattr(
+        "plugins.memory.cashew.sleep_refactor.run_sleep_cycle", forbidden("sleep")
+    )
+    provider = CashewMemoryProvider()
+    try:
+        provider.initialize("affected-wal", hermes_home=str(tmp_path))
+        assert provider.prefetch("missing") == ""
+        response = provider.handle_tool_call("cashew_query", {"query": "missing"})
+        assert '"ok": true' in response
+        provider.sync_turn("blocked", "write")
+    finally:
+        provider.shutdown()
+    assert calls == []
+    assert {
+        path: (path.stat().st_size, sha256(path.read_bytes()).hexdigest())
+        for path in tracked
+        if path.exists()
+    } == tracked
+    holder.close()
 
 
 def test_runtime_identity_epoch_is_stable_for_same_identity_and_fences_stale_owner(
@@ -700,7 +944,9 @@ def test_unknown_upstream_failure_is_uncertain_and_not_replayed(tmp_path, monkey
     def swallowed_progress(**_kwargs):
         nonlocal calls
         calls += 1
-        raise RuntimeError("upstream outcome unavailable")
+        # Model an upstream helper that catches its internal database error and
+        # returns no ExtractionResult, leaving commit progress unknowable.
+        return None
 
     monkeypatch.setattr("core.session.end_session", swallowed_progress, raising=False)
     ledger = provider._outcomes

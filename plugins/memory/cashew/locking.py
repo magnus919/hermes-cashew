@@ -11,6 +11,7 @@ import errno
 import fcntl
 import logging
 import pathlib
+import re
 import sqlite3
 import sys
 from contextlib import contextmanager
@@ -108,6 +109,11 @@ def verify_readonly_profile(conn: object) -> dict[str, str]:  # noqa: C901
     conn = cast(sqlite3.Connection, conn)
     if conn.execute("PRAGMA query_only").fetchone()[0] != 1:
         raise SQLiteWALUnsupportedError("query-only verification failed")
+    user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if user_version != 3:
+        raise SQLiteWALUnsupportedError(
+            f"read-only Cashew schema version {user_version} is unsupported"
+        )
     integrity = str(conn.execute("PRAGMA integrity_check").fetchone()[0]).lower()
     if integrity != "ok":
         raise SQLiteWALUnsupportedError("read-only integrity check failed")
@@ -117,30 +123,60 @@ def verify_readonly_profile(conn: object) -> dict[str, str]:  # noqa: C901
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()
     }
-    required = {"thought_nodes", "embeddings", "derivation_edges"}
+    required = {
+        "thought_nodes",
+        "embeddings",
+        "derivation_edges",
+        "hermes_provider_meta",
+    }
     if not required.issubset(tables):
         raise SQLiteWALUnsupportedError("read-only Cashew schema is incomplete")
     columns = {
         str(row[1])
         for row in conn.execute("PRAGMA table_info(thought_nodes)").fetchall()
     }
-    if not {"id", "content", "domain"}.issubset(columns):
+    required_keyword_columns = {
+        "id",
+        "content",
+        "node_type",
+        "domain",
+        "timestamp",
+        "access_count",
+        "last_accessed",
+        "source_file",
+        "decayed",
+        "metadata",
+        "last_updated",
+        "mood_state",
+        "permanent",
+        "tags",
+        "referent_time",
+    }
+    if not required_keyword_columns.issubset(columns):
         raise SQLiteWALUnsupportedError("read-only keyword columns are incomplete")
     embedding_columns = {
         str(row[1]) for row in conn.execute("PRAGMA table_info(embeddings)").fetchall()
     }
-    if not {"node_id", "vector", "model"}.issubset(embedding_columns):
+    if not {"node_id", "vector", "model", "updated_at"}.issubset(embedding_columns):
         raise SQLiteWALUnsupportedError("read-only embedding columns are incomplete")
+    edge_columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(derivation_edges)").fetchall()
+    }
+    if not {
+        "parent_id",
+        "child_id",
+        "weight",
+        "reasoning",
+        "timestamp",
+    }.issubset(edge_columns):
+        raise SQLiteWALUnsupportedError("read-only derivation columns are incomplete")
 
-    meta = (
-        dict(
-            conn.execute(
-                "SELECT key, value FROM hermes_provider_meta WHERE key IN "
-                "('embedding_model','embedding_dim','vec_dim','maintenance_epoch')"
-            ).fetchall()
-        )
-        if "hermes_provider_meta" in tables
-        else {}
+    meta = dict(
+        conn.execute(
+            "SELECT key, value FROM hermes_provider_meta WHERE key IN "
+            "('embedding_model','embedding_dim','vec_dim','maintenance_epoch')"
+        ).fetchall()
     )
     required_meta = {"embedding_model", "embedding_dim", "vec_dim", "maintenance_epoch"}
     if not required_meta.issubset(meta):
@@ -153,10 +189,15 @@ def verify_readonly_profile(conn: object) -> dict[str, str]:  # noqa: C901
         raise SQLiteWALUnsupportedError(
             "read-only provider identity is invalid"
         ) from exc
-    if expected_dim <= 0 or expected_vec_dim <= 0 or not meta["embedding_model"]:
+    if (
+        expected_dim <= 0
+        or expected_vec_dim <= 0
+        or expected_dim != expected_vec_dim
+        or not meta["embedding_model"]
+    ):
         raise SQLiteWALUnsupportedError("read-only provider identity is invalid")
     rows = conn.execute(
-        "SELECT node_id, model, LENGTH(vector) FROM embeddings WHERE vector IS NOT NULL"
+        "SELECT node_id, model, LENGTH(vector) FROM embeddings"
     ).fetchall()
     for node_id, model, byte_length in rows:
         if (
@@ -197,6 +238,16 @@ def verify_readonly_profile(conn: object) -> dict[str, str]:  # noqa: C901
             str(row[1])
             for row in conn.execute("PRAGMA table_info(vec_embeddings)").fetchall()
         }
+        vec_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='vec_embeddings'"
+        ).fetchone()[0]
+        declared_dimension_match = re.search(
+            r"(?:float|int8)\s*\[\s*(\d+)\s*\]", str(vec_sql), re.IGNORECASE
+        )
+        if declared_dimension_match is None:
+            raise SQLiteWALUnsupportedError("read-only vec dimension is unavailable")
+        if int(declared_dimension_match.group(1)) != expected_vec_dim:
+            raise SQLiteWALUnsupportedError("read-only vec dimension is inconsistent")
         # A virtual vec table has no PRAGMA columns on some sqlite-vec releases;
         # parity is checked when its read-only query is available.
         if "node_id" in vec_columns:
@@ -208,18 +259,28 @@ def verify_readonly_profile(conn: object) -> dict[str, str]:  # noqa: C901
                     ).fetchall()
                 }
                 ordinary_ids = {str(row[0]) for row in rows}
+                vec_lengths = {
+                    str(row[0]): row[1]
+                    for row in conn.execute(
+                        "SELECT node_id, LENGTH(embedding) FROM vec_embeddings"
+                    ).fetchall()
+                }
             except Exception as exc:
                 raise SQLiteWALUnsupportedError(
                     "read-only vec parity could not be verified"
                 ) from exc
             if vec_ids != ordinary_ids:
                 raise SQLiteWALUnsupportedError("read-only vec and ordinary IDs differ")
+            if any(
+                length is None or int(length) != expected_vec_dim * 4
+                for length in vec_lengths.values()
+            ):
+                raise SQLiteWALUnsupportedError("read-only vec blob dimensions differ")
 
     source_id = str(conn.execute("SELECT sqlite_source_id()").fetchone()[0])
-    user_version = str(conn.execute("PRAGMA user_version").fetchone()[0])
     return {
         "sqlite_source_id": source_id,
-        "user_version": user_version,
+        "user_version": str(user_version),
         "provider_model": meta["embedding_model"],
         "provider_embedding_dim": str(expected_dim),
         "provider_vec_dim": str(expected_vec_dim),

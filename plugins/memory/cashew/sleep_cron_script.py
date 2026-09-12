@@ -182,24 +182,23 @@ def main() -> None:
             # semantic state; no parent-process model fallback is permitted.
             supervisor.start()
             dimension = int(supervisor.dimension)
-            epoch = _runtime_epoch(db_path, config.embedding_model, dimension)
             # Maintenance obtains graph then cache exclusively before it asks
-            # upstream to mutate either store. The token remains installed for
-            # run_sleep_cycle(), which cannot downgrade to a graph-only lock or
-            # change the journal independently.
+            # upstream to mutate either store. Read and validate the persisted
+            # identity only after both leases are owned, eliminating the cron
+            # startup TOCTOU window.
             with admission_module.admit_operation(
                 graph_path=db_path,
                 cache_path=Path(db_path).parent / "embedding-cache.db",
                 model=config.embedding_model,
                 embedding_dim=dimension,
                 vec_dim=dimension,
-                epoch=epoch,
                 supervisor=supervisor,
                 embedding_generation=supervisor.generation,
                 exclusive=True,
                 cache_exclusive=True,
                 deadline=1.5,
             ):
+                _runtime_epoch(db_path, config.embedding_model, dimension)
                 conn = sqlite3.connect(db_path)
                 try:
                     locking_module.guard_sqlite_journal(conn)

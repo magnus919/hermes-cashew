@@ -1,0 +1,540 @@
+"""Read-only integrity inspection for existing Cashew profiles.
+
+This module deliberately stops at an audit boundary.  Cashew's currently
+available repair helpers are broad, default-service based, and do not expose a
+stable connection-aware transaction contract.  ``apply_integrity_repairs``
+therefore returns a structured unavailable result until upstream provides that
+contract; it never mutates a profile as a side effect of inspection.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import pathlib
+import re
+import shutil
+import sqlite3
+import struct
+import tempfile
+from collections import Counter
+from contextlib import contextmanager
+from typing import Any, Iterable, Iterator, cast
+
+from .admission import admit_operation
+from .locking import open_readonly_verified, verify_readonly_profile
+
+logger = logging.getLogger(__name__)
+
+_REQUIRED_TABLES = {
+    "thought_nodes",
+    "embeddings",
+    "derivation_edges",
+    "hermes_provider_meta",
+}
+_REQUIRED_NODE_COLUMNS = {
+    "id",
+    "content",
+    "node_type",
+    "domain",
+    "timestamp",
+    "access_count",
+    "last_accessed",
+    "source_file",
+    "decayed",
+    "metadata",
+    "last_updated",
+    "mood_state",
+    "permanent",
+    "tags",
+    "referent_time",
+}
+_REQUIRED_EMBEDDING_COLUMNS = {"node_id", "vector", "model", "updated_at"}
+_REQUIRED_EDGE_COLUMNS = {"parent_id", "child_id", "weight", "reasoning", "timestamp"}
+_REQUIRED_META = {"embedding_model", "embedding_dim", "vec_dim", "maintenance_epoch"}
+
+
+def _tables(conn: sqlite3.Connection) -> set[str]:
+    return {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    }
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    # Table names are selected from sqlite_master or fixed constants above.
+    return {
+        str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+
+
+def _safe_source_id(conn: sqlite3.Connection) -> str | None:
+    try:
+        value = conn.execute("SELECT sqlite_source_id()").fetchone()
+    except sqlite3.Error:
+        return None
+    return None if not value else str(value[0])
+
+
+@contextmanager
+def _source_snapshot(path: pathlib.Path) -> Iterator[pathlib.Path]:
+    """Copy a profile and its live sidecars before opening any SQLite handle.
+
+    SQLite may update reader marks in a WAL ``-shm`` file even for a query-only
+    connection.  Auditing a private copy keeps the operator's profile, WAL,
+    and SHM bytes untouched while preserving the WAL state for inspection.
+    Cooperative writers are excluded by the caller's shared maintenance lease.
+    """
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    with tempfile.TemporaryDirectory(prefix="hermes-cashew-audit-") as directory:
+        snapshot = pathlib.Path(directory) / "profile.db"
+        shutil.copy2(path, snapshot)
+        for suffix in ("-wal", "-shm"):
+            sidecar = pathlib.Path(f"{path}{suffix}")
+            if sidecar.exists():
+                shutil.copy2(sidecar, pathlib.Path(f"{snapshot}{suffix}"))
+        yield snapshot
+
+
+def _provenance(conn: sqlite3.Connection, journal_mode: str) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "sqlite_version": sqlite3.sqlite_version,
+        "sqlite_source_id": _safe_source_id(conn),
+        "journal_mode": journal_mode,
+        "user_version": None,
+        "provider_model": None,
+        "provider_embedding_dim": None,
+        "provider_vec_dim": None,
+        "provider_epoch": None,
+    }
+    try:
+        result["user_version"] = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    except (TypeError, ValueError, sqlite3.Error):
+        pass
+    if "hermes_provider_meta" not in _tables(conn):
+        return result
+    try:
+        rows = conn.execute(
+            "SELECT key, value FROM hermes_provider_meta WHERE key IN "
+            "('embedding_model','embedding_dim','vec_dim','maintenance_epoch')"
+        ).fetchall()
+    except sqlite3.Error:
+        return result
+    meta = {str(key): value for key, value in rows}
+    result["provider_model"] = meta.get("embedding_model")
+    result["provider_epoch"] = meta.get("maintenance_epoch")
+    for key, output_key in (
+        ("embedding_dim", "provider_embedding_dim"),
+        ("vec_dim", "provider_vec_dim"),
+    ):
+        try:
+            result[output_key] = int(meta[key])
+        except (KeyError, TypeError, ValueError):
+            result[output_key] = None
+    return result
+
+
+def _add_reason(reasons: Counter[str], reason: str, count: int = 1) -> None:
+    if reason and count > 0:
+        reasons[reason] += count
+
+
+def _finite_vector(
+    blob: object, expected_dim: int | None
+) -> tuple[str | None, int | None]:
+    """Return a bounded reason and decoded dimension without raising."""
+    if not isinstance(blob, (bytes, bytearray, memoryview)):
+        return "embedding_blob_invalid", None
+    raw = bytes(blob)
+    if len(raw) == 0 or len(raw) % 4:
+        return "embedding_blob_invalid", None
+    dim = len(raw) // 4
+    if dim > 16384:
+        return "embedding_dimension_invalid", dim
+    if expected_dim is not None and dim != expected_dim:
+        return "embedding_dimension_mismatch", dim
+    try:
+        values = struct.unpack(f"<{dim}f", raw)
+    except (struct.error, ValueError):
+        return "embedding_blob_invalid", dim
+    if not all(math.isfinite(value) for value in values):
+        return "embedding_nonfinite", dim
+    if math.sqrt(sum(value * value for value in values)) <= 1e-12:
+        return "embedding_zero_norm", dim
+    return None, dim
+
+
+def _load_vec_readonly(conn: sqlite3.Connection) -> bool:
+    """Load only the virtual-table module; the database remains query-only."""
+    try:
+        conn.enable_load_extension(True)
+        try:
+            import sqlite_vec
+
+            sqlite_vec.load(conn)
+        except (ImportError, AttributeError):
+            conn.load_extension("vec0")
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
+
+
+def _inspect_vec(
+    conn: sqlite3.Connection,
+    ordinary_ids: set[str],
+    expected_dim: int | None,
+    reasons: Counter[str],
+) -> dict[str, Any]:
+    vec = conn.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type='table' AND name='vec_embeddings'"
+    ).fetchone()
+    if vec is None:
+        _add_reason(reasons, "vec_index_missing", len(ordinary_ids))
+        return {
+            "available": False,
+            "entries": 0,
+            "missing_entries": len(ordinary_ids),
+            "stale_entries": 0,
+            "declared_dimension": None,
+        }
+    if not _load_vec_readonly(conn):
+        _add_reason(reasons, "vec_index_unverifiable")
+        return {
+            "available": False,
+            "entries": None,
+            "missing_entries": None,
+            "stale_entries": None,
+            "declared_dimension": None,
+        }
+    sql = str(vec[1] or "")
+    match = re.search(r"(?:float|int8)\s*\[\s*(\d+)\s*\]", sql, re.IGNORECASE)
+    declared_dim = int(match.group(1)) if match else None
+    if declared_dim is None:
+        _add_reason(reasons, "vec_dimension_unavailable")
+    elif expected_dim is not None and declared_dim != expected_dim:
+        _add_reason(reasons, "vec_dimension_mismatch")
+    try:
+        rows = conn.execute(
+            "SELECT node_id, LENGTH(embedding) FROM vec_embeddings"
+        ).fetchall()
+    except sqlite3.Error:
+        _add_reason(reasons, "vec_index_unverifiable")
+        return {
+            "available": False,
+            "entries": None,
+            "missing_entries": None,
+            "stale_entries": None,
+            "declared_dimension": declared_dim,
+        }
+    vec_ids = {str(row[0]) for row in rows if row[0] is not None}
+    missing = ordinary_ids - vec_ids
+    stale = vec_ids - ordinary_ids
+    _add_reason(reasons, "vec_entry_missing", len(missing))
+    _add_reason(reasons, "vec_entry_stale", len(stale))
+    invalid_lengths = sum(
+        1
+        for _, length in rows
+        if length is None
+        or expected_dim is not None
+        and int(length) != expected_dim * 4
+    )
+    _add_reason(reasons, "vec_blob_dimension_mismatch", invalid_lengths)
+    return {
+        "available": True,
+        "entries": len(rows),
+        "missing_entries": len(missing),
+        "stale_entries": len(stale),
+        "declared_dimension": declared_dim,
+    }
+
+
+def _graph_findings(conn: sqlite3.Connection, reasons: Counter[str]) -> dict[str, int]:
+    """Report referential graph defects without invoking upstream mutators."""
+    try:
+        orphan_edges = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM derivation_edges e "
+                "LEFT JOIN thought_nodes p ON p.id=e.parent_id "
+                "LEFT JOIN thought_nodes c ON c.id=e.child_id "
+                "WHERE p.id IS NULL OR c.id IS NULL"
+            ).fetchone()[0]
+        )
+        self_edges = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM derivation_edges WHERE parent_id=child_id"
+            ).fetchone()[0]
+        )
+    except sqlite3.Error:
+        _add_reason(reasons, "graph_unverifiable")
+        return {"orphan_edges": 0, "self_edges": 0}
+    _add_reason(reasons, "orphan_edge", orphan_edges)
+    _add_reason(reasons, "self_edge", self_edges)
+    return {"orphan_edges": orphan_edges, "self_edges": self_edges}
+
+
+def _inspect_profile(conn: sqlite3.Connection, journal_mode: str) -> dict[str, Any]:
+    reasons: Counter[str] = Counter()
+    provenance = _provenance(conn, journal_mode)
+    tables = _tables(conn)
+    missing_tables = sorted(_REQUIRED_TABLES - tables)
+    _add_reason(reasons, "schema_table_missing", len(missing_tables))
+    if provenance["user_version"] != 3:
+        _add_reason(reasons, "schema_version_unsupported")
+
+    missing_columns: dict[str, list[str]] = {}
+    for table, required in (
+        ("thought_nodes", _REQUIRED_NODE_COLUMNS),
+        ("embeddings", _REQUIRED_EMBEDDING_COLUMNS),
+        ("derivation_edges", _REQUIRED_EDGE_COLUMNS),
+    ):
+        if table not in tables:
+            continue
+        missing = sorted(required - _columns(conn, table))
+        if missing:
+            missing_columns[table] = missing
+            _add_reason(reasons, "schema_column_missing", len(missing))
+    try:
+        meta_keys = {
+            str(row[0])
+            for row in conn.execute("SELECT key FROM hermes_provider_meta").fetchall()
+        }
+    except sqlite3.Error:
+        meta_keys = set()
+    missing_meta = (
+        sorted(_REQUIRED_META - meta_keys)
+        if "hermes_provider_meta" in tables
+        else sorted(_REQUIRED_META)
+    )
+    _add_reason(reasons, "provider_identity_missing", len(missing_meta))
+
+    counts: Counter[str] = Counter()
+    vec_report: dict[str, Any] = {
+        "available": False,
+        "entries": None,
+        "missing_entries": None,
+        "stale_entries": None,
+        "declared_dimension": None,
+    }
+    graph_report = {"orphan_edges": 0, "self_edges": 0}
+    if not missing_tables and not missing_columns:
+        try:
+            integrity = str(
+                conn.execute("PRAGMA integrity_check").fetchone()[0]
+            ).lower()
+        except sqlite3.Error:
+            integrity = "unavailable"
+        if integrity != "ok":
+            _add_reason(reasons, "sqlite_integrity_failed")
+
+        expected_dim = provenance["provider_embedding_dim"]
+        expected_model = provenance["provider_model"]
+        rows = conn.execute(
+            "SELECT e.node_id, e.vector, e.model FROM embeddings e"
+        ).fetchall()
+        ordinary_ids = {str(row[0]) for row in rows if row[0] is not None}
+        counts["embeddings"] = len(rows)
+        for node_id, blob, model in rows:
+            reason, _ = _finite_vector(blob, expected_dim)
+            _add_reason(reasons, reason or "", 1)
+            if expected_model is None or model != expected_model:
+                _add_reason(reasons, "embedding_model_mismatch")
+            if node_id is None:
+                _add_reason(reasons, "embedding_node_id_invalid")
+        counts["orphan_embeddings"] = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM embeddings e "
+                "LEFT JOIN thought_nodes n ON n.id=e.node_id WHERE n.id IS NULL"
+            ).fetchone()[0]
+        )
+        counts["nodes_without_embeddings"] = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM thought_nodes n "
+                "LEFT JOIN embeddings e ON e.node_id=n.id WHERE e.node_id IS NULL"
+            ).fetchone()[0]
+        )
+        _add_reason(reasons, "orphan_embedding", counts["orphan_embeddings"])
+        _add_reason(
+            reasons, "node_embedding_missing", counts["nodes_without_embeddings"]
+        )
+        try:
+            counts["permanent_and_decayed"] = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM thought_nodes WHERE COALESCE(permanent,0) != 0 "
+                    "AND COALESCE(decayed,0) != 0"
+                ).fetchone()[0]
+            )
+            counts["permanent_core_nodes"] = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM thought_nodes WHERE node_type='core_memory' "
+                    "AND COALESCE(permanent,0) != 0"
+                ).fetchone()[0]
+            )
+        except sqlite3.Error:
+            counts["permanent_and_decayed"] = 0
+            counts["permanent_core_nodes"] = 0
+            _add_reason(reasons, "permanence_unverifiable")
+        _add_reason(reasons, "permanent_and_decayed", counts["permanent_and_decayed"])
+        _add_reason(reasons, "permanent_core_node", counts["permanent_core_nodes"])
+        vec_report = _inspect_vec(conn, ordinary_ids, expected_dim, reasons)
+        graph_report = _graph_findings(conn, reasons)
+    else:
+        counts["embeddings"] = 0
+        counts["orphan_embeddings"] = 0
+        counts["nodes_without_embeddings"] = 0
+
+    # Historical merge intent cannot be reconstructed from the current schema.
+    uncertainty = ["historical_consolidation"]
+    return {
+        "provenance": provenance,
+        "schema": {
+            "tables": sorted(tables),
+            "missing_tables": missing_tables,
+            "missing_columns": missing_columns,
+            "missing_provider_keys": missing_meta,
+        },
+        "counts": dict(counts),
+        "vector_index": vec_report,
+        "graph": graph_report,
+        "uncertainty": uncertainty,
+        "reasons": dict(sorted(reasons.items())),
+    }
+
+
+def _unavailable(path: pathlib.Path, reason: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "status": "unavailable",
+        "read_only": True,
+        "mutated": False,
+        "path": str(path),
+        "provenance": {},
+        "counts": {},
+        "vector_index": {},
+        "graph": {},
+        "uncertainty": [],
+        "reasons": {reason: 1},
+        "repair": {
+            "status": "unavailable",
+            "reason": "stable_targeted_repair_api_unavailable",
+        },
+    }
+
+
+def audit_integrity(db_path: str | pathlib.Path) -> dict[str, Any]:
+    """Return a bounded, query-only integrity report for an existing profile."""
+    path = pathlib.Path(db_path).resolve(strict=False)
+    try:
+        with admit_operation(graph_path=path, deadline=5.0):
+            try:
+                with _source_snapshot(path) as snapshot:
+                    try:
+                        conn, journal_mode = open_readonly_verified(snapshot)
+                    except Exception as exc:
+                        del exc
+                        return _unavailable(path, "readonly_open_failed")
+                    try:
+                        profile_error: str | None = None
+                        try:
+                            verify_readonly_profile(conn)
+                        except Exception as exc:
+                            profile_error = type(exc).__name__
+                        report = _inspect_profile(conn, journal_mode)
+                        if profile_error is not None:
+                            reasons = cast(dict[str, Any], report["reasons"])
+                            reasons["profile_verification_failed"] = 1
+                            report["reasons"] = dict(reasons)
+                    except Exception as exc:
+                        logger.warning(
+                            "Cashew integrity audit could not inspect profile",
+                            exc_info=True,
+                        )
+                        del exc
+                        return _unavailable(path, "audit_failed")
+                    finally:
+                        conn.close()
+            except Exception as exc:
+                del exc
+                return _unavailable(path, "readonly_snapshot_failed")
+    except Exception as exc:
+        del exc
+        return _unavailable(path, "readonly_admission_failed")
+
+    report["schema_version"] = 1
+    report["status"] = "ok" if not report["reasons"] else "findings"
+    report["read_only"] = True
+    report["mutated"] = False
+    report["path"] = str(path)
+    report["repair"] = {
+        "status": "unavailable",
+        "reason": "stable_targeted_repair_api_unavailable",
+        "explicit_apply_required": True,
+    }
+    return report
+
+
+def apply_integrity_repairs(
+    db_path: str | pathlib.Path,
+    *,
+    confirm: bool = False,
+    backup_dir: str | pathlib.Path | None = None,
+) -> dict[str, Any]:
+    """Return a structured refusal until upstream exposes safe targeted repair.
+
+    ``db_path`` and ``backup_dir`` are accepted to make the future operator
+    contract explicit.  They are intentionally not opened or created here.
+    """
+    del db_path, backup_dir
+    return {
+        "schema_version": 1,
+        "status": "unavailable",
+        "mutated": False,
+        "confirmed": bool(confirm),
+        "reason": "stable_targeted_repair_api_unavailable",
+        "message": (
+            "Cashew repair remains unavailable until upstream provides a "
+            "connection-aware targeted repair API with atomic ordinary/vec writes."
+        ),
+        "repairs": [],
+    }
+
+
+# Short operator-friendly names; the explicit names remain canonical for callers.
+audit = audit_integrity
+apply = apply_integrity_repairs
+
+
+def _main(argv: Iterable[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Audit an existing Cashew database safely."
+    )
+    parser.add_argument("db_path", type=pathlib.Path)
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Report repair availability (never implicit).",
+    )
+    parser.add_argument(
+        "--confirm", action="store_true", help="Confirm an explicit repair request."
+    )
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    report = (
+        apply_integrity_repairs(args.db_path, confirm=args.confirm)
+        if args.apply
+        else audit_integrity(args.db_path)
+    )
+    print(json.dumps(report, sort_keys=True, indent=2))
+    return 0 if report.get("status") in {"ok", "findings", "unavailable"} else 1
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(_main())

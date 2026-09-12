@@ -5,6 +5,10 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
+import os
+import sqlite3
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -46,6 +50,50 @@ def _install_cron_stub() -> list[dict[str, Any]]:
     return jobs
 
 
+def _install_bounded_runtime_fakes(implementation: Path, marker: Path) -> None:
+    """Replace only model/sleep dependencies so the generated script can run offline."""
+    (implementation / "embedding_process.py").write_text(
+        "from pathlib import Path\n"
+        "import os\n"
+        "class EmbeddingSupervisor:\n"
+        "    def __init__(self, **_kwargs):\n"
+        "        self.dimension = 384\n"
+        "        self.generation = 'clean-flat-smoke'\n"
+        "    def start(self):\n"
+        "        return None\n"
+        "    def close(self):\n"
+        "        Path(os.environ['CASHEW_CRON_SMOKE_MARKER']).write_text('closed')\n"
+    )
+    (implementation / "sleep_refactor.py").write_text(
+        "from pathlib import Path\n"
+        "import json\n"
+        "import os\n"
+        "def run_sleep_cycle(**kwargs):\n"
+        "    Path(os.environ['CASHEW_CRON_SMOKE_MARKER']).write_text('ran')\n"
+        "    return {'status': 'ok', 'db_path': kwargs['db_path']}\n"
+    )
+    marker.unlink(missing_ok=True)
+
+
+def _seed_runtime_identity(hermes_home: Path) -> Path:
+    db_path = hermes_home / "cashew" / "brain.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE hermes_provider_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        conn.executemany(
+            "INSERT INTO hermes_provider_meta VALUES (?, ?)",
+            [
+                ("embedding_model", "thenlper/gte-large"),
+                ("embedding_dim", "384"),
+                ("vec_dim", "384"),
+                ("maintenance_epoch", "1"),
+            ],
+        )
+    return db_path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("flat_root", type=Path)
@@ -74,7 +122,30 @@ def main() -> int:
     compile(source, str(script), "exec")
     if [job.get("script") for job in jobs] != ["cashew-sleep-cycle.py"]:
         raise RuntimeError(f"unexpected cron registrations: {jobs!r}")
-    print(f"flat loader and cron registration verified from {flat_root}")
+    runtime_marker = hermes_home / "cron-runtime-marker"
+    implementation = flat_root / "plugins" / "memory" / "cashew"
+    _install_bounded_runtime_fakes(implementation, runtime_marker)
+    _seed_runtime_identity(hermes_home)
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=hermes_home.parent,
+        env={
+            **os.environ,
+            "HERMES_HOME": str(hermes_home),
+            "PYTHONPATH": "",
+            "CASHEW_CRON_SMOKE_MARKER": str(runtime_marker),
+        },
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=5,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"generated cron script failed: {completed.stderr}")
+    result = json.loads(completed.stdout)
+    if result.get("status") != "ok" or runtime_marker.read_text() != "closed":
+        raise RuntimeError(f"generated cron runtime did not complete: {result!r}")
+    print(f"flat loader and cron runtime verified from {flat_root}")
     return 0
 
 

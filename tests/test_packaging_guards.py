@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -123,3 +125,34 @@ def test_distribution_guard_rejects_runtime_and_link_contamination(
 
     with pytest.raises(ValueError, match=expected):
         verifier.verify_distribution(artifact)
+
+
+def test_clean_flat_smoke_executes_generated_cron_runtime(tmp_path: Path) -> None:
+    """The smoke runs the generated subprocess, not merely its registration."""
+    flat_root = tmp_path / "profile" / "plugins" / "cashew"
+    shutil.copytree(
+        ROOT,
+        flat_root,
+        ignore=shutil.ignore_patterns(
+            ".git", ".venv", "__pycache__", "dist", "build", "graphify-out"
+        ),
+    )
+    hermes_home = tmp_path / "profile"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/smoke-flat-install.py"),
+            str(flat_root),
+            str(hermes_home),
+        ],
+        capture_output=True,
+        check=False,
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": ""},
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "flat loader and cron runtime verified" in result.stdout

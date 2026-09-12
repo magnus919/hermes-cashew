@@ -125,7 +125,9 @@ def test_ci_uses_scoped_managed_python_for_sqlite_baseline() -> None:
     tests = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
     release = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
     test_install = next(
-        step for step in tests["jobs"]["test"]["steps"] if step.get("name") == "Install"
+        step
+        for step in tests["jobs"]["test-python"]["steps"]
+        if step.get("name") == "Install"
     )
     assert test_install["env"] == expected_env
     assert (
@@ -167,9 +169,26 @@ def test_ci_uses_scoped_managed_python_for_sqlite_baseline() -> None:
 
 def test_ci_covers_declared_minimum_and_current_python() -> None:
     workflow = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
-    matrix = workflow["jobs"]["test"]["strategy"]["matrix"]
+    matrix = workflow["jobs"]["test-python"]["strategy"]["matrix"]
     assert matrix["python"] == ["3.10.19", "3.12.11"]
-    assert workflow["jobs"]["test"]["strategy"]["fail-fast"] is False
+    assert workflow["jobs"]["test-python"]["strategy"]["fail-fast"] is False
+    assert (
+        workflow["jobs"]["test-python"]["name"] == "Test (Python ${{ matrix.python }})"
+    )
+    assert workflow["jobs"]["test"]["name"] == "test"
+    assert workflow["jobs"]["test"]["needs"] == "test-python"
+    assert workflow["jobs"]["test"]["if"] == "always()"
+    assert workflow["jobs"]["wheel-smoke"]["needs"] == "test"
+
+
+def test_ci_matrix_coverage_artifacts_have_unique_names() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
+    upload = next(
+        step
+        for step in workflow["jobs"]["test-python"]["steps"]
+        if step.get("name") == "Upload coverage report"
+    )
+    assert upload["with"]["name"] == "coverage-py${{ matrix.python }}"
 
 
 def test_droid_tag_uses_the_minimum_oidc_permission_for_its_pinned_action() -> None:

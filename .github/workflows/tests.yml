@@ -14,7 +14,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  test-python:
+    name: Test (Python ${{ matrix.python }})
     # Use self-hosted runner for same-repo PRs and pushes; GitHub-hosted for fork PRs
     # (fork PRs on self-hosted runners are a security risk — arbitrary code execution)
     runs-on: ${{ fromJSON(github.event.pull_request.head.repo.fork && '["ubuntu-latest"]' || '["self-hosted","linux","x64","hermes-cashew","docker"]') }}
@@ -86,7 +87,7 @@ jobs:
       - name: Upload coverage report
         uses: actions/upload-artifact@v7
         with:
-          name: coverage
+          name: coverage-py${{ matrix.python }}
           path: coverage.xml
 
       - name: Upload coverage to Codecov
@@ -113,6 +114,24 @@ jobs:
           echo "Total elapsed time: ${ELAPSED}s (test job only)"
           echo "Install: uv sync --frozen --extra dev"
           echo "Optimizations: locked uv environment, complete pytest failure report"
+
+  # Keep the historical required-check context stable while the actual test
+  # workers fan out by Python version. `if: always()` converts any cancelled,
+  # skipped, or failed matrix result into a visible failure for branch policy.
+  test:
+    name: test
+    needs: test-python
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all supported Python workers to pass
+        env:
+          MATRIX_RESULT: ${{ needs.test-python.result }}
+        run: |
+          test "$MATRIX_RESULT" = "success" || {
+            echo "::error::supported Python matrix result: $MATRIX_RESULT"
+            exit 1
+          }
 
   wheel-smoke:
     # Same fork-conditional as test job above

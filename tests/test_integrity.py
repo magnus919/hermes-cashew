@@ -217,6 +217,47 @@ def test_audit_deadline_is_explicitly_incomplete(tmp_path: Path) -> None:
     assert report["reasons"]["audit_deadline"] >= 1
 
 
+def test_audit_installs_deadline_before_profile_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "verify-deadline.db"
+    _create_profile(path)
+    observed: list[bool] = []
+    real_open = integrity.open_readonly_verified
+
+    class _TrackingConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        def set_progress_handler(self, callback, interval) -> None:
+            observed.append(callback is not None and interval == 1000)
+            self._connection.set_progress_handler(callback, interval)
+
+        def close(self) -> None:
+            self._connection.close()
+
+    def open_tracking(snapshot: Path):
+        connection, mode = real_open(snapshot)
+        return _TrackingConnection(connection), mode
+
+    def verify_tracking(connection, *, budget):
+        assert any(observed)
+        budget.incomplete_reasons.add("audit_deadline")
+
+    monkeypatch.setattr(integrity, "open_readonly_verified", open_tracking)
+    monkeypatch.setattr(integrity, "verify_readonly_profile", verify_tracking)
+    monkeypatch.setattr(
+        integrity,
+        "_inspect_profile",
+        lambda _conn, _mode, _budget: {"reasons": {"audit_deadline": 1}},
+    )
+
+    report = audit_integrity(path)
+
+    assert report["status"] == "audit_incomplete"
+    assert any(observed)
+
+
 def test_audit_loaded_vec_parity_is_read_only(tmp_path: Path) -> None:
     path = tmp_path / "vec.db"
     _create_profile(path)
@@ -294,6 +335,25 @@ def test_audit_vec_unavailable_fallback_preserves_files(
     assert report["vector_index"]["available"] is False
     assert report["reasons"]["vec_index_unverifiable"] == 1
     assert _snapshot(path) == before
+
+
+def test_audit_plain_table_named_vec_is_unverifiable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "plain-vec.db"
+    _create_profile(path)
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE vec_embeddings (node_id TEXT, embedding BLOB)")
+    conn.commit()
+    conn.close()
+    # A successful module load must not make an ordinary table look like vec0.
+    monkeypatch.setattr(integrity, "_load_vec_readonly", lambda conn: True)
+
+    report = audit_integrity(path)
+
+    assert report["vector_index"]["available"] is False
+    assert report["vector_index"]["scan_complete"] is False
+    assert report["reasons"]["vec_index_unverifiable"] == 1
 
 
 def test_audit_vec_unavailable_wal_keeps_sidecars_unchanged(

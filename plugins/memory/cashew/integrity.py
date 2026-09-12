@@ -400,6 +400,18 @@ def _inspect_vec(
             "declared_dimension": None,
             "scan_complete": True,
         }
+    sql = str(vec[1] or "")
+    if re.search(r"\bUSING\s+vec0\b", sql, re.IGNORECASE) is None:
+        budget.scans["vec_index"] = False
+        _add_reason(reasons, "vec_index_unverifiable")
+        return {
+            "available": False,
+            "entries": None,
+            "missing_entries": None,
+            "stale_entries": None,
+            "declared_dimension": None,
+            "scan_complete": False,
+        }
     if not _load_vec_readonly(conn):
         budget.scans["vec_index"] = False
         _add_reason(reasons, "vec_index_unverifiable")
@@ -411,7 +423,6 @@ def _inspect_vec(
             "declared_dimension": None,
             "scan_complete": False,
         }
-    sql = str(vec[1] or "")
     match = re.search(r"(?:float|int8)\s*\[\s*(\d+)\s*\]", sql, re.IGNORECASE)
     declared_dim = int(match.group(1)) if match else None
     if declared_dim is None:
@@ -776,9 +787,12 @@ def audit_integrity(
                         del exc
                         return _unavailable(path, "readonly_open_failed")
                     try:
-                        conn.set_progress_handler(budget.progress, 1000)
                         profile_error: str | None = None
                         try:
+                            # Install the deadline callback before the verifier's
+                            # integrity_check and bounded scans, so those SQLite
+                            # operations cannot outrun the shared audit budget.
+                            conn.set_progress_handler(budget.progress, 1000)
                             verify_readonly_profile(conn, budget=budget)
                         except _AuditBudgetError as exc:
                             return _incomplete(path, budget, exc.reason)

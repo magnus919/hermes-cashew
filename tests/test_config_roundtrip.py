@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import dataclasses
+import errno
 import json
 import multiprocessing
 import os
@@ -484,14 +485,33 @@ def test_save_config_replaces_atomically_and_preserves_target_permissions(
     assert lock_path.stat().st_ino == original_lock_inode
 
 
-def test_save_config_cleans_temporary_file_when_directory_fsync_fails(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("err", (errno.EINVAL, errno.ENOTSUP, errno.EPERM))
+def test_save_config_allows_unsupported_directory_fsync_after_replacement(
+    tmp_path, monkeypatch, caplog, err
 ):
+    path = tmp_path / "cashew.json"
+    original_fsync = config_module.os.fsync
+
+    def reject_directory_fsync(descriptor):
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError(err, "directory fsync unsupported")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(config_module.os, "fsync", reject_directory_fsync)
+
+    save_config({"recall_k": 8}, tmp_path)
+
+    assert json.loads(path.read_text())["recall_k"] == 8
+    assert "Directory fsync is unsupported" in caplog.text
+    assert not list(tmp_path.glob(".cashew.json.*.tmp"))
+
+
+def test_save_config_reports_real_directory_fsync_failure(tmp_path, monkeypatch):
     path = tmp_path / "cashew.json"
     monkeypatch.setattr(
         config_module,
         "_fsync_directory",
-        lambda _directory: (_ for _ in ()).throw(OSError("fsync failed")),
+        lambda _directory: (_ for _ in ()).throw(OSError(errno.EIO, "fsync failed")),
     )
 
     with pytest.raises(OSError, match="fsync failed"):

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import errno
 import json
 import logging
 import math
@@ -328,7 +329,16 @@ def _fsync_directory(directory: pathlib.Path) -> None:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     directory_fd = os.open(directory, flags)
     try:
-        os.fsync(directory_fd)
+        try:
+            os.fsync(directory_fd)
+        except OSError as exc:
+            if exc.errno not in {errno.EINVAL, errno.ENOTSUP, errno.EPERM}:
+                raise
+            logger.warning(
+                "Directory fsync is unsupported for %s; configuration replacement "
+                "completed but directory-entry durability is filesystem-dependent",
+                directory,
+            )
     finally:
         os.close(directory_fd)
 

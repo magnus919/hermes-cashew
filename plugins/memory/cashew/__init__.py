@@ -1908,12 +1908,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         self._prefetch_pending_request is None
                         and not self._shutdown_started.is_set()
                     ):
-                        # Exit an idle worker so the provider owns no thread
-                        # between requests. A bounded wait also closes the
-                        # enqueue-versus-idle-exit race under the same lock.
-                        if not self._prefetch_condition.wait(timeout=0.1):
-                            if self._prefetch_pending_request is None:
-                                return
+                        # Keep the single provider-owned daemon alive until
+                        # shutdown. Retiring after an idle timeout would leave
+                        # a producer able to publish a pending request between
+                        # the timeout check and worker finalization.
+                        self._prefetch_condition.wait()
                     if (
                         self._shutdown_started.is_set()
                         and self._prefetch_pending_request is None
@@ -2001,12 +2000,23 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 _METRICS.record_prefetch_cancelled()
 
     def _prefetch_request_is_current(self, identity: _PrefetchRequestIdentity) -> bool:
-        """Check request identity without holding the lock during work."""
+        """Check request and complete runtime identity without slow work."""
         with self._sync_state_lock:
-            return (
-                not self._shutdown_started.is_set()
-                and self._prefetch_latest_identity == identity
+            if (
+                self._shutdown_started.is_set()
+                or self._prefetch_latest_identity != identity
+                or self._config is None
+                or self._db_path is None
+            ):
+                return False
+            current_identity = self._prefetch_request_identity(
+                session_id=identity.session_id,
+                generation=self._prefetch_generation,
+                domain=identity.domain,
+                tag=identity.tag,
+                exclude_tags=list(identity.exclude_tags),
             )
+            return current_identity == identity
 
     def _stage_prefetch_result(
         self,
@@ -2017,7 +2027,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         """Publish a warmup result only if its request is still current."""
         with self._sync_state_lock:
             current_identity = self._prefetch_request_identity(
-                session_id=self._session_id,
+                session_id=identity.session_id,
                 generation=self._prefetch_generation,
                 domain=identity.domain,
                 tag=identity.tag,

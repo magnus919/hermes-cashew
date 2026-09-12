@@ -367,8 +367,9 @@ def test_prefetch_half_state_skips_warm_cache():
 
 
 def test_queue_prefetch_dispatches_tracked_background_thread(tmp_path, monkeypatch):
-    """queue_prefetch tracks its daemon until the warmup exits."""
+    """queue_prefetch tracks one persistent daemon until shutdown."""
     provider = _provider_with_mock_config(tmp_path)
+    provider._sync_queue = queue.Queue()
     started = threading.Event()
     release = threading.Event()
 
@@ -387,8 +388,13 @@ def test_queue_prefetch_dispatches_tracked_background_thread(tmp_path, monkeypat
     assert threads[0].daemon
 
     release.set()
-    threads[0].join(timeout=1.0)
-    assert not threads[0].is_alive()
+    deadline = time.monotonic() + 1.0
+    while (
+        provider._prefetch_active_identity is not None and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
+    assert threads[0].is_alive()
+    provider.shutdown()
     assert provider._prefetch_threads == set()
 
 
@@ -397,6 +403,7 @@ def test_queue_prefetch_burst_has_one_active_and_one_latest_pending(
 ):
     """A burst coalesces behind one active worker and one latest request."""
     provider = _provider_with_mock_config(tmp_path)
+    provider._sync_queue = queue.Queue()
     started = threading.Event()
     release = threading.Event()
     calls: list[str] = []
@@ -431,12 +438,17 @@ def test_queue_prefetch_burst_has_one_active_and_one_latest_pending(
         assert len(provider._prefetch_threads) == 1
     release.set()
     worker = next(iter(provider._prefetch_threads))
-    worker.join(timeout=2.0)
+    deadline = time.monotonic() + 2.0
+    while (
+        provider._prefetch_active_identity is not None and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
 
-    assert not worker.is_alive()
+    assert worker.is_alive()
     assert max_active == 1
     assert calls == ["active request", "queued request 99"]
     assert _METRICS._snapshot()["prefetch_coalesced"] - before >= 99
+    provider.shutdown()
 
 
 def test_superseded_active_prefetch_skips_retrieval_after_cue_extraction(
@@ -444,6 +456,7 @@ def test_superseded_active_prefetch_skips_retrieval_after_cue_extraction(
 ):
     """An active request invalidated during cue extraction does no retrieval."""
     provider = _provider_with_mock_config(tmp_path)
+    provider._sync_queue = queue.Queue()
     provider._config.prefetch_cues = 1
     cue_started = threading.Event()
     release = threading.Event()
@@ -470,11 +483,56 @@ def test_superseded_active_prefetch_skips_retrieval_after_cue_extraction(
     release.set()
 
     deadline = time.monotonic() + 2.0
-    while provider._prefetch_threads and time.monotonic() < deadline:
-        next(iter(provider._prefetch_threads)).join(timeout=0.05)
+    while (
+        provider._prefetch_active_identity is not None and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
 
     assert retrieval_queries == ["current request"]
     assert _METRICS._snapshot()["prefetch_cancelled"] > cancelled_before
+    provider.shutdown()
+
+
+def test_active_prefetch_drops_result_after_runtime_identity_change(
+    tmp_path, monkeypatch
+):
+    """A config identity change prevents late active publication."""
+    provider = _provider_with_mock_config(tmp_path)
+    provider._config = CashewConfig()
+    provider._sync_queue = queue.Queue()
+    started = threading.Event()
+    release = threading.Event()
+    cancelled_before = _METRICS._snapshot()["prefetch_cancelled"]
+
+    def blocked_retrieval(**kwargs):
+        started.set()
+        assert release.wait(timeout=2.0)
+        return [SimpleNamespace(node_id="late")]
+
+    monkeypatch.setattr(
+        "core.retrieval.retrieve_recursive_bfs", blocked_retrieval, raising=False
+    )
+    monkeypatch.setattr(
+        provider,
+        "_enrich_results",
+        lambda node_ids, **kwargs: [{"id": node_ids[0], "content": "late"}],
+    )
+    provider.queue_prefetch("identity request")
+    assert started.wait(timeout=1.0)
+    with provider._sync_state_lock:
+        assert provider._config is not None
+        provider._config = dataclasses.replace(provider._config, recall_k=1)
+    release.set()
+
+    deadline = time.monotonic() + 2.0
+    while (
+        provider._prefetch_active_identity is not None and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
+
+    assert provider._prefetch_pending is None
+    assert _METRICS._snapshot()["prefetch_cancelled"] > cancelled_before
+    provider.shutdown()
 
 
 def test_queue_prefetch_rejects_new_worker_after_shutdown_starts(tmp_path):

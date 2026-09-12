@@ -96,17 +96,26 @@ def test_ci_and_contributor_docs_use_frozen_uv_lock() -> None:
         assert ".venv/bin/pytest" in workflow
         assert ".venv/bin/pytest -xvs" not in workflow
         assert "uv pip install --system" not in workflow
-        assert 'python-version: "3.12"' in workflow
         assert "scripts/verify-cashew-baseline.py" in workflow
         assert 'python-version: "3.11"' not in workflow
+    assert "python-version: ${{ matrix.setup }}" in tests_workflow
+    assert 'python-version: "3.12"' in release_workflow
     assert "uv sync --frozen --extra dev" in readme
     assert "uv sync --frozen --extra dev" in contributing
+    assert (
+        "uv run --frozen --extra dev python scripts/check-recursive-symlinks.py"
+        in contributing
+    )
     assert "--cov-fail-under=75" in tests_workflow
     tests_config = yaml.safe_load(tests_workflow)
     for job in tests_config["jobs"].values():
         assert "${{ runner.temp }}" not in " ".join(job.get("env", {}).values())
     assert 'WHEEL_SMOKE_VENV="$RUNNER_TEMP/' in tests_workflow
     assert 'FLAT_SMOKE_VENV="$RUNNER_TEMP/' in tests_workflow
+    assert 'SDIST_SMOKE_VENV="$RUNNER_TEMP/' in tests_workflow
+    assert "scripts/check-recursive-symlinks.py" in tests_workflow
+    assert "scripts/verify-distributions.py dist/*" in tests_workflow
+    assert "scripts/smoke-flat-install.py" in tests_workflow
 
 
 def test_ci_uses_scoped_managed_python_for_sqlite_baseline() -> None:
@@ -119,12 +128,22 @@ def test_ci_uses_scoped_managed_python_for_sqlite_baseline() -> None:
 
     tests = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
     release = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
+    test_install = next(
+        step
+        for step in tests["jobs"]["test-python"]["steps"]
+        if step.get("name") == "Install"
+    )
+    assert test_install["env"] == expected_env
+    assert (
+        'uv python install --managed-python "${{ matrix.python }}"'
+        in test_install["run"]
+    )
+    assert (
+        'uv sync --frozen --extra dev --managed-python --python "${{ matrix.python }}"'
+        in test_install["run"]
+    )
+
     managed_steps = (
-        next(
-            step
-            for step in tests["jobs"]["test"]["steps"]
-            if step.get("name") == "Install"
-        ),
         next(
             step
             for step in tests["jobs"]["wheel-smoke"]["steps"]
@@ -149,3 +168,74 @@ def test_ci_uses_scoped_managed_python_for_sqlite_baseline() -> None:
     tests_text = (ROOT / ".github/workflows/tests.yml").read_text()
     assert '.venv/bin/python -m venv --clear "$WHEEL_SMOKE_VENV"' in tests_text
     assert '.venv/bin/python -m venv --clear "$FLAT_SMOKE_VENV"' in tests_text
+    assert '.venv/bin/python -m venv --clear "$SDIST_SMOKE_VENV"' in tests_text
+
+
+def test_ci_covers_declared_minimum_and_current_python() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
+    matrix = workflow["jobs"]["test-python"]["strategy"]["matrix"]
+    assert matrix["include"] == [
+        {"setup": "3.10", "python": "3.10.19"},
+        {"setup": "3.12", "python": "3.12.11"},
+    ]
+    assert workflow["jobs"]["test-python"]["strategy"]["fail-fast"] is False
+    assert (
+        workflow["jobs"]["test-python"]["name"] == "Test (Python ${{ matrix.python }})"
+    )
+    assert workflow["jobs"]["test"]["name"] == "test"
+    assert workflow["jobs"]["test"]["needs"] == "test-python"
+    assert workflow["jobs"]["test"]["if"] == "always()"
+    assert workflow["jobs"]["test"]["steps"][0]["env"]["MATRIX_RESULT"] == (
+        "${{ needs['test-python'].result }}"
+    )
+    assert workflow["jobs"]["wheel-smoke"]["needs"] == "test"
+
+
+def test_ci_runs_runtime_tests_on_both_versions_and_quality_once() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
+    steps = workflow["jobs"]["test-python"]["steps"]
+    names = {
+        "Lint with ruff",
+        "Type check with mypy",
+        "Dead code detection with vulture",
+        "Duplicate code detection",
+        "Dead feature flag detection",
+        "Unused dependency detection with deptry",
+    }
+    by_name = {step["name"]: step for step in steps if "name" in step}
+    assert all(by_name[name]["if"] == "matrix.python == '3.12.11'" for name in names)
+    assert "if" not in by_name["Verify Cashew source and SQLite migration capability"]
+    assert (
+        "if"
+        not in by_name["AGENTS.md validation — verify install and test commands work"]
+    )
+    assert (
+        "if"
+        not in by_name[
+            "Run tests with coverage (capture log for offline-download scan)"
+        ]
+    )
+    assert "if" not in by_name["CI-03 — fail if embedding model was downloaded"]
+
+
+def test_ci_matrix_coverage_artifacts_have_unique_names() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
+    upload = next(
+        step
+        for step in workflow["jobs"]["test-python"]["steps"]
+        if step.get("name") == "Upload coverage report"
+    )
+    assert upload["with"]["name"] == "coverage-py${{ matrix.python }}"
+
+
+def test_droid_tag_uses_the_minimum_oidc_permission_for_its_pinned_action() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/droid.yml").read_text())
+    job = workflow["jobs"]["droid"]
+    assert job["permissions"] == {
+        "contents": "read",
+        "pull-requests": "write",
+        "issues": "write",
+        "actions": "read",
+        "id-token": "write",
+    }
+    assert "github.actor == github.repository_owner" in job["if"]

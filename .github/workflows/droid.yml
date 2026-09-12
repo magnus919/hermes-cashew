@@ -28,6 +28,8 @@ jobs:
       pull-requests: write
       issues: write
       actions: read
+      # Droid obtains an OIDC token for its owner-triggered review session.
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7

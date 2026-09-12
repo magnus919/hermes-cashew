@@ -579,7 +579,7 @@ def _raw_role_mapping(role: str) -> bool:
     except Exception:
         logger.debug(
             "Cashew auxiliary role check could not read the active Hermes profile; "
-            "using heuristic extraction"
+            "using heuristic extraction (reason=profile_config_unavailable)"
         )
         return False
     if not isinstance(raw, dict):
@@ -740,7 +740,8 @@ class _BoundedAuxiliaryModel:
                     reset_hermes_home_override(token)
             except Exception:
                 logger.warning(
-                    "Cashew auxiliary request failed; using heuristic extraction"
+                    "Cashew auxiliary request failed; using heuristic extraction "
+                    "(reason=request_failed)"
                 )
             finally:
                 _finish()
@@ -755,7 +756,8 @@ class _BoundedAuxiliaryModel:
         except Exception:
             _finish()
             logger.warning(
-                "Cashew auxiliary worker could not start; using heuristic extraction"
+                "Cashew auxiliary worker could not start; using heuristic extraction "
+                "(reason=worker_start_failed)"
             )
             return ""
         if not done.wait(_AUXILIARY_DEADLINE_SECONDS):
@@ -803,7 +805,8 @@ def resolve_model_fn(
             reset_hermes_home_override(token)
     except Exception:
         logger.debug(
-            "Cashew auxiliary profile scope is unavailable; using heuristic extraction"
+            "Cashew auxiliary profile scope is unavailable; using heuristic extraction "
+            "(reason=profile_scope_unavailable)"
         )
         return None
     if not enabled:

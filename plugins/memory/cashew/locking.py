@@ -28,6 +28,24 @@ class SQLiteWALUnsupportedError(RuntimeError):
     """An affected SQLite runtime cannot safely write an existing WAL DB."""
 
 
+_READONLY_SCAN_ROW_CAP = 100_000
+_READONLY_SCAN_BATCH = 256
+
+
+def _bounded_rows(cursor: object) -> list[tuple[object, ...]]:
+    """Materialize only a fixed-size validation result, never an unbounded scan."""
+    rows: list[tuple[object, ...]] = []
+    while True:
+        batch = cursor.fetchmany(_READONLY_SCAN_BATCH)  # type: ignore[attr-defined]
+        if not batch:
+            return rows
+        rows.extend(tuple(row) for row in batch)
+        if len(rows) > _READONLY_SCAN_ROW_CAP:
+            raise SQLiteWALUnsupportedError(
+                "read-only profile exceeds validation bound"
+            )
+
+
 def lock_path_for_db(db_path: str | pathlib.Path) -> pathlib.Path:
     """Return the canonical, stable advisory-lock path for a configured DB."""
     canonical_db = pathlib.Path(db_path).resolve(strict=False)
@@ -199,15 +217,18 @@ def verify_readonly_profile(conn: object) -> dict[str, str]:  # noqa: C901
         or not meta["embedding_model"]
     ):
         raise SQLiteWALUnsupportedError("read-only provider identity is invalid")
-    rows = conn.execute(
-        "SELECT node_id, model, LENGTH(vector) FROM embeddings"
-    ).fetchall()
+    rows = _bounded_rows(
+        conn.execute(
+            "SELECT node_id, model, LENGTH(vector) FROM embeddings "
+            f"LIMIT {_READONLY_SCAN_ROW_CAP + 1}"
+        )
+    )
     for node_id, model, byte_length in rows:
         if (
             not node_id
             or not model
             or byte_length is None
-            or int(byte_length) != expected_dim * 4
+            or int(str(byte_length)) != expected_dim * 4
         ):
             raise SQLiteWALUnsupportedError(
                 "read-only embedding identity is inconsistent"
@@ -257,16 +278,22 @@ def verify_readonly_profile(conn: object) -> dict[str, str]:  # noqa: C901
             try:
                 vec_ids = {
                     str(row[0])
-                    for row in conn.execute(
-                        "SELECT node_id FROM vec_embeddings"
-                    ).fetchall()
+                    for row in _bounded_rows(
+                        conn.execute(
+                            "SELECT node_id FROM vec_embeddings "
+                            f"LIMIT {_READONLY_SCAN_ROW_CAP + 1}"
+                        )
+                    )
                 }
                 ordinary_ids = {str(row[0]) for row in rows}
                 vec_lengths = {
                     str(row[0]): row[1]
-                    for row in conn.execute(
-                        "SELECT node_id, LENGTH(embedding) FROM vec_embeddings"
-                    ).fetchall()
+                    for row in _bounded_rows(
+                        conn.execute(
+                            "SELECT node_id, LENGTH(embedding) FROM vec_embeddings "
+                            f"LIMIT {_READONLY_SCAN_ROW_CAP + 1}"
+                        )
+                    )
                 }
             except Exception as exc:
                 raise SQLiteWALUnsupportedError(
@@ -275,7 +302,7 @@ def verify_readonly_profile(conn: object) -> dict[str, str]:  # noqa: C901
             if vec_ids != ordinary_ids:
                 raise SQLiteWALUnsupportedError("read-only vec and ordinary IDs differ")
             if any(
-                length is None or int(length) != expected_vec_dim * 4
+                length is None or int(str(length)) != expected_vec_dim * 4
                 for length in vec_lengths.values()
             ):
                 raise SQLiteWALUnsupportedError("read-only vec blob dimensions differ")

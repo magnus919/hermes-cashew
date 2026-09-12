@@ -303,6 +303,44 @@ def test_cleanup_thread_start_failure_still_releases_owner(
     replacement.close()
 
 
+def test_cleanup_thread_start_failure_during_startup_releases_owner(
+    tmp_path: Path,
+    child_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = _supervisor(tmp_path, model="startup-hang", startup_timeout=1.0)
+    start_errors: list[Exception] = []
+
+    def start() -> None:
+        try:
+            supervisor.start()
+        except Exception as exc:
+            start_errors.append(exc)
+
+    caller = threading.Thread(target=start)
+    caller.start()
+    deadline = time.monotonic() + 1.0
+    while supervisor._process is None and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert supervisor._process is not None
+
+    real_start = threading.Thread.start
+
+    def fail_cleanup_start(thread: threading.Thread) -> None:
+        if thread.name == "cashew-embedding-close":
+            raise RuntimeError("simulated cleanup thread start failure")
+        real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_cleanup_start)
+    supervisor.close(timeout=0.0)
+    caller.join(timeout=1.0)
+    assert not caller.is_alive()
+    assert start_errors
+    assert supervisor._owner_released.wait(timeout=1.0)
+    replacement = _supervisor(tmp_path)
+    replacement.close()
+
+
 def test_second_provider_fails_closed_even_with_identical_identity(
     tmp_path: Path, child_python: Path
 ) -> None:
@@ -388,6 +426,55 @@ def test_reaping_generation_blocks_replacement_until_exit_confirmed(
     assert supervisor._process is None
 
 
+def test_reaper_thread_start_failure_retains_owner_until_retry_reaps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = _supervisor(tmp_path, teardown_timeout=0.0)
+    release_reaper = threading.Event()
+
+    class DelayedProcess:
+        pid = 43210
+        returncode = -9
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            if timeout is not None:
+                raise subprocess.TimeoutExpired("fake-worker", timeout)
+            assert release_reaper.wait(timeout=2.0)
+            return self.returncode
+
+    process = DelayedProcess()
+    supervisor._process = process  # type: ignore[assignment]
+    monkeypatch.setattr(embedding_process.os, "killpg", lambda *_args: None)
+    real_start = threading.Thread.start
+
+    def fail_reaper_start(thread: threading.Thread) -> None:
+        if thread.name == "cashew-embedding-reaper":
+            raise RuntimeError("simulated reaper thread start failure")
+        real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_reaper_start)
+    supervisor.close(timeout=0.0)
+    assert supervisor._process is process
+    assert not supervisor._reaping
+    assert not supervisor._owner_released.is_set()
+    with pytest.raises(EmbeddingUnavailable) as raised:
+        _supervisor(tmp_path)
+    assert raised.value.reason is EmbeddingFailure.OWNED
+
+    monkeypatch.setattr(threading.Thread, "start", real_start)
+    supervisor.close(timeout=0.0)
+    assert supervisor._reaping
+    assert not supervisor._owner_released.is_set()
+    release_reaper.set()
+    assert supervisor._owner_released.wait(timeout=1.0)
+    assert supervisor._process is None
+    replacement = _supervisor(tmp_path)
+    replacement.close()
+
+
 def test_close_during_startup_is_bounded_and_reaps_child(
     tmp_path: Path, child_python: Path
 ) -> None:
@@ -409,6 +496,26 @@ def test_close_during_startup_is_bounded_and_reaps_child(
         time.sleep(0.005)
     assert supervisor._process is None
     assert not supervisor._reaping
+
+
+def test_close_uses_explicit_budget_for_admitted_request(tmp_path: Path) -> None:
+    supervisor = _supervisor(tmp_path, teardown_timeout=0.0)
+    entered = threading.Event()
+
+    def admitted_request() -> None:
+        with supervisor._request_lock:
+            entered.set()
+            time.sleep(0.05)
+
+    request = threading.Thread(target=admitted_request)
+    request.start()
+    assert entered.wait(timeout=1.0)
+    supervisor.close(timeout=0.2)
+    request.join(timeout=1.0)
+    assert not request.is_alive()
+    assert supervisor._owner_released.is_set()
+    replacement = _supervisor(tmp_path)
+    replacement.close()
 
 
 def test_close_before_process_publication_keeps_owner_until_request_exits(

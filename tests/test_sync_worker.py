@@ -11,6 +11,8 @@ import time
 import types
 from typing import Any
 
+import pytest
+
 from plugins.memory.cashew import CashewMemoryProvider
 from plugins.memory.cashew.config import CONFIG_FILENAME
 
@@ -624,6 +626,58 @@ def test_shutdown_hung_worker_logs_warning_no_raise(tmp_path, monkeypatch, caplo
         assert p._sync_queue is None
         assert p._db_path is None
         assert p._config is None
+
+
+def test_shutdown_cleanup_thread_start_failure_blocks_init_until_retry(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(
+        "core.session.end_session", fake_end_session_slow(0.25), raising=False
+    )
+    first_home = tmp_path / "first"
+    second_home = tmp_path / "second"
+    p = CashewMemoryProvider()
+    p.save_config({"sync_queue_timeout": 0.01}, str(first_home))
+    p.initialize("first-session", hermes_home=str(first_home))
+    p.sync_turn("user", "assistant")
+    time.sleep(0.03)
+    real_start = threading.Thread.start
+
+    def fail_cleanup_start(thread: threading.Thread) -> None:
+        if thread.name.startswith("cashew-shutdown-"):
+            raise RuntimeError("simulated provider cleanup thread start failure")
+        real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_cleanup_start)
+    with caplog.at_level(logging.WARNING, logger="plugins.memory.cashew"):
+        p.shutdown()
+    assert "shutdown cleanup could not start" in caplog.text
+    assert p._shutdown_started.is_set()
+    assert p._shutdown_cleanup_pending is not None
+    assert p._sync_queue is not None
+
+    p.initialize("blocked-session", hermes_home=str(second_home))
+    assert p._session_id == "first-session"
+
+    deadline = time.monotonic() + 1.0
+    worker = p._sync_worker
+    assert worker is not None
+    while worker.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert not worker.is_alive()
+    p.shutdown()
+    assert not p._shutdown_started.is_set()
+    assert p._shutdown_cleanup_pending is None
+    assert p._sync_queue is None
+
+    monkeypatch.setattr(threading.Thread, "start", real_start)
+    p.save_config({}, str(second_home))
+    p.initialize("second-session", hermes_home=str(second_home))
+    try:
+        assert p._session_id == "second-session"
+        assert p._sync_queue is not None
+    finally:
+        p.shutdown()
 
 
 def test_sync_turn_does_not_block_behind_full_queue_shutdown():

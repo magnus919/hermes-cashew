@@ -369,6 +369,8 @@ class EmbeddingSupervisor:
             return self.dimension
         finally:
             self._request_lock.release()
+            if self._close_waiting:
+                self._finish_close_after_request()
 
     def _record_failure(self) -> None:
         self._failure_count += 1
@@ -516,10 +518,10 @@ class EmbeddingSupervisor:
                 if self._close_waiting:
                     self._finish_close_after_request()
 
-        request = threading.Thread(
-            target=execute, daemon=True, name="cashew-embedding-request"
-        )
         try:
+            request = threading.Thread(
+                target=execute, daemon=True, name="cashew-embedding-request"
+            )
             request.start()
         except Exception as exc:
             self._request_lock.release()
@@ -566,7 +568,20 @@ class EmbeddingSupervisor:
             process.wait(timeout=wait_budget())
         except subprocess.TimeoutExpired:
             self._reaping = True
-            threading.Thread(target=self._reap, args=(process,), daemon=True).start()
+            try:
+                reaper = threading.Thread(
+                    target=self._reap,
+                    args=(process,),
+                    daemon=True,
+                    name="cashew-embedding-reaper",
+                )
+                reaper.start()
+            except Exception:
+                # Retain the process and owner for a later close() retry. It is
+                # unsafe to publish a replacement until wait() actually reaps
+                # this generation.
+                self._reaping = False
+                logger.warning("embedding reaper unavailable; close remains pending")
             return
         self._last_exit_code = process.returncode
         self._process = None
@@ -583,7 +598,7 @@ class EmbeddingSupervisor:
         with self._request_lock:
             self._terminate()
         self._close_waiting = False
-        if not self._reaping:
+        if not self._reaping and self._process is None:
             self._release_owner()
 
     def close(self, timeout: float | None = None) -> None:
@@ -595,7 +610,15 @@ class EmbeddingSupervisor:
             return min(self.teardown_timeout, max(0.0, deadline - time.monotonic()))
 
         self._closed = True
-        if self._request_lock.acquire(timeout=wait_budget()):
+        # A caller-provided timeout is the owner's total shutdown budget. Give
+        # an admitted request that full remaining window to release its slot;
+        # teardown operations themselves retain their shorter phase cap.
+        request_wait = (
+            self.teardown_timeout
+            if deadline is None
+            else max(0.0, deadline - time.monotonic())
+        )
+        if self._request_lock.acquire(timeout=request_wait):
             try:
                 if self._socket is not None:
                     try:
@@ -613,12 +636,12 @@ class EmbeddingSupervisor:
         else:
             self._close_waiting = True
             self._terminate(deadline=deadline)
-            cleanup = threading.Thread(
-                target=self._finish_close_after_request,
-                daemon=True,
-                name="cashew-embedding-close",
-            )
             try:
+                cleanup = threading.Thread(
+                    target=self._finish_close_after_request,
+                    daemon=True,
+                    name="cashew-embedding-close",
+                )
                 cleanup.start()
             except Exception:
                 # The request thread also observes _close_waiting in its
@@ -630,10 +653,10 @@ class EmbeddingSupervisor:
                     finally:
                         self._request_lock.release()
                     self._close_waiting = False
-                    if not self._reaping:
+                    if not self._reaping and self._process is None:
                         self._release_owner()
             return
-        if not self._reaping:
+        if not self._reaping and self._process is None:
             self._release_owner()
 
 

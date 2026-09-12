@@ -389,6 +389,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         # Stop accepting new turns once shutdown begins while allowing turns
         # already ahead of the sentinel to drain normally.
         self._shutdown_started = threading.Event()
+        self._shutdown_cleanup_pending: (
+            tuple[threading.Thread | None, queue.Queue, tuple[threading.Thread, ...]]
+            | None
+        ) = None
         # Interpreter-finalization flag: set only after sentence-transformers
         # reports that Python's atexit sequence has begun. Unlike normal
         # shutdown, this is unrecoverable and remaining queued turns must stop.
@@ -1744,7 +1748,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._last_assistant = ""
             self._prefetch_condition.notify_all()
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> None:  # noqa: C901 - teardown state machine is explicit
         """Stop producers, bounded-join background work, clear references.
 
         Order is load-bearing:
@@ -1762,6 +1766,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         """
         # Serialize the ownership decision only. The bounded joins happen
         # outside both locks so sync_turn remains a non-blocking hot path.
+        retry_cleanup: (
+            tuple[threading.Thread | None, queue.Queue, tuple[threading.Thread, ...]]
+            | None
+        ) = None
         with self._lifecycle_lock:
             if self._initializing:
                 if self._sync_worker is None:
@@ -1776,25 +1784,39 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 # shutdown; initialize() retains ownership until its trace
                 # context exits and its unconditional finalizer runs.
             with self._sync_state_lock:
-                if self._sync_queue is None or self._shutdown_started.is_set():
-                    return  # safe no-op or shutdown already in progress
-                timeout = (
-                    self._config.sync_queue_timeout
-                    if self._config is not None
-                    else 30.0
-                )
-                deadline = time.monotonic() + max(0.0, timeout)
-                self._shutdown_started.set()
-                self._set_health_locked("stopping", "shutdown_requested")
-                self._prefetch_generation += 1
-                self._prefetch_pending = None
-                model_fn = self._model_fn
-                self._prefetch_pending_request = None
-                self._prefetch_latest_identity = None
-                q = self._sync_queue
-                assert q is not None
-                prefetch_threads = tuple(self._prefetch_threads)
-                self._prefetch_condition.notify_all()
+                if self._sync_queue is None:
+                    return  # safe no-op
+                if self._shutdown_started.is_set():
+                    retry_cleanup = self._shutdown_cleanup_pending
+                    if retry_cleanup is None:
+                        return  # shutdown already in progress
+                else:
+                    retry_cleanup = None
+                if retry_cleanup is not None:
+                    # Retry outside both provider locks. The prior shutdown
+                    # already closed producer admission and the model callable.
+                    pass
+                else:
+                    timeout = (
+                        self._config.sync_queue_timeout
+                        if self._config is not None
+                        else 30.0
+                    )
+                    deadline = time.monotonic() + max(0.0, timeout)
+                    self._shutdown_started.set()
+                    self._set_health_locked("stopping", "shutdown_requested")
+                    self._prefetch_generation += 1
+                    self._prefetch_pending = None
+                    model_fn = self._model_fn
+                    self._prefetch_pending_request = None
+                    self._prefetch_latest_identity = None
+                    q = self._sync_queue
+                    assert q is not None
+                    prefetch_threads = tuple(self._prefetch_threads)
+                    self._prefetch_condition.notify_all()
+        if retry_cleanup is not None:
+            self._schedule_shutdown_cleanup(*retry_cleanup)
+            return
         _METRICS.emit()
         # Items already in the queue remain ahead of the sentinel and receive a
         # bounded opportunity to persist before the worker exits.
@@ -1847,13 +1869,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         if alive_workers:
             with self._sync_state_lock:
                 self._set_health_locked("stopping", "worker_timeout")
-            cleanup = threading.Thread(
-                target=self._clear_state_after_workers_exit,
-                args=(worker, q, alive_workers),
-                daemon=True,
-                name=f"cashew-shutdown-{self._session_id}",
-            )
-            cleanup.start()
+                self._shutdown_cleanup_pending = (worker, q, alive_workers)
+            self._schedule_shutdown_cleanup(worker, q, alive_workers)
             return
         self._clear_runtime_state(
             worker,
@@ -1871,6 +1888,33 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         for worker in workers:
             worker.join()
         self._clear_runtime_state(sync_worker, sync_queue)
+
+    def _schedule_shutdown_cleanup(
+        self,
+        sync_worker: threading.Thread | None,
+        sync_queue: queue.Queue,
+        workers: tuple[threading.Thread, ...],
+    ) -> None:
+        """Start or retry deferred cleanup without raising from shutdown()."""
+        if not any(worker.is_alive() for worker in workers):
+            self._clear_runtime_state(sync_worker, sync_queue)
+            return
+        try:
+            cleanup = threading.Thread(
+                target=self._clear_state_after_workers_exit,
+                args=(sync_worker, sync_queue, workers),
+                daemon=True,
+                name=f"cashew-shutdown-{self._session_id}",
+            )
+            cleanup.start()
+        except Exception:
+            logger.warning(
+                "cashew shutdown cleanup could not start; retry shutdown after worker exit"
+            )
+            return
+        with self._sync_state_lock:
+            if self._sync_queue is sync_queue:
+                self._shutdown_cleanup_pending = None
 
     def _finish_embedding_runtime_close(
         self,
@@ -1928,6 +1972,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._sleep_cron_job_id = None  # clear instance tracking only
             # Clear state. _hermes_home persists (see is_available() contract).
             self._sync_queue = None
+            self._shutdown_cleanup_pending = None
             self._sync_worker = None
             self._config = None
             self._db_path = None

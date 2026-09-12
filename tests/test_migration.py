@@ -457,6 +457,75 @@ def test_initialize_finalizes_vec_when_active_identity_already_matches(
         provider.shutdown()
 
 
+def test_existing_vec_schema_without_extension_keeps_identity_ready(
+    tmp_path, monkeypatch
+):
+    """Optional vec loss cannot reject an otherwise verified ordinary identity."""
+    db_path = tmp_path / "cashew" / "brain.db"
+    db_path.parent.mkdir(parents=True)
+    _make_dimension_mismatch_db(db_path)
+    monkeypatch.setattr(
+        "scripts.migrate_embeddings.migrate_embeddings", _fake_migrate_to_1024
+    )
+
+    import sqlite_vec
+
+    real_load = sqlite_vec.load
+    loads = 0
+
+    def unavailable_after_migration(conn):
+        nonlocal loads
+        loads += 1
+        if loads == 1:
+            return real_load(conn)
+        raise RuntimeError("sqlite-vec unavailable")
+
+    embedded_queries: list[dict] = []
+    persisted_extracts: list[dict] = []
+
+    def record_embedding_route(**kwargs):
+        embedded_queries.append(kwargs)
+        return []
+
+    def persist_extract(**kwargs):
+        persisted_extracts.append(kwargs)
+        return types.SimpleNamespace(new_nodes=["written"], new_edges=[])
+
+    monkeypatch.setattr(sqlite_vec, "load", unavailable_after_migration)
+    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", record_embedding_route)
+    monkeypatch.setattr("core.session.end_session", persist_extract, raising=False)
+    provider = CashewMemoryProvider()
+    provider.save_config({"embedding_model": "thenlper/gte-large"}, str(tmp_path))
+    provider.initialize("vec-unavailable-repair", hermes_home=str(tmp_path))
+    try:
+        assert provider._embedding_identity_ready is True
+        assert provider._vector_available is False
+        assert provider._embedding_dimensions(db_path) == ({1024}, 1024)
+
+        extract = json.loads(
+            provider.handle_tool_call(
+                "cashew_extract",
+                {"user_content": "write", "assistant_content": "admitted"},
+            )
+        )
+        assert extract["ok"] is True
+        assert persisted_extracts
+
+        provider.prefetch("ordinary BFS route")
+        assert embedded_queries == [
+            {
+                "db_path": str(db_path),
+                "query": "ordinary BFS route",
+                "top_k": provider._config.recall_k,
+                "domain": None,
+                "tags": None,
+                "exclude_tags": None,
+            }
+        ]
+    finally:
+        provider.shutdown()
+
+
 @pytest.mark.real_embedding_child
 def test_pinned_upstream_migration_uses_owned_child_embedding_boundary(tmp_path):
     """The dd57 migration persists child-produced vectors without a parent model."""

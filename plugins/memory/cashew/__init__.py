@@ -1380,21 +1380,36 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     "migration postcondition model or dimension mismatch"
                 )
             if vec_dimension is not None:
-                conn.enable_load_extension(True)
+                extension_enabled = False
                 try:
+                    conn.enable_load_extension(True)
+                    extension_enabled = True
                     import sqlite_vec
 
                     sqlite_vec.load(conn)
+                except Exception:
+                    # sqlite-vec is optional at this boundary. A platform can
+                    # retain its schema while losing the native extension;
+                    # exact ordinary embedding identity still authorizes the
+                    # ready BFS path, while finalization reports vec degraded.
+                    logger.info(
+                        "sqlite-vec unavailable during migration postcondition validation; "
+                        "skipping vec row check"
+                    )
+                else:
+                    vec_ids = {
+                        str(row[0])
+                        for row in conn.execute(
+                            "SELECT node_id FROM vec_embeddings"
+                        ).fetchall()
+                    }
+                    if vec_ids != expected_ids:
+                        raise RuntimeError(
+                            "migration postcondition vec node IDs mismatch"
+                        )
                 finally:
-                    conn.enable_load_extension(False)
-                vec_ids = {
-                    str(row[0])
-                    for row in conn.execute(
-                        "SELECT node_id FROM vec_embeddings"
-                    ).fetchall()
-                }
-                if vec_ids != expected_ids:
-                    raise RuntimeError("migration postcondition vec node IDs mismatch")
+                    if extension_enabled:
+                        conn.enable_load_extension(False)
         finally:
             conn.close()
 

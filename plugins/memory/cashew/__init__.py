@@ -1770,8 +1770,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             parallel_retrieval = is_feature_enabled(
                 config, "experimental_parallel_retrieval"
             )
-        pending = self._consume_prefetch_pending(requested_session)
-        with self._sync_state_lock:
+            # Consume the pending result and snapshot the warm cache while
+            # the same runtime identity is admitted. Releasing the lock
+            # between these steps could let a reinitialized profile publish a
+            # same-session cache that belongs to a newer generation.
+            pending = self._consume_prefetch_pending_locked(requested_session)
             self._warm_cache.update(pending)
             warm_cache = tuple(self._warm_cache.items())
             # Consume the snapshot before doing any potentially slow retrieval.
@@ -1987,9 +1990,13 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
     def _consume_prefetch_pending(self, session_id: str) -> dict[str, str]:
         """Atomically consume a current result, retaining its source cues."""
         with self._sync_state_lock:
-            pending = self._prefetch_pending
-            self._prefetch_pending = None
-            current_generation = self._prefetch_generation
+            return self._consume_prefetch_pending_locked(session_id)
+
+    def _consume_prefetch_pending_locked(self, session_id: str) -> dict[str, str]:
+        """Consume a pending result while ``_sync_state_lock`` is held."""
+        pending = self._prefetch_pending
+        self._prefetch_pending = None
+        current_generation = self._prefetch_generation
         if pending is None:
             return {}
         generation, result_session, cues, context = pending

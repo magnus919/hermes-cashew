@@ -605,6 +605,36 @@ def test_sync_turn_does_not_block_behind_full_queue_shutdown():
     assert not shutdown_thread.is_alive()
 
 
+def test_sync_turn_handles_config_clear_between_teardown_admission_reads(tmp_path):
+    """A teardown between config reads cannot make sync_turn raise."""
+
+    class ConfigClearRaceProvider(CashewMemoryProvider):
+        _clear_on_config_read = False
+
+        def __getattribute__(self, name: str) -> Any:
+            if name == "_config" and object.__getattribute__(
+                self, "_clear_on_config_read"
+            ):
+                object.__setattr__(self, "_clear_on_config_read", False)
+                config = object.__getattribute__(self, "_config")
+                object.__setattr__(self, "_config", None)
+                object.__getattribute__(self, "_shutdown_started").set()
+                return config
+            return object.__getattribute__(self, name)
+
+    p = ConfigClearRaceProvider()
+    p.initialize("session-a", hermes_home=str(tmp_path))
+    saved_config = p._config
+    try:
+        p._clear_on_config_read = True
+        p.sync_turn("u", "a")
+    finally:
+        p._clear_on_config_read = False
+        p._config = saved_config
+        p._shutdown_started.clear()
+        p.shutdown()
+
+
 def test_on_session_end_returns_without_draining_queue(tmp_path, monkeypatch):
     """on_session_end returns promptly without draining the sync queue.
 

@@ -23,7 +23,7 @@ _READY_TIMEOUT = 10
 _EXIT_TIMEOUT = 15
 
 _CHILD = r"""
-import fcntl, hashlib, json, os, sys, time
+import fcntl, hashlib, json, os, sqlite3, sys, time
 from pathlib import Path
 import numpy as np
 os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_DATASETS_OFFLINE="1")
@@ -35,8 +35,7 @@ assert getattr(core.session, "__file__", ""), "real core.session required"
 
 home = Path(sys.argv[1]); marker = sys.argv[2]; action = sys.argv[3]
 overlap = Path(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4] else None
-home.mkdir(parents=True, exist_ok=True)
-(home / "cashew.json").write_text(json.dumps({"cashew_db_path": "brain.db", "llm_aux_role": None, "think_cycles": False}))
+assert (home / "cashew.json").exists(), "parent must provision profile before launch"
 
 class DeterministicEmbeddingService:
     model = "thenlper/gte-large"
@@ -57,7 +56,8 @@ _embedding_service = DeterministicEmbeddingService()
 core.embedding_service.get_default_service = lambda: _embedding_service
 
 def emit(event, **payload):
-    print(json.dumps({"event": event, "core": core.session.__file__, **payload}), flush=True)
+    message = json.dumps({"event": event, "core": core.session.__file__, **payload})
+    os.write(sys.stdout.fileno(), (message + "\n").encode())
 
 def command():
     value = sys.stdin.readline().strip()
@@ -163,6 +163,8 @@ elif action == "sleep":
     emit("result", result=result)
 
 elif action == "migration":
+    import logging
+
     from plugins.memory.cashew import _patch_upstream_embedding
 
     _patch_upstream_embedding("thenlper/gte-small", "cpu")
@@ -171,26 +173,39 @@ elif action == "migration":
     provider = CashewMemoryProvider()
     provider._config = CashewConfig(embedding_model="thenlper/gte-small")
     original_repair = provider._repair_embedding_dimension_locked
+    migration_records = []
+    class MigrationCapture(logging.Handler):
+        def emit(self, record):
+            if "embedding migration" in record.getMessage():
+                migration_records.append({
+                    "message": record.getMessage(),
+                    "exception": str(record.exc_info[1]) if record.exc_info else "",
+                })
+    capture = MigrationCapture()
+    logging.getLogger("plugins.memory.cashew").addHandler(capture)
     def paused_repair(db_path):
         emit("maintenance_locked")
-        if command() != "release":
-            raise RuntimeError("expected release command")
-        assert overlap is not None
-        (overlap / "phase_started").write_text("migration")
-        wait_for(overlap / "writer_started")
+        if overlap is not None:
+            if command() != "release":
+                raise RuntimeError("expected release command")
+            (overlap / "phase_started").write_text("migration")
+            wait_for(overlap / "writer_started")
         return original_repair(db_path)
     provider._repair_embedding_dimension_locked = paused_repair
     emit("ready")
     if command() != "start":
         raise RuntimeError("expected start command")
     dimensions_before = provider._embedding_dimensions(home / "brain.db")
-    provider._repair_embedding_dimension(home / "brain.db")
+    try:
+        provider._repair_embedding_dimension(home / "brain.db")
+    finally:
+        logging.getLogger("plugins.memory.cashew").removeHandler(capture)
     dimensions_after = provider._embedding_dimensions(home / "brain.db")
     before = [sorted(dimensions_before[0]), dimensions_before[1]]
     after = [sorted(dimensions_after[0]), dimensions_after[1]]
     if after == [[384], 384]:
         outcome = "migrated"
-    elif after == before:
+    elif overlap is not None and after == before and migration_records:
         outcome = "deferred_by_concurrent_writer"
     else:
         raise RuntimeError("unexpected post-migration dimensions: " + repr(after))
@@ -201,6 +216,7 @@ elif action == "migration":
             "dimensions_before": before,
             "dimensions_after": after,
             "outcome": outcome,
+            "migration_records": migration_records,
         },
     )
 
@@ -217,14 +233,57 @@ elif action == "lock":
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
     emit("result", result={"released": True})
 
+elif action == "sqlite_write_lock":
+    emit("ready")
+    if command() != "hold":
+        raise RuntimeError("expected hold command")
+    connection = sqlite3.connect(home / "brain.db")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        emit("sqlite_write_locked")
+        if command() != "release":
+            raise RuntimeError("expected release command")
+        connection.commit()
+    finally:
+        connection.close()
+    emit("result", result={"released": True})
+
+elif action == "rapid_events":
+    emit("ready")
+    if command() != "start":
+        raise RuntimeError("expected start command")
+    emit("queued")
+    emit("entered_upstream_write")
+    emit("result", result={"rapid": True})
+
 else:
     raise RuntimeError("unknown action: " + action)
 """
 
 
+def _provision_profile(home: Path) -> None:
+    """Create one profile before children race on its shared database."""
+    home.mkdir(parents=True, exist_ok=True)
+    config_path = home / "cashew.json"
+    if config_path.exists():
+        return
+    staged = config_path.with_suffix(".json.tmp")
+    staged.write_text(
+        json.dumps(
+            {
+                "cashew_db_path": "brain.db",
+                "llm_aux_role": None,
+                "think_cycles": False,
+            }
+        )
+    )
+    staged.replace(config_path)
+
+
 def _start(
     home: Path, marker: str, action: str, overlap: Path | None = None
 ) -> subprocess.Popen[str]:
+    _provision_profile(home)
     process = subprocess.Popen(
         [
             sys.executable,
@@ -238,7 +297,7 @@ def _start(
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
+        text=False,
         env={**os.environ, "HOME": str(home / "user")},
     )
     try:
@@ -246,35 +305,56 @@ def _start(
         event = _event(process, expected)
         assert event["core"]
         return process
-    except BaseException:
+    except BaseException as exc:
+        detail = _child_error(process)
         _terminate(process)
-        raise
+        raise AssertionError(f"child startup failed: {detail}") from exc
 
 
 def _event(
     process: subprocess.Popen[str], expected: str, timeout: float = _READY_TIMEOUT
 ) -> dict[str, Any]:
-    assert process.stdout is not None
-    readable, _, _ = select.select([process.stdout], [], [], timeout)
-    assert readable, f"child did not emit {expected!r} within {timeout}s"
-    line = process.stdout.readline()
-    assert line, f"child exited before {expected!r}: {_child_error(process)}"
-    payload = json.loads(line)
-    assert payload["event"] == expected, payload
-    assert payload["core"], "child must import the installed core.session module"
-    return payload
+    pending: list[dict[str, Any]] = getattr(process, "_event_pending", [])
+    buffer: bytearray = getattr(process, "_event_buffer", bytearray())
+    process._event_pending = pending
+    process._event_buffer = buffer
+    deadline = time.monotonic() + timeout
+    while True:
+        for index, payload in enumerate(pending):
+            if payload["event"] == expected:
+                pending.pop(index)
+                assert payload["core"], "child must import installed core.session"
+                return payload
+        parsed = False
+        while b"\n" in buffer:
+            line, _, remainder = buffer.partition(b"\n")
+            buffer[:] = remainder
+            if line:
+                pending.append(json.loads(line))
+                parsed = True
+        if parsed:
+            continue
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, f"child did not emit {expected!r} within {timeout}s"
+        assert process.stdout is not None
+        readable, _, _ = select.select([process.stdout.fileno()], [], [], remaining)
+        if not readable:
+            continue
+        chunk = os.read(process.stdout.fileno(), 4096)
+        assert chunk, f"child exited before {expected!r}: {_child_error(process)}"
+        buffer.extend(chunk)
 
 
 def _send(process: subprocess.Popen[str], value: str) -> None:
     assert process.stdin is not None
-    process.stdin.write(f"{value}\n")
+    process.stdin.write(f"{value}\n".encode())
     process.stdin.flush()
 
 
 def _child_error(process: subprocess.Popen[str]) -> str:
     if process.poll() is None or process.stderr is None:
         return "child is still running"
-    return process.stderr.read()
+    return process.stderr.read().decode(errors="replace")
 
 
 def _terminate(process: subprocess.Popen[str]) -> None:
@@ -354,13 +434,16 @@ def _assert_consistent(db_path: Path) -> None:
 
             connection.enable_load_extension(True)
             sqlite_vec.load(connection)
-            assert (
-                connection.execute(
-                    "SELECT v.node_id FROM vec_embeddings v "
-                    "LEFT JOIN thought_nodes n ON n.id = v.node_id WHERE n.id IS NULL"
-                ).fetchall()
-                == []
+            embedding_dimensions = dict(
+                connection.execute("SELECT node_id, LENGTH(vector) / 4 FROM embeddings")
             )
+            vec_dimensions = dict(
+                connection.execute(
+                    "SELECT node_id, LENGTH(embedding) / 4 FROM vec_embeddings"
+                )
+            )
+            assert set(vec_dimensions) == set(embedding_dimensions)
+            assert vec_dimensions == embedding_dimensions
     finally:
         connection.close()
 
@@ -441,6 +524,20 @@ def test_abrupt_sync_worker_exit_only_requires_post_restart_durability(
     _assert_consistent(home / "brain.db")
 
 
+def test_event_reader_retains_rapid_out_of_order_child_events(tmp_path: Path) -> None:
+    """A buffered child line cannot hide the next event from a later read."""
+    child = _start(tmp_path / "events", "rapid", "rapid_events")
+    try:
+        _send(child, "start")
+        assert (
+            _event(child, "entered_upstream_write")["event"] == "entered_upstream_write"
+        )
+        assert _event(child, "queued")["event"] == "queued"
+        assert _result(child) == {"rapid": True}
+    finally:
+        _terminate(child)
+
+
 def test_sleep_lock_contention_has_bounded_named_skip(tmp_path: Path) -> None:
     """A different process holding maintenance lock produces a bounded skip."""
     home = tmp_path / "shared"
@@ -475,13 +572,37 @@ def test_real_extract_overlaps_sleep_and_preserves_its_marker(tmp_path: Path) ->
         _event(writer, "entered_upstream_write")
         _send(sleeper, "release")
         _send(writer, "write")
-        assert _result(sleeper) is not None
+        sleep_result = _result(sleeper)
+        assert "error" not in sleep_result
+        assert sleep_result["nodes_selected"] >= 2
         assert _result(writer)["ok"] is True
     finally:
         _terminate(sleeper)
         _terminate(writer)
 
     assert any("extract-during-sleep" in value for value in _markers(home / "brain.db"))
+    _assert_consistent(home / "brain.db")
+
+
+def test_uncontended_migration_reaches_new_dimension_and_preserves_seed(
+    tmp_path: Path,
+) -> None:
+    """The upstream migration must change a seeded 1024-dimensional brain."""
+    home = tmp_path / "shared"
+    assert _extract(home, "migration-uncontended-seed")["ok"] is True
+    migration = _start(home, "migration", "migration")
+    try:
+        _send(migration, "start")
+        _event(migration, "maintenance_locked")
+        result = _result(migration)
+        assert result["dimensions_before"] == [[1024], 1024]
+        assert result["outcome"] == "migrated"
+        assert result["dimensions_after"] == [[384], 384]
+    finally:
+        _terminate(migration)
+    assert any(
+        "migration-uncontended-seed" in value for value in _markers(home / "brain.db")
+    )
     _assert_consistent(home / "brain.db")
 
 
@@ -511,6 +632,11 @@ def test_migration_maintenance_overlaps_real_writer_and_keeps_database_sound(
             "migrated",
             "deferred_by_concurrent_writer",
         }
+        if migration_result["outcome"] == "deferred_by_concurrent_writer":
+            assert any(
+                "database is locked" in record["exception"].lower()
+                for record in migration_result["migration_records"]
+            )
         assert _result(writer)["ok"] is True
     finally:
         _terminate(migration)
@@ -519,4 +645,32 @@ def test_migration_maintenance_overlaps_real_writer_and_keeps_database_sound(
     assert any(
         "writer-during-migration" in value for value in _markers(home / "brain.db")
     )
+    assert any("migration-seed" in value for value in _markers(home / "brain.db"))
     _assert_consistent(home / "brain.db")
+
+
+def test_real_sqlite_write_lock_reports_extract_failure_within_timeout(
+    tmp_path: Path,
+) -> None:
+    """A persistence write blocked after initialization reports its actual failure."""
+    home = tmp_path / "shared"
+    assert _extract(home, "sqlite-lock-seed")["ok"] is True
+    writer = _start(home, "sqlite-lock-writer", "extract")
+    holder = _start(home, "sqlite-lock-holder", "sqlite_write_lock")
+    try:
+        _send(holder, "hold")
+        _event(holder, "sqlite_write_locked")
+        _send(writer, "start")
+        _event(writer, "entered_upstream_write")
+        started = time.monotonic()
+        _send(writer, "write")
+        result = _result(writer)
+        assert time.monotonic() - started < _EXIT_TIMEOUT
+        assert result["ok"] is False
+        assert result["upstream_failure"]["type"] == "OperationalError"
+        assert "database is locked" in result["upstream_failure"]["message"].lower()
+        _send(holder, "release")
+        assert _result(holder) == {"released": True}
+    finally:
+        _terminate(writer)
+        _terminate(holder)

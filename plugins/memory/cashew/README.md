@@ -129,3 +129,16 @@ INFO plugins.memory.cashew: think cycle produced 2 insight(s) on cluster: ...
 WARNING plugins.memory.cashew: think cycle failed ...
 WARNING plugins.memory.cashew: on_pre_compress failed ...
 ```
+
+## Optional diagnostics
+
+Diagnostics are disabled by default. The plugin ignores generic host telemetry
+settings. Set `HERMES_CASHEW_SENTRY_DSN` to opt into an isolated,
+provider-owned Sentry client; set `HERMES_CASHEW_OTEL_ENABLED=1` to emit
+Cashew OpenTelemetry spans through the existing host provider. Neither option
+changes the host's global telemetry configuration.
+
+Events and spans contain only a fixed set of operation codes, allowlisted error
+classes, lifecycle state/generation, bounded counts, and duration buckets.
+They exclude prompts, queries, node content, exception messages and tracebacks,
+paths, session identifiers, credentials, response bodies, and breadcrumbs.

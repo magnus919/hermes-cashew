@@ -115,36 +115,30 @@ def _prepare_think_db(db: Path) -> None:
         )
 
 
-_FORK_ADMISSION = None
-
-
-def _run_inherited_async_dream(ready, parent_closed, reacquired) -> None:
-    """Run the actual async dream entrypoint with an inherited admission token."""
+def _run_async_dream_owner(graph: str, cache: str, ready) -> None:
+    """Run the async entrypoint from a child-owned admission."""
     import plugins.memory.cashew.sleep_refactor as sleep_module
     from plugins.memory.cashew.admission import current_admission
 
-    admission = _FORK_ADMISSION
-    assert admission is not None
+    with admit_operation(
+        graph_path=graph,
+        cache_path=cache,
+        model="model-a",
+        embedding_dim=384,
+        vec_dim=384,
+        exclusive=True,
+        cache_exclusive=True,
+    ) as admission:
 
-    def paused_dream(*_args, **_kwargs):
-        assert current_admission() is admission
-        ready.set()
-        assert parent_closed.wait(timeout=10)
-        # The parent has released its inherited descriptor copy.  Reacquire
-        # both leases in this child on independent descriptors before the
-        # competing-process assertion; this is the actual transferred token's
-        # owner, not a fresh admission or a production-path substitute.
-        with try_maintenance_lock(admission.graph_path) as graph_lease:
-            with try_maintenance_lock(admission.cache_path) as cache_lease:
-                assert graph_lease is not None
-                assert cache_lease is not None
-                reacquired.set()
-                time.sleep(30)
+        def paused_dream(*_args, **_kwargs):
+            assert current_admission() is admission
+            ready.set()
+            time.sleep(30)
 
-    sleep_module._generate_dream = paused_dream
-    sleep_module._run_dream_async(
-        str(admission.graph_path), [], model_fn=None, admission=admission
-    )
+        sleep_module._generate_dream = paused_dream
+        sleep_module._run_dream_async(graph, [], model_fn=None, admission=admission)
+    # The admission context has exited, but the transferred async owner keeps
+    # its original descriptors until the child finishes or is killed.
     time.sleep(30)
 
 
@@ -518,60 +512,37 @@ def test_async_dream_transfers_exact_token_and_process_death_releases_leases(
     tmp_path,
 ):
     """The real async entrypoint installs the token and dies without stranding locks."""
-    global _FORK_ADMISSION
     context = multiprocessing.get_context("fork")
     graph = tmp_path / "brain.db"
     cache = tmp_path / "cache.db"
     ready = context.Event()
-    with admit_operation(
-        graph_path=graph,
-        cache_path=cache,
-        model="model-a",
-        embedding_dim=384,
-        vec_dim=384,
-        exclusive=True,
-        cache_exclusive=True,
-    ) as admission:
-        _FORK_ADMISSION = admission
-        owner = admission.lease_owner
-        assert owner is not None
-        parent_closed = context.Event()
-        reacquired = context.Event()
-        child = context.Process(
-            target=_run_inherited_async_dream,
-            args=(ready, parent_closed, reacquired),
+    child = context.Process(
+        target=_run_async_dream_owner,
+        args=(str(graph), str(cache), ready),
+    )
+    child.start()
+    try:
+        assert ready.wait(timeout=10)
+        # The child exits its admission context after the real async entrypoint
+        # transfers the original owner; no replacement lock is acquired.
+        probe_context = multiprocessing.get_context("spawn")
+        probe_read, probe_write = probe_context.Pipe(duplex=False)
+        probe = probe_context.Process(
+            target=_probe_exclusive_leases,
+            args=(str(graph), str(cache), probe_write),
         )
-        child.start()
-        try:
-            assert ready.wait(timeout=10)
-            # The child performs the one transfer itself.  Closing the parent's
-            # copy releases its inherited descriptors; the child then owns
-            # independent leases for the remainder of the actual async call.
-            owner.close()
-            parent_closed.set()
-            assert reacquired.wait(timeout=10)
-            # The transferred child owns the exact token and both descriptors;
-            # independent exclusive contenders remain blocked until it exits.
-            probe_context = multiprocessing.get_context("spawn")
-            probe_read, probe_write = probe_context.Pipe(duplex=False)
-            probe = probe_context.Process(
-                target=_probe_exclusive_leases,
-                args=(str(graph), str(cache), probe_write),
-            )
-            probe.start()
-            probe_write.close()
-            assert probe_read.recv() == (False, False)
-            probe.join(timeout=10)
-            assert probe.exitcode == 0
-            child.terminate()
+        probe.start()
+        probe_write.close()
+        assert probe_read.recv() == (False, False)
+        probe.join(timeout=10)
+        assert probe.exitcode == 0
+        child.terminate()
+        child.join(timeout=10)
+        assert child.exitcode is not None
+    finally:
+        if child.is_alive():
+            child.kill()
             child.join(timeout=10)
-            assert child.exitcode is not None
-        finally:
-            if child.is_alive():
-                child.kill()
-                child.join(timeout=10)
-            owner.close()
-        _FORK_ADMISSION = None
     with try_maintenance_lock(graph) as graph_lease:
         assert graph_lease is not None
     with try_maintenance_lock(cache) as cache_lease:

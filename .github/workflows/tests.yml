@@ -66,23 +66,29 @@ jobs:
           echo "::endgroup::"
 
       - name: Lint with ruff
+        if: matrix.python == '3.12.11'
         run: .venv/bin/ruff check plugins/memory/cashew/ tests/ --output-format=github
 
       - name: Type check with mypy
+        if: matrix.python == '3.12.11'
         run: |
           .venv/bin/python scripts/check-recursive-symlinks.py plugins/memory/cashew/
           .venv/bin/mypy --explicit-package-bases plugins/memory/cashew/
 
       - name: Dead code detection with vulture
+        if: matrix.python == '3.12.11'
         run: .venv/bin/vulture plugins/memory/cashew/ --min-confidence 80
 
       - name: Duplicate code detection
+        if: matrix.python == '3.12.11'
         run: .venv/bin/python scripts/check-duplicates.py
 
       - name: Dead feature flag detection
+        if: matrix.python == '3.12.11'
         run: .venv/bin/python scripts/check-dead-flags.py
 
       - name: Unused dependency detection with deptry
+        if: matrix.python == '3.12.11'
         run: .venv/bin/deptry .
 
       - name: Run tests with coverage (capture log for offline-download scan)

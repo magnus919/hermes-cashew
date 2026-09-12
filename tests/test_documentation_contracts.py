@@ -191,6 +191,33 @@ def test_ci_covers_declared_minimum_and_current_python() -> None:
     assert workflow["jobs"]["wheel-smoke"]["needs"] == "test"
 
 
+def test_ci_runs_runtime_tests_on_both_versions_and_quality_once() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
+    steps = workflow["jobs"]["test-python"]["steps"]
+    names = {
+        "Lint with ruff",
+        "Type check with mypy",
+        "Dead code detection with vulture",
+        "Duplicate code detection",
+        "Dead feature flag detection",
+        "Unused dependency detection with deptry",
+    }
+    by_name = {step["name"]: step for step in steps if "name" in step}
+    assert all(by_name[name]["if"] == "matrix.python == '3.12.11'" for name in names)
+    assert "if" not in by_name["Verify Cashew source and SQLite migration capability"]
+    assert (
+        "if"
+        not in by_name["AGENTS.md validation — verify install and test commands work"]
+    )
+    assert (
+        "if"
+        not in by_name[
+            "Run tests with coverage (capture log for offline-download scan)"
+        ]
+    )
+    assert "if" not in by_name["CI-03 — fail if embedding model was downloaded"]
+
+
 def test_ci_matrix_coverage_artifacts_have_unique_names() -> None:
     workflow = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
     upload = next(

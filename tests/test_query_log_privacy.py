@@ -18,10 +18,21 @@ def _provider(tmp_path) -> CashewMemoryProvider:
 def test_warm_cache_hit_logs_lengths_not_query_content(caplog, tmp_path):
     sensitive = "HIV treatment plan for Alice"
     provider = _provider(tmp_path)
-    provider._warm_cache[sensitive] = "private context"
+    identity = provider._prefetch_request_identity(
+        session_id="",
+        generation=0,
+        domain=None,
+        tag=None,
+        exclude_tags=None,
+    )
+    provider._stage_prefetch_result(
+        identity,
+        [sensitive],
+        [{"id": "private", "content": "private context"}],
+    )
 
     with caplog.at_level(logging.INFO, logger="plugins.memory.cashew"):
-        assert provider.prefetch(sensitive) == "private context"
+        assert "private context" in provider.prefetch(sensitive)
 
     assert sensitive not in caplog.text
     assert "Alice" not in caplog.text

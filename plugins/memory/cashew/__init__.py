@@ -111,6 +111,17 @@ class _PrefetchResult:
     nodes: tuple[dict[str, Any], ...]
 
 
+@dataclasses.dataclass(frozen=True)
+class _PrefetchRequest:
+    """One latest-request slot entry for the bounded prefetch worker."""
+
+    identity: _PrefetchRequestIdentity
+    query: str
+    db_path: str
+    top_k: int
+    use_llm: bool
+
+
 # Probe for the Hermes cron module. In a full Hermes Agent environment the
 # cron.jobs package is importable (the agent root is on sys.path). In CI and
 # standalone test environments it is not — the sleep cycle cron job cannot be
@@ -442,10 +453,14 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         # between the daemon thread and the main agent loop.
         self._prefetch_pending: _PrefetchResult | None = None
         self._prefetch_generation: int = 0
-        # Background warmups accepted by queue_prefetch(). Shutdown joins
-        # these before clearing DB/config state so a worker cannot observe a
-        # half-torn-down provider.
+        # One daemon worker owns background warmups. At most one request is
+        # active and one newer request is retained in this pending slot.
         self._prefetch_threads: set[threading.Thread] = set()
+        self._prefetch_worker: threading.Thread | None = None
+        self._prefetch_condition = threading.Condition(self._sync_state_lock)
+        self._prefetch_pending_request: _PrefetchRequest | None = None
+        self._prefetch_active_identity: _PrefetchRequestIdentity | None = None
+        self._prefetch_latest_identity: _PrefetchRequestIdentity | None = None
         # Last assistant response, buffered from sync_turn for use by
         # queue_prefetch's LLM cue extraction.
         self._last_assistant: str = ""
@@ -1522,7 +1537,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._prefetch_generation += 1
             self._warm_cache.clear()
             self._prefetch_pending = None
+            self._prefetch_pending_request = None
+            self._prefetch_latest_identity = None
             self._last_assistant = ""
+            self._prefetch_condition.notify_all()
 
     def shutdown(self) -> None:
         """Stop producers, bounded-join background work, clear references.
@@ -1551,9 +1569,12 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._shutdown_started.set()
             self._prefetch_generation += 1
             self._prefetch_pending = None
+            self._prefetch_pending_request = None
+            self._prefetch_latest_identity = None
             q = self._sync_queue
             assert q is not None
             prefetch_threads = tuple(self._prefetch_threads)
+            self._prefetch_condition.notify_all()
         # Items already in the queue remain ahead of the sentinel and receive a
         # bounded opportunity to persist before the worker exits.
         try:
@@ -1635,7 +1656,12 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._prefetch_generation += 1
             self._prefetch_pending = None
             self._prefetch_threads.clear()
+            self._prefetch_worker = None
+            self._prefetch_active_identity = None
+            self._prefetch_pending_request = None
+            self._prefetch_latest_identity = None
             self._last_assistant = ""
+            self._prefetch_condition.notify_all()
         logger.debug("cashew provider shutdown complete")
 
     def _parallel_retrieve(
@@ -1810,31 +1836,24 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Warm cashew memory for the next turn (ABC optional hook).
 
-        Dispatches a background thread so this returns immediately and never
-        blocks the user's turn. The thread runs vector search (and optionally
-        LLM cue extraction) and populates _warm_cache when done.
-
-        If the background thread hasn't finished before the next prefetch(),
-        prefetch falls through to cold storage transparently. Results are
-        stored in a staging slot (_prefetch_pending) and swapped atomically
-        into _warm_cache at the start of the next prefetch to avoid
-        concurrent access between thread and main loop.
+        Enqueues the latest request for the single daemon worker. One request
+        may be active while one newer request waits in the coalescing slot;
+        newer requests replace that slot without starting more workers.
 
         Contract:
         - Half-state guard: if _config is None, return silently.
         - Never blocks — returns in <1ms.
         - Never raises into Hermes (caught in background thread).
         """
-        with self._sync_state_lock:
-            if self._config is None or self._shutdown_started.is_set():
+        with self._prefetch_condition:
+            config = self._config
+            db_path = self._db_path
+            if config is None or db_path is None or self._shutdown_started.is_set():
                 return
             effective_session = str(session_id or self._session_id)
             self._prefetch_generation += 1
             generation = self._prefetch_generation
             self._prefetch_pending = None
-            db_path = str(self._db_path)
-            top_k = self._config.prefetch_k
-            use_llm = self._model_fn is not None and self._config.prefetch_cues > 0
             identity = self._prefetch_request_identity(
                 session_id=effective_session,
                 generation=generation,
@@ -1842,80 +1861,152 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 tag=None,
                 exclude_tags=None,
             )
-        if not query:
-            logger.debug("queue_prefetch: empty query, no warmup")
-            return
-
-        def _warmup_worker() -> None:
-            """Background thread: retrieve + optionally refine with LLM."""
-            try:
-                # If LLM is available, extract cues for better retrieval
-                if use_llm:
-                    try:
-                        cues = self._extract_prefetch_cues(query)
-                        logger.info(
-                            "queue_prefetch: extracted %d LLM cue(s)",
-                            len(cues),
-                        )
-                    except Exception:
-                        logger.debug(
-                            "queue_prefetch: LLM cue extraction failed, using raw query"
-                        )
-                        cues = [query] if query else []
-                else:
-                    cues = [query] if query else []
-
-                if not cues:
-                    return
-
-                from core.retrieval import retrieve_recursive_bfs
-
-                seen_ids: set[str] = set()
-                all_nodes: list[dict] = []
-                for cue in cues:
-                    results = retrieve_recursive_bfs(
-                        db_path=db_path,
-                        query=cue,
-                        top_k=top_k,
-                    )
-                    if results:
-                        node_ids = [r.node_id for r in results]
-                        nodes = self._enrich_results(node_ids, db_path=db_path)
-                        for n in nodes:
-                            nid = n.get("id", "")
-                            if nid not in seen_ids:
-                                seen_ids.add(nid)
-                                all_nodes.append(n)
-
-                if all_nodes:
-                    self._stage_prefetch_result(identity, cues, all_nodes)
-                    logger.info(
-                        "queue_prefetch: cached %d result(s) from %d cue(s) for next turn",
-                        len(all_nodes),
-                        len(cues),
-                    )
-            except Exception:
-                logger.debug(
-                    "queue_prefetch background worker failed (non-fatal)", exc_info=True
-                )
-            finally:
-                with self._sync_state_lock:
-                    self._prefetch_threads.discard(threading.current_thread())
-
-        t = threading.Thread(
-            target=_warmup_worker,
-            daemon=True,
-            name=f"cashew-prefetch-{self._session_id}",
-        )
-        with self._sync_state_lock:
-            if self._shutdown_started.is_set():
+            if not query:
+                logger.debug("queue_prefetch: empty query, no warmup")
+                self._prefetch_latest_identity = None
                 return
-            self._prefetch_threads.add(t)
-            try:
-                t.start()
-            except Exception:
-                self._prefetch_threads.discard(t)
-                logger.debug("queue_prefetch: failed to start warmup", exc_info=True)
+            request = _PrefetchRequest(
+                identity=identity,
+                query=query,
+                db_path=str(db_path),
+                top_k=config.prefetch_k,
+                use_llm=self._model_fn is not None and config.prefetch_cues > 0,
+            )
+            if self._prefetch_pending_request is not None:
+                _METRICS.record_prefetch_coalesced()
+            self._prefetch_pending_request = request
+            self._prefetch_latest_identity = identity
+            worker = self._prefetch_worker
+            if worker is None or not worker.is_alive():
+                worker = threading.Thread(
+                    target=self._prefetch_worker_loop,
+                    daemon=True,
+                    name=f"cashew-prefetch-{self._session_id}",
+                )
+                self._prefetch_worker = worker
+                self._prefetch_threads.add(worker)
+                try:
+                    worker.start()
+                except Exception:
+                    self._prefetch_threads.discard(worker)
+                    self._prefetch_worker = None
+                    self._prefetch_pending_request = None
+                    _METRICS.record_prefetch_failed()
+                    logger.debug(
+                        "queue_prefetch: failed to start warmup worker", exc_info=True
+                    )
+                    return
+            self._prefetch_condition.notify()
+
+    def _prefetch_worker_loop(self) -> None:
+        """Run at most one active request and one pending latest request."""
+        current_thread = threading.current_thread()
+        try:
+            while True:
+                with self._prefetch_condition:
+                    while (
+                        self._prefetch_pending_request is None
+                        and not self._shutdown_started.is_set()
+                    ):
+                        # Exit an idle worker so the provider owns no thread
+                        # between requests. A bounded wait also closes the
+                        # enqueue-versus-idle-exit race under the same lock.
+                        if not self._prefetch_condition.wait(timeout=0.1):
+                            if self._prefetch_pending_request is None:
+                                return
+                    if (
+                        self._shutdown_started.is_set()
+                        and self._prefetch_pending_request is None
+                    ):
+                        return
+                    request = self._prefetch_pending_request
+                    self._prefetch_pending_request = None
+                    assert request is not None
+                    self._prefetch_active_identity = request.identity
+                self._run_prefetch_request(request)
+                with self._prefetch_condition:
+                    self._prefetch_active_identity = None
+        finally:
+            with self._prefetch_condition:
+                self._prefetch_threads.discard(current_thread)
+                if self._prefetch_worker is current_thread:
+                    self._prefetch_worker = None
+                self._prefetch_active_identity = None
+                self._prefetch_condition.notify_all()
+
+    def _run_prefetch_request(self, request: _PrefetchRequest) -> None:
+        """Execute one request, checking identity before expensive stages."""
+        identity = request.identity
+        if not self._prefetch_request_is_current(identity):
+            _METRICS.record_prefetch_cancelled()
+            return
+        try:
+            if request.use_llm:
+                try:
+                    cues = self._extract_prefetch_cues(request.query)
+                    logger.info("queue_prefetch: extracted %d LLM cue(s)", len(cues))
+                except Exception:
+                    logger.debug(
+                        "queue_prefetch: LLM cue extraction failed, using raw query"
+                    )
+                    cues = [request.query]
+            else:
+                cues = [request.query]
+            cues = [cue for cue in cues if cue and cue.strip()]
+            if not cues:
+                return
+            if not self._prefetch_request_is_current(identity):
+                _METRICS.record_prefetch_cancelled()
+                return
+
+            from core.retrieval import retrieve_recursive_bfs
+
+            seen_ids: set[str] = set()
+            all_nodes: list[dict] = []
+            for cue in cues:
+                if not self._prefetch_request_is_current(identity):
+                    _METRICS.record_prefetch_cancelled()
+                    return
+                results = retrieve_recursive_bfs(
+                    db_path=request.db_path,
+                    query=cue,
+                    top_k=request.top_k,
+                )
+                if results:
+                    node_ids = [r.node_id for r in results]
+                    nodes = self._enrich_results(node_ids, db_path=request.db_path)
+                    for node in nodes:
+                        node_id = node.get("id", "")
+                        if node_id not in seen_ids:
+                            seen_ids.add(node_id)
+                            all_nodes.append(node)
+            if not self._prefetch_request_is_current(identity):
+                _METRICS.record_prefetch_cancelled()
+                return
+            if all_nodes:
+                self._stage_prefetch_result(identity, cues, all_nodes)
+                logger.info(
+                    "queue_prefetch: cached %d result(s) from %d cue(s)",
+                    len(all_nodes),
+                    len(cues),
+                )
+        except Exception:
+            if self._prefetch_request_is_current(identity):
+                _METRICS.record_prefetch_failed()
+                logger.debug(
+                    "queue_prefetch background worker failed (non-fatal)",
+                    exc_info=True,
+                )
+            else:
+                _METRICS.record_prefetch_cancelled()
+
+    def _prefetch_request_is_current(self, identity: _PrefetchRequestIdentity) -> bool:
+        """Check request identity without holding the lock during work."""
+        with self._sync_state_lock:
+            return (
+                not self._shutdown_started.is_set()
+                and self._prefetch_latest_identity == identity
+            )
 
     def _stage_prefetch_result(
         self,

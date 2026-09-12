@@ -14,6 +14,7 @@ import pytest
 
 from plugins.memory.cashew import CashewMemoryProvider
 from plugins.memory.cashew.config import CashewConfig
+from plugins.memory.cashew.metrics import _METRICS
 
 
 def _provider_with_mock_config(tmp_path):
@@ -389,6 +390,91 @@ def test_queue_prefetch_dispatches_tracked_background_thread(tmp_path, monkeypat
     threads[0].join(timeout=1.0)
     assert not threads[0].is_alive()
     assert provider._prefetch_threads == set()
+
+
+def test_queue_prefetch_burst_has_one_active_and_one_latest_pending(
+    tmp_path, monkeypatch
+):
+    """A burst coalesces behind one active worker and one latest request."""
+    provider = _provider_with_mock_config(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+    active = 0
+    max_active = 0
+    state_lock = threading.Lock()
+
+    def blocked_retrieval(**kwargs):
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+            calls.append(kwargs["query"])
+        started.set()
+        assert release.wait(timeout=2.0)
+        with state_lock:
+            active -= 1
+        return []
+
+    monkeypatch.setattr(
+        "core.retrieval.retrieve_recursive_bfs", blocked_retrieval, raising=False
+    )
+    before = _METRICS._snapshot()["prefetch_coalesced"]
+    provider.queue_prefetch("active request")
+    assert started.wait(timeout=1.0)
+    for index in range(100):
+        provider.queue_prefetch(f"queued request {index}")
+
+    with provider._sync_state_lock:
+        assert provider._prefetch_pending_request is not None
+        assert provider._prefetch_pending_request.query == "queued request 99"
+        assert len(provider._prefetch_threads) == 1
+    release.set()
+    worker = next(iter(provider._prefetch_threads))
+    worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert max_active == 1
+    assert calls == ["active request", "queued request 99"]
+    assert _METRICS._snapshot()["prefetch_coalesced"] - before >= 99
+
+
+def test_superseded_active_prefetch_skips_retrieval_after_cue_extraction(
+    tmp_path, monkeypatch
+):
+    """An active request invalidated during cue extraction does no retrieval."""
+    provider = _provider_with_mock_config(tmp_path)
+    provider._config.prefetch_cues = 1
+    cue_started = threading.Event()
+    release = threading.Event()
+    retrieval_queries: list[str] = []
+    model_calls = 0
+    cancelled_before = _METRICS._snapshot()["prefetch_cancelled"]
+
+    def blocked_model(_prompt: str) -> str:
+        nonlocal model_calls
+        model_calls += 1
+        cue_started.set()
+        assert release.wait(timeout=2.0)
+        return "obsolete cue" if model_calls == 1 else "current request"
+
+    provider._model_fn = blocked_model
+    monkeypatch.setattr(
+        "core.retrieval.retrieve_recursive_bfs",
+        lambda **kwargs: retrieval_queries.append(kwargs["query"]) or [],
+        raising=False,
+    )
+    provider.queue_prefetch("obsolete request")
+    assert cue_started.wait(timeout=1.0)
+    provider.queue_prefetch("current request")
+    release.set()
+
+    deadline = time.monotonic() + 2.0
+    while provider._prefetch_threads and time.monotonic() < deadline:
+        next(iter(provider._prefetch_threads)).join(timeout=0.05)
+
+    assert retrieval_queries == ["current request"]
+    assert _METRICS._snapshot()["prefetch_cancelled"] > cancelled_before
 
 
 def test_queue_prefetch_rejects_new_worker_after_shutdown_starts(tmp_path):

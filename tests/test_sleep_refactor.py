@@ -117,6 +117,28 @@ def _insert_embedding(
     )
 
 
+def test_load_embedding_matrix_filters_non_active_dimensions(small_graph):
+    """Mixed historical vectors cannot participate in an active profile cycle."""
+    import plugins.memory.cashew.sleep_refactor as sleep
+
+    conn = sqlite3.connect(small_graph)
+    try:
+        _insert_node(conn, "wrong-dimension", "wrong dimension")
+        conn.execute(
+            "INSERT INTO embeddings (node_id, vector, model, updated_at) VALUES (?, ?, ?, datetime('now'))",
+            ("wrong-dimension", np.ones(1024, dtype=np.float32).tobytes(), "other"),
+        )
+        conn.commit()
+        ids, matrix = sleep._load_embedding_matrix(
+            conn, ["a", "wrong-dimension"], expected_dimension=384
+        )
+    finally:
+        conn.close()
+
+    assert ids == ["a"]
+    assert matrix.shape == (1, 384)
+
+
 def _insert_edge(
     conn, parent: str, child: str, weight: float = 1.0, reasoning: str = ""
 ) -> None:
@@ -798,6 +820,27 @@ def test_embed_orphans_uses_injected_process_client(db_path):
 
     assert count == 1
     assert calls == [["embedding device check"]]
+    conn.close()
+
+
+def test_embed_orphans_rejects_wrong_child_dimension(db_path):
+    """An orphan write cannot introduce a vector from another generation."""
+    conn = sqlite3.connect(db_path)
+    _insert_node(conn, "wrong-child-vector", "dimension must match")
+    conn.commit()
+
+    client = type(
+        "Client",
+        (),
+        {"encode": lambda _self, texts: np.ones((len(texts), 7), dtype=np.float32)},
+    )()
+    assert _embed_orphans(conn, embedding_client=client, expected_dimension=384) == 0
+    assert (
+        conn.execute(
+            "SELECT node_id FROM embeddings WHERE node_id='wrong-child-vector'"
+        ).fetchone()
+        is None
+    )
     conn.close()
 
 

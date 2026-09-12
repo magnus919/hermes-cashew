@@ -126,6 +126,11 @@ class EmbeddingSupervisor:
         self.backoff_base = backoff_base
         self.generation = uuid.uuid4().hex
         self._request_lock = threading.Lock()
+        # Covers an entire upstream EmbeddingService call, including cache hits
+        # and empty-text fast paths that never reach ProcessEmbeddingBackend.
+        # It is deliberately distinct from _request_lock: the latter is taken
+        # by encode(), which may run while this generation-use gate is held.
+        self._service_gate = threading.RLock()
         self._process: subprocess.Popen[bytes] | None = None
         self._socket: socket.socket | None = None
         self._closed = False
@@ -195,6 +200,19 @@ class EmbeddingSupervisor:
                 self._close_callbacks.append(callback)
         if call_now:
             callback()
+
+    @contextlib.contextmanager
+    def serve_generation(self) -> Iterator[None]:
+        """Permit one bound upstream-service call while this generation is live.
+
+        A closed supervisor must also reject cached and empty-text service
+        paths.  Holding this gate through the delegate call makes that check
+        race-safe with close() without taking the encode request lock twice.
+        """
+        with self._service_gate:
+            if self._closed:
+                raise EmbeddingUnavailable(EmbeddingFailure.CLOSED)
+            yield
 
     def _read_exact(self, size: int, deadline: float) -> bytes:
         channel = self._socket
@@ -625,6 +643,11 @@ class EmbeddingSupervisor:
             self._release_owner()
 
     def close(self, timeout: float | None = None) -> None:
+        with self._service_gate:
+            self._close_locked(timeout)
+
+    def _close_locked(self, timeout: float | None = None) -> None:
+        """Close after excluding new generation-bound service calls."""
         deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
 
         def wait_budget() -> float:

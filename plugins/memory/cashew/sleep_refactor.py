@@ -68,6 +68,7 @@ def _set_wal(conn: sqlite3.Connection) -> None:
 def _load_embedding_matrix(
     conn: sqlite3.Connection,
     node_ids: list[str],
+    expected_dimension: int | None = None,
 ) -> tuple[list[str], np.ndarray]:
     """Load embeddings for *node_ids* from the `embeddings` table.
 
@@ -90,6 +91,9 @@ def _load_embedding_matrix(
     for nid, blob in rows:
         try:
             vec = np.frombuffer(blob, dtype=np.float32)
+            if expected_dimension is not None and vec.size != expected_dimension:
+                bad += 1
+                continue
             if np.any(np.isnan(vec)) or np.any(np.isinf(vec)):
                 bad += 1
                 continue
@@ -633,6 +637,7 @@ def _embed_orphans(
     embedding_model: str = "thenlper/gte-large",
     embedding_device: str = "cpu",
     embedding_client: Any = None,
+    expected_dimension: int | None = None,
 ) -> int:
     """Embed any active nodes lacking an embedding row. Returns count."""
     rows = conn.execute(
@@ -665,6 +670,10 @@ def _embed_orphans(
                 vectors.ndim != 2
                 or vectors.shape[0] != 1
                 or vectors.shape[1] == 0
+                or (
+                    expected_dimension is not None
+                    and vectors.shape[1] != expected_dimension
+                )
                 or not np.isfinite(vectors).all()
             ):
                 logger.warning("sleep: orphan embedding returned an invalid vector")
@@ -710,6 +719,7 @@ def _run_dream_async(
     embedding_model: str = "thenlper/gte-large",
     embedding_device: str = "cpu",
     embedding_client: Any = None,
+    expected_dimension: int | None = None,
 ) -> None:
     """Run Phase 8 (dream) + Phase 9 (orphan embedding) in a daemon thread.
 
@@ -730,6 +740,7 @@ def _run_dream_async(
                     embedding_model=embedding_model,
                     embedding_device=embedding_device,
                     embedding_client=embedding_client,
+                    expected_dimension=expected_dimension,
                 )
             logger.info(
                 "sleep: background dream complete (id=%s, orphans=%d)",
@@ -805,7 +816,16 @@ def run_sleep_cycle(
                 ids = [r[0] for r in rows]
                 logger.info("sleep: selected %d nodes (limit=%d)", len(ids), limit)
 
-                valid_ids, matrix = _load_embedding_matrix(conn, ids)
+                expected_dimension = getattr(embedding_client, "dimension", None)
+                if (
+                    not isinstance(expected_dimension, int)
+                    or isinstance(expected_dimension, bool)
+                    or expected_dimension <= 0
+                ):
+                    expected_dimension = None
+                valid_ids, matrix = _load_embedding_matrix(
+                    conn, ids, expected_dimension=expected_dimension
+                )
                 if len(valid_ids) < 2:
                     logger.warning("sleep: too few valid embeddings — aborting")
                     return {"error": "too few nodes", "nodes_selected": len(ids)}
@@ -822,6 +842,7 @@ def run_sleep_cycle(
                     embedding_model=embedding_model,
                     embedding_device=embedding_device,
                     embedding_client=embedding_client,
+                    expected_dimension=expected_dimension,
                     t_start=t_start,
                 )
     except MaintenanceLockAcquisitionError:
@@ -846,6 +867,7 @@ def _run_sleep_cycle_locked(
     embedding_model: str,
     embedding_device: str,
     embedding_client: Any,
+    expected_dimension: int | None,
     t_start: float,
 ) -> dict:
     """Run synchronous sleep phases while the caller owns DB and lock resources."""
@@ -916,6 +938,7 @@ def _run_sleep_cycle_locked(
                 embedding_model=embedding_model,
                 embedding_device=embedding_device,
                 embedding_client=embedding_client,
+                expected_dimension=expected_dimension,
             )
             dream_pending = True
             dream_status = "pending"
@@ -934,6 +957,7 @@ def _run_sleep_cycle_locked(
             embedding_model=embedding_model,
             embedding_device=embedding_device,
             embedding_client=embedding_client,
+            expected_dimension=expected_dimension,
         )
 
     elapsed = round(time.perf_counter() - t_start, 1)

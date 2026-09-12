@@ -76,10 +76,7 @@ def _check_stopped_health(provider: Any) -> None:
     """Confirm shutdown publishes the terminal diagnostic state."""
     status = provider.health_status()
     if status.get("state") != "stopped":
-        _error(
-            "health_status() did not report stopped state: "
-            f"{status.get('state')}"
-        )
+        _error(f"health_status() did not report stopped state: {status.get('state')}")
 
 
 def main() -> int:  # noqa: C901 - verifier keeps its user-facing failure prefixes together
@@ -94,9 +91,6 @@ def main() -> int:  # noqa: C901 - verifier keeps its user-facing failure prefix
 
     tmp_dir = tempfile.mkdtemp(prefix="cashew-verify-")
     hermes_home = pathlib.Path(tmp_dir)
-    previous_embedding_cache = _os.environ.get("CASHEW_EMBD_CACHE")
-    _os.environ["CASHEW_EMBD_CACHE"] = str(hermes_home / "embedding-cache.db")
-
     try:
         from plugins.memory.cashew import CashewMemoryProvider
 
@@ -184,10 +178,6 @@ def main() -> int:  # noqa: C901 - verifier keeps its user-facing failure prefix
         _error(f"unexpected {type(exc).__name__}: {exc}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        if previous_embedding_cache is None:
-            _os.environ.pop("CASHEW_EMBD_CACHE", None)
-        else:
-            _os.environ["CASHEW_EMBD_CACHE"] = previous_embedding_cache
 
 
 if __name__ == "__main__":

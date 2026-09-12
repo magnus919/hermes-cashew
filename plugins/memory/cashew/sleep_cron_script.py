@@ -131,6 +131,9 @@ def main() -> None:
         cache_dir=hermes_home / "cashew" / "model-cache",
     )
     try:
+        # Validate the child model/dimension before sleep reads or writes any
+        # semantic state; no parent-process model fallback is permitted.
+        supervisor.start()
         result = sleep_module.run_sleep_cycle(
             db_path=db_path,
             limit=config.sleep_max_nodes,

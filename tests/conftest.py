@@ -189,6 +189,64 @@ def _mock_heavy_imports(monkeypatch: pytest.MonkeyPatch):
         sys.modules.pop("sentence_transformers", None)
 
 
+@pytest.fixture(autouse=True)
+def _offline_embedding_child(tmp_path_factory, monkeypatch: pytest.MonkeyPatch):
+    """Make ordinary provider tests exercise a real child handshake offline.
+
+    Tests dedicated to embedding_process install their own launcher and replace
+    this value.  The fake is only visible in the child process; the parent
+    fixture above still fails any accidental in-process model construction.
+    """
+    from plugins.memory.cashew import embedding_process
+
+    # Keep harness files out of a test's own tmp_path: tests that assert a
+    # read-only provider must be able to observe an empty profile directory.
+    fake_root = tmp_path_factory.mktemp("offline-embedding-child")
+    package = fake_root / "sentence_transformers"
+    package.mkdir(parents=True)
+    package.joinpath("__init__.py").write_text(
+        """
+import numpy as np
+
+_DIMS = {
+    'thenlper/gte-large': 1024,
+    'thenlper/gte-base': 768,
+    'thenlper/gte-small': 384,
+    'BAAI/bge-large-en-v1.5': 1024,
+    'BAAI/bge-base-en-v1.5': 768,
+    'BAAI/bge-small-en-v1.5': 384,
+    'all-MiniLM-L6-v2': 384,
+    'sentence-transformers/all-MiniLM-L6-v2': 384,
+    'all-mpnet-base-v2': 768,
+}
+
+class SentenceTransformer:
+    def __init__(self, model, device='cpu'):
+        self.model = model
+        self.device = device
+        self._dim = _DIMS.get(model, 7)
+    def get_sentence_embedding_dimension(self):
+        return self._dim
+    def encode(self, texts, **_kwargs):
+        return np.ones((len(texts), self._dim), dtype=np.float32)
+"""
+    )
+    launcher = fake_root / "offline-embedding-child.py"
+    launcher.write_text(
+        "#!" + sys.executable + "\n"
+        "import runpy, sys\n"
+        f"sys.path.insert(0, {str(fake_root)!r})\n"
+        "script = sys.argv.pop(1)\n"
+        "runpy.run_path(script, run_name='__main__')\n"
+    )
+    launcher.chmod(0o700)
+    # embedding_process imports the sys module directly.  Replace only its
+    # reference; mutating sys.executable would also break test subprocesses.
+    monkeypatch.setattr(
+        embedding_process, "sys", types.SimpleNamespace(executable=str(launcher))
+    )
+
+
 @pytest.fixture
 def isolated_user_home(tmp_path, monkeypatch: pytest.MonkeyPatch):
     """Guard against code falling back to the user's default Hermes profile.

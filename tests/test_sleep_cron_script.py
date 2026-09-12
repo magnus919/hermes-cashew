@@ -56,6 +56,7 @@ def _write_installation(implementation: Path, identity: str) -> None:
     (implementation / "embedding_process.py").write_text(
         "class EmbeddingSupervisor:\n"
         "    def __init__(self, **kwargs): self.kwargs = kwargs\n"
+        "    def start(self): return 384\n"
         "    def close(self): pass\n"
     )
     (implementation / "embedding_worker.py").write_text("# test worker marker\n")

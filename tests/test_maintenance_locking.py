@@ -31,6 +31,16 @@ with try_maintenance_lock(sys.argv[1]) as lock_fd:
 """
 
 
+class _VerifiedSupervisor:
+    dimension = 1024
+
+    def _when_closed(self, callback) -> None:
+        callback()
+
+    def close(self, **_kwargs) -> None:
+        return None
+
+
 def _start_lock_holder(db_path: Path) -> subprocess.Popen[str]:
     process = subprocess.Popen(
         [sys.executable, "-c", _HOLDER, str(db_path)],
@@ -191,7 +201,9 @@ def test_initialize_survives_acquisition_failure_when_inspection_needs_no_migrat
 
     monkeypatch.setattr(locking.fcntl, "flock", denied_lock)
     monkeypatch.setattr(
-        cashew_module, "_patch_upstream_embedding", lambda *_, **__: None
+        cashew_module,
+        "_bind_upstream_embedding",
+        lambda *_, **__: _VerifiedSupervisor(),
     )
     monkeypatch.setattr(CashewMemoryProvider, "_ensure_db_schema", lambda *_: None)
     monkeypatch.setattr(
@@ -234,7 +246,9 @@ def test_initialize_degrades_when_acquisition_failure_hides_required_migration(
 
     monkeypatch.setattr(locking.fcntl, "flock", denied_lock)
     monkeypatch.setattr(
-        cashew_module, "_patch_upstream_embedding", lambda *_, **__: None
+        cashew_module,
+        "_bind_upstream_embedding",
+        lambda *_, **__: _VerifiedSupervisor(),
     )
     monkeypatch.setattr(CashewMemoryProvider, "_ensure_db_schema", lambda *_: None)
     monkeypatch.setattr(
@@ -280,7 +294,9 @@ def test_initialize_respects_held_aged_lock_without_removing_it(
         migration_called = True
 
     monkeypatch.setattr(
-        cashew_module, "_patch_upstream_embedding", lambda *_, **__: None
+        cashew_module,
+        "_bind_upstream_embedding",
+        lambda *_, **__: _VerifiedSupervisor(),
     )
     monkeypatch.setattr(CashewMemoryProvider, "_ensure_db_schema", lambda *_: None)
     monkeypatch.setattr(

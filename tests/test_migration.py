@@ -4,13 +4,51 @@
 from __future__ import annotations
 
 import fcntl
+import importlib
 import pathlib
 import sqlite3
 
 import numpy as np
+import pytest
 
-from plugins.memory.cashew import CashewMemoryProvider, _patch_upstream_embedding
+import plugins.memory.cashew as cashew_module
+from plugins.memory.cashew import CashewMemoryProvider
 from plugins.memory.cashew.config import CashewConfig
+
+
+@pytest.fixture(autouse=True)
+def _verified_child_handshake(request, monkeypatch: pytest.MonkeyPatch):
+    """Keep migration assertions offline while preserving the handshake contract."""
+
+    if request.node.get_closest_marker("real_embedding_child"):
+        yield
+        return
+
+    class FakeSupervisor:
+        dimension = 1024
+
+        def __init__(self, *, dimension: int, **_kwargs) -> None:
+            self.dimension = dimension or self.dimension
+
+        def start(self) -> int:
+            return self.dimension
+
+        def serve_generation(self):
+            from contextlib import nullcontext
+
+            return nullcontext()
+
+        def encode(self, texts):
+            return np.ones((len(texts), self.dimension), dtype=np.float32)
+
+        def _when_closed(self, callback):
+            callback()
+
+        def close(self, **_kwargs) -> None:
+            return None
+
+    monkeypatch.setattr(cashew_module, "EmbeddingSupervisor", FakeSupervisor)
+    yield
 
 
 def _make_v0_1_0_db(db_path):
@@ -127,6 +165,29 @@ def _fake_migrate_to_1024(db_path, *, confirm, quiet):
     conn.commit()
     conn.close()
     return {"nodes_embedded": 1}
+
+
+def _logical_embedding_snapshot(db_path):
+    """Capture migration-relevant SQLite data without comparing file bytes."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        _load_sqlite_vec(conn)
+        return {
+            "nodes": conn.execute(
+                "SELECT id, content, node_type, domain, timestamp FROM thought_nodes ORDER BY id"
+            ).fetchall(),
+            "embeddings": conn.execute(
+                "SELECT node_id, vector, model, updated_at FROM embeddings ORDER BY node_id"
+            ).fetchall(),
+            "vec": conn.execute(
+                "SELECT node_id, embedding FROM vec_embeddings ORDER BY node_id"
+            ).fetchall(),
+            "vec_schema": conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='vec_embeddings'"
+            ).fetchone(),
+        }
+    finally:
+        conn.close()
 
 
 def test_v0_1_0_columns_added(tmp_path):
@@ -329,6 +390,35 @@ def test_initialize_backs_up_and_migrates_embedding_dimension(tmp_path, monkeypa
         p.shutdown()
 
 
+@pytest.mark.real_embedding_child
+def test_pinned_upstream_migration_uses_owned_child_embedding_boundary(tmp_path):
+    """The dd57 migration persists child-produced vectors without a parent model."""
+    # The suite's broad guard replaces core.embed_nodes. Restore just the
+    # pinned upstream function here; its service remains the owned child path.
+    core_embeddings = importlib.import_module("core.embeddings")
+    migration_script = importlib.import_module("scripts.migrate_embeddings")
+    importlib.reload(core_embeddings)
+    importlib.reload(migration_script)
+    db_path = tmp_path / "cashew" / "brain.db"
+    db_path.parent.mkdir(parents=True)
+    _make_dimension_mismatch_db(db_path)
+
+    provider = CashewMemoryProvider()
+    provider.save_config({"embedding_model": "thenlper/gte-large"}, str(tmp_path))
+    provider.initialize("real-dd57-migration", hermes_home=str(tmp_path))
+    try:
+        assert provider._embedding_dimensions(db_path) == ({1024}, 1024)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            assert conn.execute(
+                "SELECT model, LENGTH(vector) / 4 FROM embeddings WHERE node_id='n1'"
+            ).fetchone() == ("thenlper/gte-large", 1024)
+        finally:
+            conn.close()
+    finally:
+        provider.shutdown()
+
+
 def test_failed_embedding_migration_restores_backup(tmp_path, monkeypatch, caplog):
     """A destructive upstream failure restores both embedding stores."""
     db_path = tmp_path / "cashew" / "brain.db"
@@ -350,6 +440,7 @@ def test_failed_embedding_migration_restores_backup(tmp_path, monkeypatch, caplo
     )
     p = CashewMemoryProvider()
     p._config = CashewConfig(embedding_model="thenlper/gte-large")
+    p._embedding_supervisor = type("Verified", (), {"dimension": 1024})()
 
     p._repair_embedding_dimension(db_path)
 
@@ -359,6 +450,69 @@ def test_failed_embedding_migration_restores_backup(tmp_path, monkeypatch, caplo
         "SELECT content FROM thought_nodes WHERE id='n1'"
     ).fetchone() == ("dimension migration",)
     conn.close()
+    assert "restoring pre-migration backup" in caplog.text
+
+
+def test_partial_embedding_migration_restores_backup(tmp_path, monkeypatch, caplog):
+    """A zero-row upstream success is not allowed to commit destructive work."""
+    db_path = tmp_path / "cashew" / "brain.db"
+    db_path.parent.mkdir(parents=True)
+    _make_dimension_mismatch_db(db_path)
+    before = _logical_embedding_snapshot(db_path)
+
+    def incomplete_success(db_path, *, confirm, quiet):
+        del confirm, quiet
+        conn = sqlite3.connect(str(db_path))
+        _load_sqlite_vec(conn)
+        conn.execute("DELETE FROM embeddings")
+        conn.execute("DROP TABLE vec_embeddings")
+        conn.commit()
+        conn.close()
+        return {"nodes_embedded": 0}
+
+    monkeypatch.setattr(
+        "scripts.migrate_embeddings.migrate_embeddings", incomplete_success
+    )
+    p = CashewMemoryProvider()
+    p._config = CashewConfig(embedding_model="thenlper/gte-large")
+    p._embedding_supervisor = type("Verified", (), {"dimension": 1024})()
+    p._repair_embedding_dimension(db_path)
+
+    assert p._embedding_dimensions(db_path) == ({384}, 384)
+    assert _logical_embedding_snapshot(db_path) == before
+    assert "restoring pre-migration backup" in caplog.text
+
+
+def test_migration_rolls_back_wrong_model_or_vec_identity(
+    tmp_path, monkeypatch, caplog
+):
+    """Matching counts cannot hide a wrong-model or wrong sqlite-vec result."""
+    db_path = tmp_path / "cashew" / "brain.db"
+    db_path.parent.mkdir(parents=True)
+    _make_dimension_mismatch_db(db_path)
+    before = _logical_embedding_snapshot(db_path)
+
+    def wrong_postcondition(path, *, confirm, quiet):
+        summary = _fake_migrate_to_1024(path, confirm=confirm, quiet=quiet)
+        conn = sqlite3.connect(str(path))
+        try:
+            _load_sqlite_vec(conn)
+            conn.execute("UPDATE embeddings SET model = 'wrong/model'")
+            conn.execute("DELETE FROM vec_embeddings WHERE node_id = 'n1'")
+            conn.commit()
+        finally:
+            conn.close()
+        return summary
+
+    monkeypatch.setattr(
+        "scripts.migrate_embeddings.migrate_embeddings", wrong_postcondition
+    )
+    p = CashewMemoryProvider()
+    p._config = CashewConfig(embedding_model="thenlper/gte-large")
+    p._embedding_supervisor = type("Verified", (), {"dimension": 1024})()
+    p._repair_embedding_dimension(db_path)
+
+    assert _logical_embedding_snapshot(db_path) == before
     assert "restoring pre-migration backup" in caplog.text
 
 
@@ -383,6 +537,7 @@ def test_embedding_migration_defers_while_sleep_lock_is_held(
     try:
         p = CashewMemoryProvider()
         p._config = CashewConfig(embedding_model="thenlper/gte-large")
+        p._embedding_supervisor = type("Verified", (), {"dimension": 1024})()
         p._repair_embedding_dimension(db_path)
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -391,17 +546,3 @@ def test_embedding_migration_defers_while_sleep_lock_is_held(
     assert called is False
     assert p._embedding_dimensions(db_path) == ({384}, 384)
     assert "migration deferred" in caplog.text
-
-
-def test_upstream_embedding_configuration_is_idempotent():
-    import core.config
-    import core.embeddings
-
-    embed_nodes = core.embeddings.embed_nodes
-    try:
-        _patch_upstream_embedding("BAAI/bge-small-en-v1.5")
-        _patch_upstream_embedding("BAAI/bge-small-en-v1.5")
-        assert core.config.config.embedding_model == "BAAI/bge-small-en-v1.5"
-        assert core.embeddings.embed_nodes is embed_nodes
-    finally:
-        _patch_upstream_embedding("thenlper/gte-large")

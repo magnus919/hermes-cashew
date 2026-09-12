@@ -13,8 +13,9 @@ import re
 import sqlite3
 import threading
 import time
-from typing import Any, Callable, Dict, List, cast
+from typing import Any, Callable, Dict, List
 
+from . import embedding_compat as _embedding_compat
 from .admission import (
     OperationAdmissionError,
     admit_operation,
@@ -76,16 +77,6 @@ from .config import (
 from .config import (
     save_config as _config_save_config,
 )
-from .cron_reconcile import (
-    CRON_JOB_NAME,
-    CRON_SCRIPT_NAME,
-    installation_marker,
-    owns_job,
-    profile_cron_lock,
-    profile_identity,
-    render_script,
-    stage_script,
-)
 
 try:
     from core.context import ContextRetriever
@@ -102,6 +93,14 @@ from .tools import (
     build_extract_success_envelope,
     build_success_envelope,
 )
+
+# Keep these private names available to existing adapter tests and loader
+# integrations while making embedding ownership explicit in embedding_compat.
+_GenerationBoundEmbeddingCache = _embedding_compat.GenerationBoundEmbeddingCache
+_GenerationBoundEmbeddingService = _embedding_compat.GenerationBoundEmbeddingService
+_NoopEmbeddingCache = _embedding_compat.NoopEmbeddingCache
+_UPSTREAM_COMPATIBILITY_SHIMS = _embedding_compat.UPSTREAM_COMPATIBILITY_SHIMS
+_UPSTREAM_KNOWN_DIMS = _embedding_compat.UPSTREAM_KNOWN_DIMS
 
 logger = logging.getLogger(__name__)
 
@@ -184,73 +183,6 @@ class _OpaqueUpstreamError(RuntimeError):
         self.partial = partial
 
 
-class _GenerationBoundEmbeddingService:
-    """Make one upstream service unavailable once its owner closes.
-
-    Upstream's service returns cache hits and zero vectors without consulting a
-    backend.  The outer generation gate prevents those convenience paths from
-    letting a closed profile serve another profile's global singleton.
-    """
-
-    def __init__(
-        self,
-        service: Any,
-        supervisor: EmbeddingSupervisor,
-        *,
-        cache_path: pathlib.Path | None = None,
-        model: str | None = None,
-        dimension: int | None = None,
-    ) -> None:
-        self._service = service
-        self._supervisor = supervisor
-        self._cache_path = cache_path
-        self._model = model
-        self._dimension = dimension
-
-    @property
-    def model(self) -> str:
-        return cast(str, self._service.model)
-
-    @property
-    def dim(self) -> int:
-        return cast(int, self._service.dim)
-
-    def embed_np(self, texts: list[str]) -> Any:
-        admission = current_admission()
-        if admission is None and self._cache_path is not None:
-            with admit_operation(
-                cache_path=self._cache_path,
-                model=self._model,
-                embedding_dim=self._dimension,
-                supervisor=self._supervisor,
-                embedding_generation=getattr(self._supervisor, "generation", None),
-                cache_exclusive=True,
-                deadline=1.5,
-            ):
-                with self._supervisor.serve_generation():
-                    return self._service.embed_np(texts)
-        with self._supervisor.serve_generation():
-            return self._service.embed_np(texts)
-
-    def embed(self, text: Any) -> Any:
-        """Keep upstream's public single-text route behind the same gate."""
-        admission = current_admission()
-        if admission is None and self._cache_path is not None:
-            with admit_operation(
-                cache_path=self._cache_path,
-                model=self._model,
-                embedding_dim=self._dimension,
-                supervisor=self._supervisor,
-                embedding_generation=getattr(self._supervisor, "generation", None),
-                cache_exclusive=True,
-                deadline=1.5,
-            ):
-                with self._supervisor.serve_generation():
-                    return self._service.embed(text)
-        with self._supervisor.serve_generation():
-            return self._service.embed(text)
-
-
 # Probe for the Hermes cron module. In a full Hermes Agent environment the
 # cron.jobs package is importable (the agent root is on sys.path). In CI and
 # standalone test environments it is not — the sleep cycle cron job cannot be
@@ -314,163 +246,6 @@ def _ensure_config_file(hermes_home: pathlib.Path) -> None:
 
 
 # ── Upstream embedding model patching ──────────────────────────────────
-
-_UPSTREAM_KNOWN_DIMS: dict[str, int] = {
-    "all-MiniLM-L6-v2": 384,
-    "sentence-transformers/all-MiniLM-L6-v2": 384,
-    "thenlper/gte-large": 1024,
-    "thenlper/gte-base": 768,
-    "thenlper/gte-small": 384,
-    "all-mpnet-base-v2": 768,
-    "BAAI/bge-large-en-v1.5": 1024,
-    "BAAI/bge-base-en-v1.5": 768,
-    "BAAI/bge-small-en-v1.5": 384,
-}
-
-# Cashew-brain at ac090ce has no instance-scoped migration or embedding API.
-# These are the only private compatibility seams retained by this adapter:
-#
-# * ``core.config.config.embedding_model`` selects the model used by pinned
-#   migration helpers, which call ``resolve_embedding_dim()`` without args.
-# * ``core.embedding_service._default_service`` is read by ``embed_nodes()``
-#   without accepting a service/backend argument.
-# * ``core.embedding_service._KNOWN_DIMS[model]`` prevents that no-argument
-#   resolver from constructing an in-process LocalBackend for an *unknown*
-#   model after the child has already verified its dimension.
-#
-# Retire these assignments once upstream accepts an explicit service or
-# dimension in its embedding and migration entry points.  Do not add backend
-# method patches, reset the singleton, or write DEFAULT_MODEL/EMBEDDING_DIM:
-# those process-wide compatibility constants cannot safely represent profiles.
-_UPSTREAM_COMPATIBILITY_SHIMS = (
-    "core.config.config.embedding_model",
-    "core.embedding_service._default_service",
-    "core.embedding_service._KNOWN_DIMS[model]",
-)
-
-
-class _NoopEmbeddingCache:
-    """Exact cache surface used when the affected SQLite runtime is unsafe."""
-
-    def __init__(self, path: pathlib.Path) -> None:
-        self.path = str(path)
-
-    def get_many(self, model: str, texts: list[str]) -> list[None]:
-        del model
-        return [None for _ in texts]
-
-    def put_many(self, model: str, pairs: list[tuple[str, Any]]) -> int:
-        del model, pairs
-        return 0
-
-    def get(self, model: str, text: str) -> None:
-        del model, text
-        return None
-
-    def put(self, model: str, text: str, vector: Any) -> None:
-        del model, text, vector
-
-    def size(self, model: str | None = None) -> int:
-        del model
-        return 0
-
-    def invalidate_model(self, model: str) -> None:
-        del model
-
-
-class _GenerationBoundEmbeddingCache:
-    """Reuse the admission-owned cache lease without opening another handle."""
-
-    def __init__(
-        self,
-        cache: Any,
-        *,
-        path: pathlib.Path,
-        model: str,
-        embedding_dim: int,
-        supervisor: Any,
-        generation: str | int | None,
-    ) -> None:
-        self._cache = cache
-        self.path = str(path)
-        self._path = path.resolve(strict=False)
-        self._model = model
-        self._embedding_dim = embedding_dim
-        self._supervisor = supervisor
-        self._generation = generation
-
-    def _check(self, model: str) -> None:
-        admission = current_admission()
-        if admission is None:
-            raise OperationAdmissionError("embedding cache operation is not admitted")
-        if isinstance(self._cache, _NoopEmbeddingCache):
-            # Affected-runtime profiles deliberately carry no cache lease; the
-            # facade remains a harmless exact no-op for upstream calls.
-            if model != self._model:
-                raise OperationAdmissionError(
-                    "embedding cache admission model mismatch"
-                )
-            return
-        if admission.cache_path != self._path:
-            raise OperationAdmissionError("embedding cache admission path mismatch")
-        if admission.model != model or admission.model != self._model:
-            raise OperationAdmissionError("embedding cache admission model mismatch")
-        if admission.embedding_dim not in (None, self._embedding_dim):
-            raise OperationAdmissionError(
-                "embedding cache admission dimension mismatch"
-            )
-        if admission.supervisor is not self._supervisor:
-            raise OperationAdmissionError(
-                "embedding cache admission supervisor mismatch"
-            )
-        if admission.embedding_generation != self._generation:
-            raise OperationAdmissionError(
-                "embedding cache admission generation mismatch"
-            )
-        if admission.cache_lease is None:
-            raise OperationAdmissionError("embedding cache lease is not owned")
-        # The child handshake is the source of truth for dimensions.  Keep the
-        # per-model cache record in the same file scoped to this admission so a
-        # stale facade cannot publish a vector before identity is durable.
-        try:
-            with sqlite3.connect(str(self._path)) as conn:
-                row = conn.execute(
-                    "SELECT embedding_dim FROM hermes_cashew_cache_meta WHERE model=?",
-                    (model,),
-                ).fetchone()
-        except sqlite3.Error as exc:
-            raise OperationAdmissionError(
-                "embedding cache identity metadata is unavailable"
-            ) from exc
-        if row is None or int(row[0]) != self._embedding_dim:
-            raise OperationAdmissionError(
-                "embedding cache model dimension metadata mismatch"
-            )
-
-    def get_many(self, model: str, texts: list[str]) -> Any:
-        self._check(model)
-        return self._cache.get_many(model, texts)
-
-    def put_many(self, model: str, pairs: list[tuple[str, Any]]) -> Any:
-        self._check(model)
-        return self._cache.put_many(model, pairs)
-
-    def get(self, model: str, text: str) -> Any:
-        self._check(model)
-        return self._cache.get(model, text)
-
-    def put(self, model: str, text: str, vector: Any) -> Any:
-        self._check(model)
-        return self._cache.put(model, text, vector)
-
-    def size(self, model: str | None = None) -> Any:
-        selected = model or self._model
-        self._check(selected)
-        return self._cache.size(selected)
-
-    def invalidate_model(self, model: str) -> Any:
-        self._check(model)
-        return self._cache.invalidate_model(model)
 
 
 def _open_profile_embedding_cache(cache_path: pathlib.Path) -> Any:
@@ -707,13 +482,28 @@ def _persist_cache_identity(
 
 
 def _remove_existing_sleep_job(hermes_home: pathlib.Path | None) -> None:
-    """Compatibility no-op for older callers.
+    """Remove any existing 'cashew-sleep-cycle' cron job to prevent duplicates.
 
-    Job ownership is now established by a profile token in the scheduler prompt
-    and by the generated script marker.  A name-only scan could delete another
-    profile's job, so reconciliation deliberately performs no global cleanup.
+    Hermes cron jobs persist across restarts in ``$HERMES_HOME/cron/jobs.json``.
+    Without dedup, each provider initialize() would add another job, causing
+    N sleep cycles per tick after N restarts.  This helper scans by name and
+    removes any previous instance before registering a fresh one.
     """
-    del hermes_home
+    if hermes_home is None:
+        return
+    if not _HAS_HERMES_CRON:
+        return
+    try:
+        from cron.jobs import list_jobs, remove_job
+
+        for job in list_jobs():
+            if job.get("name") == "cashew-sleep-cycle":
+                remove_job(job["id"])
+                logger.info("sleep: removed duplicate cron job %s", job["id"])
+    except ImportError:
+        logger.debug("sleep: cron module not available — skipping dedup")
+    except Exception:
+        logger.warning("sleep: failed to dedup cron jobs", exc_info=True)
 
 
 # ── on_pre_compress prompt template ──────────────────────────────────
@@ -1365,7 +1155,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
     # ── Sleep cycle cron scheduling ──────────────────────────────────────
 
     def _register_sleep_cron(self) -> None:
-        """Reconcile this profile's persistent cron job and managed script."""
+        """Reconcile the persistent cron job and managed script with config."""
         if (
             self._hermes_home is None
             or self._config is None
@@ -1373,74 +1163,89 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         ):
             return
         try:
-            from cron.jobs import (
-                create_job,
-                list_jobs,
-                parse_schedule,
-                remove_job,
-                update_job,
-                use_cron_store,
+            from cron.jobs import create_job, list_jobs, remove_job
+
+            existing = [
+                job for job in list_jobs() if job.get("name") == "cashew-sleep-cycle"
+            ]
+            desired_schedule = self._config.sleep_schedule
+            enabled = self._config.sleep_cycles and bool(desired_schedule)
+            if not enabled:
+                for job in existing:
+                    remove_job(job["id"])
+                self._sleep_cron_job_id = None
+                return
+
+            script_source = (
+                pathlib.Path(__file__).parent / "sleep_cron_script.py"
+            ).read_text()
+            implementation = pathlib.Path(__file__).parent.resolve()
+            flat_anchor = self._hermes_home / "plugins" / "cashew"
+            dev_anchor = (
+                self._hermes_home / "hermes-agent" / "plugins" / "memory" / "cashew"
             )
-
-            home = self._hermes_home
-            config = self._config
-            desired_schedule = config.sleep_schedule
-            enabled = config.sleep_cycles and bool(desired_schedule)
-            parsed_schedule = parse_schedule(desired_schedule) if enabled else None
-            profile_id = profile_identity(home)
-            script_dest = home / "scripts" / CRON_SCRIPT_NAME
-            # The public cron API is profile-contextual.  Keep the whole
-            # read/reconcile/write transaction in this profile's store rather
-            # than relying on the process-wide active Hermes home.
-            with profile_cron_lock(home), use_cron_store(home):
-                existing = [
-                    job
-                    for job in list_jobs(include_disabled=True)
-                    if isinstance(job, dict)
-                ]
-                owned = [job for job in existing if owns_job(job, profile_id)]
-                if not enabled:
-                    for job in owned:
-                        job_id = job.get("id")
-                        if isinstance(job_id, str):
-                            remove_job(job_id)
-                    self._sleep_cron_job_id = None
-                    return
-
-                marker = installation_marker(
-                    home, pathlib.Path(__file__).parent.resolve(), config
+            if (
+                flat_anchor / "plugins" / "memory" / "cashew"
+            ).resolve() == implementation:
+                marker = {
+                    "kind": "flat",
+                    "anchor": "plugins/cashew",
+                    "implementation": str(implementation),
+                }
+            elif dev_anchor.resolve() == implementation:
+                marker = {
+                    "kind": "development",
+                    "anchor": "hermes-agent/plugins/memory/cashew",
+                    "implementation": str(implementation),
+                }
+            else:
+                raise RuntimeError(
+                    "Cashew must be installed at the selected HERMES_HOME flat or "
+                    "development anchor before its cron job can be registered"
                 )
-                template = (
-                    pathlib.Path(__file__).parent / "sleep_cron_script.py"
-                ).read_text(encoding="utf-8")
-                rendered = render_script(template, marker)
-                if stage_script(script_dest, rendered):
-                    logger.info("sleep: refreshed cron script at %s", script_dest)
-
-                if len(owned) == 1:
-                    job_id = owned[0].get("id")
-                    if isinstance(job_id, str):
-                        # Preserve the scheduler-owned identity and next-run
-                        # state when only the desired cadence changed.
-                        if owned[0].get("schedule") != parsed_schedule:
-                            update_job(job_id, {"schedule": desired_schedule})
-                        self._sleep_cron_job_id = job_id
-                        with self._sync_state_lock:
-                            self._health_cron = "registered"
-                        return
-
-                for job in owned:
-                    job_id = job.get("id")
-                    if isinstance(job_id, str):
-                        remove_job(job_id)
-                job = create_job(
-                    prompt=f"hermes-cashew sleep cycle [{profile_id}]",
-                    schedule=desired_schedule,
-                    name=CRON_JOB_NAME,
-                    script=CRON_SCRIPT_NAME,
-                    no_agent=True,
-                    repeat=None,  # forever
+            marker_sentinel = "_INSTALLATION_MARKER = None"
+            if script_source.count(marker_sentinel) != 1:
+                logger.warning(
+                    "sleep: cron script template is invalid; reinstall or reinitialize Cashew"
                 )
+                raise RuntimeError(
+                    "Cashew cron script template is invalid; reinstall or "
+                    "reinitialize Cashew before registering its cron job"
+                )
+            script_source = script_source.replace(
+                marker_sentinel,
+                f"_INSTALLATION_MARKER = {marker!r}",
+                1,
+            )
+            script_dest = self._hermes_home / "scripts" / "cashew-sleep-cycle.py"
+            script_dest.parent.mkdir(parents=True, exist_ok=True)
+            if not script_dest.exists() or script_dest.read_text() != script_source:
+                staged = script_dest.with_suffix(".py.tmp")
+                staged.write_text(script_source)
+                staged.chmod(0o755)
+                staged.replace(script_dest)
+                logger.info("sleep: refreshed cron script at %s", script_dest)
+
+            matching = [
+                job for job in existing if job.get("schedule") == desired_schedule
+            ]
+            if len(existing) == 1 and len(matching) == 1:
+                self._sleep_cron_job_id = matching[0]["id"]
+                with self._sync_state_lock:
+                    self._health_cron = "registered"
+                return
+
+            for job in existing:
+                remove_job(job["id"])
+
+            job = create_job(
+                prompt="hermes-cashew sleep cycle",
+                schedule=desired_schedule,
+                name="cashew-sleep-cycle",
+                script="cashew-sleep-cycle.py",
+                no_agent=True,
+                repeat=None,  # forever
+            )
             self._sleep_cron_job_id = job["id"]
             with self._sync_state_lock:
                 self._health_cron = "registered"
@@ -1469,19 +1274,15 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
     def _suspend_sleep_cron(self) -> None:
         """Remove a stale sleep job when this profile's identity is unresolved."""
-        if self._hermes_home is None:
-            return
         try:
-            from cron.jobs import list_jobs, remove_job, use_cron_store
+            from cron.jobs import list_jobs, remove_job
 
-            home = self._hermes_home
-            profile_id = profile_identity(home)
-            with profile_cron_lock(home), use_cron_store(home):
-                for job in list_jobs(include_disabled=True):
-                    if isinstance(job, dict) and owns_job(job, profile_id):
-                        job_id = job.get("id")
-                        if isinstance(job_id, str):
-                            remove_job(job_id)
+            for job in list_jobs():
+                if (
+                    job.get("name") == "cashew-sleep-cycle"
+                    and job.get("script") == "cashew-sleep-cycle.py"
+                ):
+                    remove_job(job["id"])
         except ImportError:
             pass
         except Exception:
@@ -1490,6 +1291,27 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._sleep_cron_job_id = None
             with self._sync_state_lock:
                 self._health_cron = "disabled"
+
+    def _remove_sleep_cron(self) -> None:
+        """Deregister the sleep cycle cron job.
+
+        Called from shutdown().  Safe to call even when no job was registered.
+        """
+        if self._sleep_cron_job_id is None:
+            return
+        try:
+            from cron.jobs import remove_job
+
+            remove_job(self._sleep_cron_job_id)
+            logger.info("sleep: removed cron job %s", self._sleep_cron_job_id)
+        except Exception:
+            logger.warning(
+                "sleep: failed to remove cron job %s",
+                self._sleep_cron_job_id,
+                exc_info=True,
+            )
+        finally:
+            self._sleep_cron_job_id = None
 
     # LLM integration via auxiliary.memory convention
     # ------------------------------------------------------------------

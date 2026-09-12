@@ -26,14 +26,19 @@ from .embedding_process import (
     ProcessEmbeddingBackend,
     embedding_caller_wait,
 )
-from .error_tracking import capture_exception, set_plugin_context
+from .error_tracking import (
+    SentryTelemetry,
+    capture_exception,
+    close_sentry_telemetry,
+    start_sentry_telemetry,
+)
 from .health import OutcomeLedger, safe_error_class
 from .locking import (
     MaintenanceLockAcquisitionError,
     lock_path_for_db,
     try_maintenance_lock,
 )
-from .log_filter import add_scrub_filter
+from .log_filter import acquire_provider_scrub_filters, release_provider_scrub_filters
 from .metrics import _METRICS
 from .tracing import trace_operation
 
@@ -85,9 +90,6 @@ def _retrieve_with_embedding_wait(**kwargs: Any) -> Any:
     with embedding_caller_wait(1.5):
         return retrieve_recursive_bfs(**kwargs)
 
-
-# Install scrub filter on the cashew logger so all log output is sanitized.
-add_scrub_filter(logger)
 
 # Issue #18: sentence-transformers emits INFO-level progress bars and BertModel
 # load reports directly to the terminal during embedding. That noise leaks into
@@ -468,6 +470,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         # may still use upstream BFS when that optional extension is absent.
         self._embedding_identity_ready = False
         self._embedding_supervisor: EmbeddingSupervisor | None = None
+        # Optional diagnostics are explicitly enabled and owned by this
+        # provider generation. It is closed only after accepted workers drain.
+        self._sentry_telemetry: SentryTelemetry | None = None
+        self._log_scrub_acquired = False
 
     @property
     def name(self) -> str:
@@ -648,8 +654,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             # after a prior shutdown.
             self._shutdown_started.clear()
             self._shutdown_flag.clear()
-            with trace_operation("cashew.initialize") as span:
-                span.set_attribute("session_id", session_id)
+            acquire_provider_scrub_filters()
+            self._log_scrub_acquired = True
+            self._sentry_telemetry = start_sentry_telemetry()
+            with trace_operation("cashew.initialize"):
                 self._config = load_config(self._hermes_home)
                 # First-load bootstrap creates only Cashew's own config. The
                 # user explicitly opts into host-backed LLM work by adding an
@@ -712,17 +720,6 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     and _HAS_HERMES_CRON
                 ):
                     self._register_sleep_cron()
-                set_plugin_context(
-                    session_id=session_id,
-                    config={
-                        "recall_k": self._config.recall_k,
-                        "cashew_db_path": self._config.cashew_db_path,
-                        "embedding_model": self._config.embedding_model,
-                        "embedding_device": self._config.embedding_device,
-                        "auto_extraction": self._config.auto_extraction,
-                        "sleep_cycles": self._config.sleep_cycles,
-                    },
-                )
                 with self._lifecycle_lock:
                     if self._initialization_cancelled:
                         raise _InitializationCancelledError()
@@ -776,6 +773,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         except _InitializationCancelledError:
             model_fn = self._model_fn
             supervisor = self._embedding_supervisor
+            telemetry = self._sentry_telemetry
             with self._sync_state_lock:
                 self._config = None
                 self._db_path = None
@@ -783,17 +781,23 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._model_fn = None
                 self._embedding_identity_ready = False
                 self._sync_queue = None
+                self._sentry_telemetry = None
                 self._shutdown_started.set()
                 self._set_health_locked("stopped", "initialization_cancelled")
             close_model = getattr(model_fn, "_cashew_close", None)
             if callable(close_model):
                 close_model()
+            close_sentry_telemetry(telemetry)
             self._close_embedding_runtime(supervisor)
+            if self._log_scrub_acquired:
+                release_provider_scrub_filters()
+                self._log_scrub_acquired = False
         except Exception as _exc:
             capture_exception(
                 _exc,
                 operation="cashew.initialize",
                 session_id=session_id,
+                telemetry=self._sentry_telemetry,
             )
             config_path = (
                 resolve_config_path(self._hermes_home)
@@ -807,6 +811,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             )
             model_fn = self._model_fn
             supervisor = self._embedding_supervisor
+            telemetry = self._sentry_telemetry
             reason = self._initialization_reason(_exc)
             with self._sync_state_lock:
                 self._config = None
@@ -816,12 +821,17 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._embedding_identity_ready = False
                 self._sync_worker = None
                 self._sync_queue = None
+                self._sentry_telemetry = None
                 self._shutdown_started.set()
                 self._set_health_locked("failed", reason, error=_exc)
             close_model = getattr(model_fn, "_cashew_close", None)
             if callable(close_model):
                 close_model()
+            close_sentry_telemetry(telemetry)
             self._close_embedding_runtime(supervisor)
+            if self._log_scrub_acquired:
+                release_provider_scrub_filters()
+                self._log_scrub_acquired = False
         finally:
             with self._lifecycle_lock:
                 self._initializing = False
@@ -905,6 +915,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 )
             marker_sentinel = "_INSTALLATION_MARKER = None"
             if script_source.count(marker_sentinel) != 1:
+                logger.warning(
+                    "sleep: cron script template is invalid; reinstall or reinitialize Cashew"
+                )
                 raise RuntimeError(
                     "Cashew cron script template is invalid; reinstall or "
                     "reinitialize Cashew before registering its cron job"
@@ -1153,7 +1166,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     ledger.start()
                 try:
                     with trace_operation("cashew.sync") as span:
-                        span.set_attribute("user.length", len(turn[0]))
+                        span.set_attribute("input_length", len(turn[0]))
                         completed = self._drain_once(turn)
                     self._finish_worker_turn(ledger, generation, completed)
                 except Exception as _exc:
@@ -1164,6 +1177,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         operation="cashew.sync",
                         session_id=self._session_id,
                         extra={"turn_user_len": len(turn[0])},
+                        telemetry=self._sentry_telemetry,
                     )
                     logger.warning("cashew sync worker: turn failed", exc_info=True)
                 finally:
@@ -2250,6 +2264,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._model_fn = None
             self._embedding_identity_ready = False
             supervisor = self._embedding_supervisor
+            telemetry = self._sentry_telemetry
+            self._sentry_telemetry = None
             self._warm_cache.clear()
             self._prefetch_generation += 1
             self._prefetch_pending = None
@@ -2261,11 +2277,15 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._last_assistant = ""
             self._prefetch_condition.notify_all()
             self._set_health_locked("stopping", "embedding_shutdown")
+        close_sentry_telemetry(telemetry)
         self._close_embedding_runtime(
             supervisor,
             timeout=embedding_close_timeout,
             mark_stopped=True,
         )
+        if self._log_scrub_acquired:
+            release_provider_scrub_filters()
+            self._log_scrub_acquired = False
 
     def prefetch(  # noqa: C901 - retrieval fallback branches preserve the adapter contract
         self,
@@ -2360,7 +2380,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 return ""
         with trace_operation(
             "cashew.prefetch",
-            {"query.length": len(query)},
+            {"input_length": len(query)},
         ) as _span:
             vector_failed = False
             keyword_failed = False
@@ -2848,7 +2868,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 query = args["query"]
                 with trace_operation(
                     "cashew.query",
-                    {"query.length": len(query)},
+                    {"input_length": len(query)},
                 ) as span:
                     max_nodes = args.get("max_nodes", self._config.recall_k)
                     domain = args.get("domain")
@@ -2901,8 +2921,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                                 )
                     _elapsed_ms = (time.perf_counter() - _t0) * 1000
                     _METRICS.record_query(cache_hit=False, elapsed_ms=_elapsed_ms)
-                    span.set_attribute("node_count", node_count)
-                    span.set_attribute("elapsed_ms", _elapsed_ms)
+                    span.set_attribute("result_count", node_count)
+                    span.set_attribute("duration_bucket_ms", _elapsed_ms)
                 return build_success_envelope(
                     query=query,
                     context=context,
@@ -2926,6 +2946,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         "query_len": len(args.get("query", "")),
                         "max_nodes": args.get("max_nodes", "default"),
                     },
+                    telemetry=self._sentry_telemetry,
                 )
                 logger.warning(
                     "cashew tool call %r failed",
@@ -2985,6 +3006,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     operation="cashew.extract",
                     session_id=self._session_id,
                     extra={"user_len": len(args.get("user_content", ""))},
+                    telemetry=self._sentry_telemetry,
                 )
                 logger.warning(
                     "cashew tool call %r failed",

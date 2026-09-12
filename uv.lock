@@ -502,6 +502,7 @@ dev = [
     { name = "deptry" },
     { name = "jsonschema" },
     { name = "mypy" },
+    { name = "opentelemetry-api" },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -509,6 +510,7 @@ dev = [
     { name = "pytest-mock" },
     { name = "pyyaml" },
     { name = "ruff" },
+    { name = "sentry-sdk" },
     { name = "vulture" },
 ]
 tracing = [
@@ -524,6 +526,7 @@ requires-dist = [
     { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.18,<5" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.8,<3" },
     { name = "numpy" },
+    { name = "opentelemetry-api", marker = "extra == 'dev'", specifier = ">=1.20,<2" },
     { name = "opentelemetry-api", marker = "extra == 'tracing'", specifier = ">=1.20,<2" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.6,<5" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.2,<10" },
@@ -534,6 +537,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4,<1" },
     { name = "scikit-learn" },
     { name = "sentence-transformers" },
+    { name = "sentry-sdk", marker = "extra == 'dev'", specifier = ">=1.40,<3" },
     { name = "sentry-sdk", marker = "extra == 'tracing'", specifier = ">=1.40,<3" },
     { name = "sqlite-vec" },
     { name = "vulture", marker = "extra == 'dev'", specifier = ">=2.11,<3" },

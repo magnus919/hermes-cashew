@@ -115,7 +115,7 @@ def _prepare_think_db(db: Path) -> None:
         )
 
 
-def _run_async_dream_owner(graph: str, cache: str, ready) -> None:
+def _run_async_dream_owner(graph: str, cache: str, ready, context_exited) -> None:
     """Run the async entrypoint from a child-owned admission."""
     import plugins.memory.cashew.sleep_refactor as sleep_module
     from plugins.memory.cashew.admission import current_admission
@@ -139,6 +139,7 @@ def _run_async_dream_owner(graph: str, cache: str, ready) -> None:
         sleep_module._run_dream_async(graph, [], model_fn=None, admission=admission)
     # The admission context has exited, but the transferred async owner keeps
     # its original descriptors until the child finishes or is killed.
+    context_exited.set()
     time.sleep(30)
 
 
@@ -516,13 +517,15 @@ def test_async_dream_transfers_exact_token_and_process_death_releases_leases(
     graph = tmp_path / "brain.db"
     cache = tmp_path / "cache.db"
     ready = context.Event()
+    context_exited = context.Event()
     child = context.Process(
         target=_run_async_dream_owner,
-        args=(str(graph), str(cache), ready),
+        args=(str(graph), str(cache), ready, context_exited),
     )
     child.start()
     try:
         assert ready.wait(timeout=10)
+        assert context_exited.wait(timeout=10)
         # The child exits its admission context after the real async entrypoint
         # transfers the original owner; no replacement lock is acquired.
         probe_context = multiprocessing.get_context("spawn")

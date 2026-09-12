@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import threading
 import time
+import types
 
+import plugins.memory.cashew as cashew_module
 from plugins.memory.cashew import CashewMemoryProvider
 
 
@@ -86,7 +88,22 @@ def test_init_vector_unavailable_reports_keyword_degradation(tmp_path, monkeypat
     def vec_unavailable(provider, _db_path):
         provider._vector_available = False
 
+    embedded_queries: list[dict] = []
+    persisted_extracts: list[dict] = []
+
+    def record_embedding_route(**kwargs):
+        embedded_queries.append(kwargs)
+        return []
+
+    def persist_extract(**kwargs):
+        persisted_extracts.append(kwargs)
+        return types.SimpleNamespace(new_nodes=["written"], new_edges=[])
+
     monkeypatch.setattr(CashewMemoryProvider, "_finalize_vec_schema", vec_unavailable)
+    monkeypatch.setattr(
+        cashew_module, "_retrieve_with_embedding_wait", record_embedding_route
+    )
+    monkeypatch.setattr("core.session.end_session", persist_extract, raising=False)
     provider = CashewMemoryProvider()
     provider.initialize("vector-health", hermes_home=str(tmp_path))
     try:
@@ -94,6 +111,19 @@ def test_init_vector_unavailable_reports_keyword_degradation(tmp_path, monkeypat
         assert status["state"] == "degraded"
         assert status["reason_code"] == "vector_unavailable"
         assert status["fallback"] == "keyword"
+        assert provider._embedding_identity_ready is True
+
+        extract = json.loads(
+            provider.handle_tool_call(
+                "cashew_extract",
+                {"user_content": "write", "assistant_content": "admitted"},
+            )
+        )
+        assert extract["ok"] is True
+        assert persisted_extracts
+
+        provider.prefetch("embedding route")
+        assert embedded_queries
     finally:
         provider.shutdown()
 

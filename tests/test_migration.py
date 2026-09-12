@@ -8,6 +8,7 @@ import importlib
 import json
 import pathlib
 import sqlite3
+import types
 
 import numpy as np
 import pytest
@@ -39,7 +40,7 @@ def _verified_child_handshake(request, monkeypatch: pytest.MonkeyPatch):
 
             return nullcontext()
 
-        def encode(self, texts):
+        def encode(self, texts, **_kwargs):
             return np.ones((len(texts), self.dimension), dtype=np.float32)
 
         def _when_closed(self, callback):
@@ -593,36 +594,50 @@ def test_unresolved_identity_is_keyword_only_and_recovers_after_reinitialize(
     before = _logical_embedding_snapshot(db_path)
     removed: list[str] = []
 
-    class CronJobs:
-        @staticmethod
-        def list_jobs():
-            return [
-                {
-                    "id": "cashew",
-                    "name": "cashew-sleep-cycle",
-                    "script": "cashew-sleep-cycle.py",
-                },
-                {
-                    "id": "other",
-                    "name": "cashew-sleep-cycle",
-                    "script": "other.py",
-                },
-            ]
-
-        @staticmethod
-        def remove_job(job_id):
-            removed.append(job_id)
-
     import sys
-    import types
+
+    jobs = [
+        {
+            "id": "cashew",
+            "name": "cashew-sleep-cycle",
+            "script": "cashew-sleep-cycle.py",
+            "schedule": "every 12h",
+        },
+        {"id": "other", "name": "unrelated-job", "script": "other.py"},
+    ]
+    created: list[dict] = []
+
+    def list_jobs():
+        return list(jobs)
+
+    def remove_job(job_id):
+        removed.append(job_id)
+        jobs[:] = [job for job in jobs if job["id"] != job_id]
+
+    def create_job(**kwargs):
+        created.append(kwargs)
+        job = {
+            "id": "recovered-cashew",
+            "name": kwargs["name"],
+            "script": kwargs["script"],
+            "schedule": kwargs["schedule"],
+        }
+        jobs.append(job)
+        return job
 
     cron_package = types.ModuleType("cron")
     cron_package.__path__ = []  # type: ignore[attr-defined]
     cron_jobs = types.ModuleType("cron.jobs")
-    cron_jobs.list_jobs = CronJobs.list_jobs
-    cron_jobs.remove_job = CronJobs.remove_job
+    cron_jobs.list_jobs = list_jobs
+    cron_jobs.remove_job = remove_job
+    cron_jobs.create_job = create_job
     monkeypatch.setitem(sys.modules, "cron", cron_package)
     monkeypatch.setitem(sys.modules, "cron.jobs", cron_jobs)
+    monkeypatch.setattr(cashew_module, "_HAS_HERMES_CRON", True)
+    source = pathlib.Path(__file__).parents[1] / "plugins" / "memory" / "cashew"
+    anchor = tmp_path / "hermes-agent" / "plugins" / "memory" / "cashew"
+    anchor.parent.mkdir(parents=True)
+    anchor.symlink_to(source, target_is_directory=True)
 
     def destructive_failure(path, *, confirm, quiet):
         del confirm, quiet
@@ -686,10 +701,61 @@ def test_unresolved_identity_is_keyword_only_and_recovers_after_reinitialize(
     monkeypatch.setattr(
         "scripts.migrate_embeddings.migrate_embeddings", _fake_migrate_to_1024
     )
+    embedded_queries: list[dict] = []
+    persisted_extracts: list[dict] = []
+
+    def record_embedding_route(**kwargs):
+        embedded_queries.append(kwargs)
+        return []
+
+    def persist_extract(**kwargs):
+        persisted_extracts.append(kwargs)
+        conn = sqlite3.connect(kwargs["db_path"])
+        try:
+            conn.execute(
+                "INSERT INTO thought_nodes (id, content, node_type, domain, timestamp) "
+                "VALUES ('recovered-write', 'recovered write', 'fact', 'test', '2026-01-03')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return types.SimpleNamespace(new_nodes=["recovered-write"], new_edges=[])
+
+    monkeypatch.setattr(
+        cashew_module, "_retrieve_with_embedding_wait", record_embedding_route
+    )
+    monkeypatch.setattr("core.session.end_session", persist_extract, raising=False)
     provider.initialize("recovered", hermes_home=str(tmp_path))
     try:
         assert provider._embedding_identity_ready is True
         assert provider._embedding_dimensions(db_path) == ({1024}, 1024)
+        import core.embedding_service
+
+        service = core.embedding_service.get_default_service()
+        assert isinstance(service, cashew_module._GenerationBoundEmbeddingService)
+        assert service._supervisor is provider._embedding_supervisor
+        assert service.embed_np(["recovered generation"]).shape == (1, 1024)
+
+        extract = json.loads(
+            provider.handle_tool_call(
+                "cashew_extract",
+                {"user_content": "write", "assistant_content": "recovered"},
+            )
+        )
+        assert extract["ok"] is True
+        assert persisted_extracts
+        conn = sqlite3.connect(str(db_path))
+        try:
+            assert conn.execute(
+                "SELECT content FROM thought_nodes WHERE id='recovered-write'"
+            ).fetchone() == ("recovered write",)
+        finally:
+            conn.close()
+
+        provider.prefetch("recovered route")
+        assert embedded_queries
+        assert created and provider._sleep_cron_job_id == "recovered-cashew"
+        assert any(job["id"] == "other" for job in jobs)
     finally:
         provider.shutdown()
 

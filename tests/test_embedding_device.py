@@ -427,9 +427,14 @@ def test_pinned_upstream_shims_are_bounded_and_have_retirement_provenance(
 
     # The pinned dd57 call graph requires the three documented seams.  These
     # are AST checks so a comment or unrelated helper cannot satisfy them.
-    assert "get_default_service" in {
-        called_name(call) for call in calls(core_embeddings.embed_nodes)
-    }
+    default_service_calls = [
+        call
+        for call in calls(core_embeddings.embed_nodes)
+        if called_name(call) == "get_default_service"
+    ]
+    assert default_service_calls and all(
+        not call.args and not call.keywords for call in default_service_calls
+    )
     for migration_entry in (
         migration_script.detect_mismatch,
         migration_script.migrate_embeddings,
@@ -462,10 +467,14 @@ def test_pinned_upstream_shims_are_bounded_and_have_retirement_provenance(
         and node.attr == "dim"
         for node in ast.walk(resolver_tree)
     )
-    assert "get_embedding_model" in {
-        called_name(call)
+    model_calls = [
+        call
         for call in calls(core.embedding_service._resolve_default_model)
-    }
+        if called_name(call) == "get_embedding_model"
+    ]
+    assert model_calls and all(
+        not call.args and not call.keywords for call in model_calls
+    )
 
     def assigned_target(target: ast.expr) -> str | None:
         def dotted(node: ast.expr) -> str | None:

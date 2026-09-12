@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -64,3 +66,24 @@ def test_main_reports_initialize_failure_and_cleans_up(
     )
     assert not verify_home.exists()
     assert "CASHEW_EMBD_CACHE" not in os.environ
+
+
+def test_module_entrypoint_consumes_health_status_without_path_leakage() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, "-m", "plugins.memory.cashew.verify"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "HF_DATASETS_OFFLINE": "1",
+        },
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "[cashew] verify: all checks passed"
+    assert "health_status" not in result.stdout
+    assert "Traceback" not in result.stderr

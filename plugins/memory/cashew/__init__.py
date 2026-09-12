@@ -22,6 +22,7 @@ from .embedding import (
     normalize_embedding_device,
 )
 from .error_tracking import capture_exception, set_plugin_context
+from .health import OutcomeLedger, safe_error_class
 from .locking import (
     MaintenanceLockAcquisitionError,
     lock_path_for_db,
@@ -488,6 +489,18 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         # reports that Python's atexit sequence has begun. Unlike normal
         # shutdown, this is unrecoverable and remaining queued turns must stop.
         self._shutdown_flag = threading.Event()
+        # Provider-local operational status.  The module-level metrics object is
+        # aggregate telemetry only; this snapshot is the truthful per-generation
+        # diagnostic contract.
+        self._health_state = "unconfigured"
+        self._health_reason: str | None = "not_initialized"
+        self._health_fallback = "none"
+        self._health_cron = "disabled"
+        self._health_generation = 0
+        self._health_last_error: dict[str, str | float] | None = None
+        self._health_last_error_at: float | None = None
+        self._outcomes = OutcomeLedger()
+        self._vector_available: bool | None = None
 
     @property
     def name(self) -> str:
@@ -507,6 +520,98 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         # When the home is unknown, fall back to dependency availability only.
         return ContextRetriever is not None
+
+    def health_status(self) -> Dict[str, Any]:
+        """Return a bounded, read-only operational snapshot for diagnostics.
+
+        This method intentionally performs no database/model/cron work and does
+        not change provider state.  Hermes discovery must continue to use
+        :meth:`is_available`, whose cheap config/dependency contract is stable.
+        """
+        with self._sync_state_lock:
+            last_error = None
+            if self._health_last_error is not None:
+                last_error = dict(self._health_last_error)
+                if self._health_last_error_at is not None:
+                    last_error["age_s"] = round(
+                        max(0.0, time.monotonic() - self._health_last_error_at), 1
+                    )
+            runtime = {
+                "config_loaded": self._config is not None,
+                "retriever_ready": self._retriever is not None,
+                "write_enabled": self._write_enabled,
+                "worker_running": bool(
+                    self._sync_worker is not None and self._sync_worker.is_alive()
+                ),
+            }
+            snapshot = {
+                "state": self._health_state,
+                "reason_code": self._health_reason,
+                "generation": self._health_generation,
+                "runtime": runtime,
+                "fallback": self._health_fallback,
+                "cron": self._health_cron,
+                "last_error": last_error,
+            }
+            snapshot.update(self._outcomes.snapshot())
+            return snapshot
+
+    def _set_health_locked(
+        self,
+        state: str,
+        reason: str | None = None,
+        *,
+        fallback: str | None = None,
+        cron: str | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        """Publish health state while ``_sync_state_lock`` is held."""
+        self._health_state = state
+        self._health_reason = reason
+        if fallback is not None:
+            self._health_fallback = fallback
+        if cron is not None:
+            self._health_cron = cron
+        if error is not None:
+            self._health_last_error = {
+                "code": reason or "provider_error",
+                "class": safe_error_class(error),
+            }
+            self._health_last_error_at = time.monotonic()
+        elif state in {"ready", "degraded", "stopped", "unconfigured"}:
+            self._health_last_error = None
+            self._health_last_error_at = None
+
+    def _mark_health_if_current(
+        self,
+        ledger: OutcomeLedger,
+        generation: int,
+        state: str,
+        reason: str,
+        *,
+        fallback: str | None = None,
+    ) -> None:
+        """Publish an operation finding only for its admitted generation."""
+        with self._sync_state_lock:
+            if (
+                ledger is not self._outcomes
+                or generation != self._health_generation
+                or self._shutdown_started.is_set()
+                or self._health_state in {"stopping", "stopped"}
+            ):
+                return
+            self._set_health_locked(state, reason, fallback=fallback)
+
+    def _outcome_current_locked(
+        self, ledger: OutcomeLedger, generation: int
+    ) -> bool:
+        """Return whether an operation may publish into the current runtime."""
+        return (
+            ledger is self._outcomes
+            and generation == self._health_generation
+            and not self._shutdown_started.is_set()
+            and self._health_state not in {"stopping", "stopped"}
+        )
 
     def get_config_schema(self) -> list[dict[str, Any]]:
         """Return the JSON-Schema-shaped dict Hermes uses to drive `hermes memory setup` (CONF-01)."""
@@ -555,6 +660,14 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     return
                 self._initializing = True
                 self._initialization_cancelled = False
+                self._health_generation += 1
+                self._outcomes = OutcomeLedger()
+                self._health_fallback = "none"
+                self._health_cron = "disabled"
+                self._health_last_error = None
+                self._health_last_error_at = None
+                self._vector_available = None
+                self._set_health_locked("initializing", "initializing")
         try:
             self._session_id = session_id
             self._hermes_home = pathlib.Path(kwargs["hermes_home"])
@@ -625,6 +738,43 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         raise _InitializationCancelledError()
                     # Start only after the complete runtime snapshot is ready.
                     self._start_sync_worker()
+                    # Publish health while the same lifecycle ownership lock is
+                    # held as worker publication.  Shutdown cannot clear the
+                    # config or queue between the start and this snapshot.
+                    with self._sync_state_lock:
+                        if (
+                            self._sync_queue is None
+                            or self._shutdown_started.is_set()
+                        ):
+                            raise _InitializationCancelledError()
+                        cron_state = (
+                            "registered"
+                            if self._sleep_cron_job_id is not None
+                            else self._health_cron
+                        )
+                        config = self._config
+                        model_fn = self._model_fn
+                        if self._vector_available is False:
+                            self._set_health_locked(
+                                "degraded",
+                                "vector_unavailable",
+                                fallback="keyword",
+                                cron=cron_state,
+                            )
+                        elif cron_state in {"unavailable", "failed"}:
+                            self._set_health_locked(
+                                "degraded",
+                                "cron_unavailable"
+                                if cron_state == "unavailable"
+                                else "cron_registration_failed",
+                                cron=cron_state,
+                            )
+                        elif config is not None and config.llm_aux_role and model_fn is None:
+                            self._set_health_locked(
+                                "degraded", "model_unavailable", cron=cron_state
+                            )
+                        else:
+                            self._set_health_locked("ready", None, cron=cron_state)
         except _InitializationCancelledError:
             with self._sync_state_lock:
                 self._config = None
@@ -633,6 +783,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._model_fn = None
                 self._sync_queue = None
                 self._shutdown_started.clear()
+                self._set_health_locked("stopped", "initialization_cancelled")
         except Exception as _exc:
             capture_exception(
                 _exc,
@@ -649,16 +800,30 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 config_path,
                 exc_info=True,
             )
-            self._config = None
-            self._db_path = None
-            self._retriever = None
-            self._sync_worker = None
-            self._sync_queue = None
-            self._shutdown_started.clear()
+            reason = self._initialization_reason(_exc)
+            with self._sync_state_lock:
+                self._config = None
+                self._db_path = None
+                self._retriever = None
+                self._sync_worker = None
+                self._sync_queue = None
+                self._shutdown_started.clear()
+                self._set_health_locked("failed", reason, error=_exc)
         finally:
             with self._lifecycle_lock:
                 self._initializing = False
                 self._initialization_cancelled = False
+
+    @staticmethod
+    def _initialization_reason(error: BaseException) -> str:
+        """Map init failures to a small diagnostic vocabulary."""
+        if ContextRetriever is None:
+            return "dependency_missing"
+        if isinstance(error, (ValueError, TypeError, json.JSONDecodeError)):
+            return "config_invalid"
+        if isinstance(error, sqlite3.OperationalError):
+            return "storage_error"
+        return "initialization_failed"
 
     def _start_sync_worker(self) -> None:
         """Launch the daemon worker. Called from initialize() only on happy path.
@@ -746,6 +911,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             ]
             if len(existing) == 1 and len(matching) == 1:
                 self._sleep_cron_job_id = matching[0]["id"]
+                with self._sync_state_lock:
+                    self._health_cron = "registered"
                 return
 
             for job in existing:
@@ -760,18 +927,24 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 repeat=None,  # forever
             )
             self._sleep_cron_job_id = job["id"]
+            with self._sync_state_lock:
+                self._health_cron = "registered"
             logger.info(
                 "sleep: registered cron job %s (schedule=%s)",
                 job["id"],
                 desired_schedule,
             )
         except ImportError:
+            with self._sync_state_lock:
+                self._health_cron = "unavailable"
             logger.warning(
                 "sleep: cannot register cron job — Hermes cron module not available "
                 "(schedule=%s); sleep cycles will not run automatically",
                 self._config.sleep_schedule,
             )
         except Exception:
+            with self._sync_state_lock:
+                self._health_cron = "failed"
             logger.warning(
                 "sleep: failed to register cron job (schedule=%s)",
                 self._config.sleep_schedule,
@@ -843,6 +1016,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 or not config.auto_extraction
                 or self._sync_queue is None
             ):
+                if self._sync_queue is not None and (
+                    self._initializing or self._shutdown_started.is_set()
+                ):
+                    self._outcomes.reject()
                 return
             # Buffer assistant content for queue_prefetch cue extraction only
             # after the turn has been admitted.
@@ -853,22 +1030,29 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             turn = (user_content, assistant_content, effective_session)
             try:
                 q.put_nowait(turn)
+                self._outcomes.admit()
             except queue.Full:
                 # Drop-oldest policy.
+                evicted = False
                 try:
                     q.get_nowait()
                     q.task_done()  # balance the drop (exactly once)
+                    evicted = True
                 except queue.Empty:
                     pass  # worker drained between Full and get_nowait — rare race
-                self._dropped_turn_count += 1
-                _METRICS.record_sync_dropped()
+                if evicted:
+                    self._dropped_turn_count += 1
+                    self._outcomes.drop_pending()
+                    _METRICS.record_sync_dropped()
                 logger.warning(
                     "cashew sync queue overflow (maxsize=%d); dropped oldest turn",
                     q.maxsize,
                 )
                 try:
                     q.put_nowait(turn)
+                    self._outcomes.admit()
                 except queue.Full:
+                    self._outcomes.reject()
                     logger.warning(
                         "cashew sync queue still full after drop-oldest; "
                         "dropping new turn"
@@ -925,11 +1109,17 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 if turn is _SHUTDOWN:
                     q.task_done()
                     return
+                with self._sync_state_lock:
+                    ledger = self._outcomes
+                    generation = self._health_generation
+                    ledger.start()
                 try:
                     with trace_operation("cashew.sync") as span:
                         span.set_attribute("user.length", len(turn[0]))
-                        self._drain_once(turn)
+                        completed = self._drain_once(turn)
+                    self._finish_worker_turn(ledger, generation, completed)
                 except Exception as _exc:
+                    self._fail_worker_turn(ledger, generation, _exc)
                     _METRICS.record_sync_failure()
                     capture_exception(
                         _exc,
@@ -941,6 +1131,32 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 finally:
                     q.task_done()
                     _METRICS.set_queue_depth(q.qsize())
+
+    def _finish_worker_turn(
+        self, ledger: OutcomeLedger, generation: int, completed: bool
+    ) -> None:
+        """Publish a worker completion only to its admitted generation."""
+        with self._sync_state_lock:
+            if ledger is not self._outcomes or generation != self._health_generation:
+                return
+            if completed is False:
+                ledger.drop_in_flight()
+            else:
+                ledger.complete()
+
+    def _fail_worker_turn(
+        self, ledger: OutcomeLedger, generation: int, error: BaseException
+    ) -> None:
+        """Publish a worker failure unless shutdown has taken ownership."""
+        with self._sync_state_lock:
+            if ledger is not self._outcomes or generation != self._health_generation:
+                return
+            ledger.fail()
+            if (
+                not self._shutdown_started.is_set()
+                and self._health_state not in {"stopping", "stopped"}
+            ):
+                self._set_health_locked("degraded", "backend_error", error=error)
 
     def _ensure_db_schema(self, db_path: pathlib.Path) -> None:
         """Create or migrate Cashew schema tables.
@@ -959,6 +1175,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         conn = sqlite3.connect(str(db_path))
         try:
+            self._vector_available = True
             try:
                 conn.enable_load_extension(True)
                 try:
@@ -968,6 +1185,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 except (ImportError, AttributeError):
                     conn.load_extension("vec0")
             except Exception:
+                self._vector_available = False
                 pass  # sqlite-vec not available at platform level; graceful degradation active
             self._migrate_vec_embeddings(conn)
             self._create_vec_embeddings(conn)
@@ -1291,7 +1509,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         except Exception:
             logger.warning("cashew access metrics update failed", exc_info=True)
 
-    def _drain_once(self, turn: tuple[str, str, str]) -> None:
+    def _drain_once(self, turn: tuple[str, str, str]) -> bool:
         """Persist one turn via Cashew's heuristic extractor (or LLM if configured).
 
         Lazy-imports core.session so the plugin module loads even when cashew-brain
@@ -1310,7 +1528,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         # observed. Normal provider shutdown must drain accepted turns.
         if self._shutdown_flag.is_set():
             logger.debug("cashew sync: interpreter shutdown flag set, dropping turn")
-            return
+            return False
 
         import sqlite3
 
@@ -1333,7 +1551,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 if "can't register atexit after shutdown" in msg:
                     logger.info("cashew sync: interpreter shutting down, dropping turn")
                     self._shutdown_flag.set()
-                    return
+                    return False
                 raise
             except sqlite3.OperationalError as e:
                 if "database is locked" in str(e) and attempt < max_retries - 1:
@@ -1373,6 +1591,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 except Exception:
                     logger.warning("think cycle failed", exc_info=True)
             self._save_think_counter(counter)
+        return True
 
     def _load_think_counter(self) -> int:
         """Read persistent think counter from DB. Resets to 0 on any error."""
@@ -1649,6 +1868,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 )
                 deadline = time.monotonic() + max(0.0, timeout)
                 self._shutdown_started.set()
+                self._set_health_locked("stopping", "shutdown_requested")
                 self._prefetch_generation += 1
                 self._prefetch_pending = None
                 self._prefetch_pending_request = None
@@ -1701,6 +1921,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             if t.is_alive()
         )
         if alive_workers:
+            with self._sync_state_lock:
+                self._set_health_locked("stopping", "worker_timeout")
             cleanup = threading.Thread(
                 target=self._clear_state_after_workers_exit,
                 args=(worker, q, alive_workers),
@@ -1754,6 +1976,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._last_assistant = ""
             self._prefetch_condition.notify_all()
             self._shutdown_started.clear()
+            self._set_health_locked("stopped", "shutdown_complete")
         logger.debug("cashew provider shutdown complete")
 
     def _parallel_retrieve(
@@ -1808,7 +2031,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     return nodes
         return None
 
-    def prefetch(
+    def prefetch(  # noqa: C901 - retrieval fallback branches preserve the adapter contract
         self,
         query: str,
         domain: str | None = None,
@@ -1828,6 +2051,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             ):
                 return ""
             requested_session = str(kwargs.get("session_id") or self._session_id)
+            ledger = self._outcomes
+            generation = self._health_generation
             identity = self._prefetch_request_identity(
                 session_id=requested_session,
                 generation=self._prefetch_generation,
@@ -1897,6 +2122,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     return self._format_context(nodes)
                 return ""
 
+            vector_failed = False
+            keyword_failed = False
             try:
                 from core.retrieval import retrieve_recursive_bfs
 
@@ -1914,6 +2141,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     nodes = self._enrich_results(node_ids, db_path=str(db_path))
                     return self._format_context(nodes)
             except Exception:
+                vector_failed = True
                 logger.debug(
                     "upstream retrieval failed, falling back to keyword", exc_info=True
                 )
@@ -1927,13 +2155,34 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     db_path=db_path,
                 )
                 if nodes:
+                    if vector_failed:
+                        self._mark_health_if_current(
+                            ledger,
+                            generation,
+                            "degraded",
+                            "vector_unavailable",
+                            fallback="keyword",
+                        )
                     self._update_access_metrics(
                         [n["id"] for n in nodes], db_path=db_path
                     )
                     return self._format_context(nodes)
             except Exception:
+                keyword_failed = True
                 logger.warning(
                     "cashew recall failed (query_len=%d)", len(query), exc_info=True
+                )
+            if keyword_failed:
+                self._mark_health_if_current(
+                    ledger, generation, "degraded", "backend_error"
+                )
+            elif vector_failed:
+                self._mark_health_if_current(
+                    ledger,
+                    generation,
+                    "degraded",
+                    "vector_unavailable",
+                    fallback="keyword",
                 )
         return ""
 
@@ -2302,7 +2551,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         """
         return [CASHEW_QUERY_SCHEMA, CASHEW_EXTRACT_SCHEMA]
 
-    def handle_tool_call(
+    def handle_tool_call(  # noqa: C901 - compatibility dispatcher keeps envelope branches together
         self, name: str, args: Dict[str, Any], **kwargs: Any
     ) -> str:
         """Route an LLM tool call to the Cashew backend.
@@ -2339,6 +2588,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     query=args.get("query"),
                     error_message="cashew recall failed",
                 )
+            with self._sync_state_lock:
+                ledger = self._outcomes
+                generation = self._health_generation
             try:
                 _t0 = time.perf_counter()
                 query = args["query"]
@@ -2350,6 +2602,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     domain = args.get("domain")
                     tag = args.get("tag")
                     exclude_tags = args.get("exclude_tags")
+                    vector_failed = False
                     try:
                         from core.retrieval import retrieve_recursive_bfs
 
@@ -2362,6 +2615,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                             exclude_tags=exclude_tags,
                         )
                     except Exception:
+                        vector_failed = True
                         results = None
                     if results:
                         node_ids = [r.node_id for r in results]
@@ -2377,6 +2631,17 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     else:
                         context = ""
                         node_count = 0
+                    with self._sync_state_lock:
+                        if self._outcome_current_locked(ledger, generation):
+                            ledger.record_tool(
+                                "cashew_query", success=True, empty=node_count == 0
+                            )
+                            if vector_failed and not self._shutdown_started.is_set():
+                                self._set_health_locked(
+                                    "degraded",
+                                    "vector_unavailable",
+                                    fallback="keyword",
+                                )
                     _elapsed_ms = (time.perf_counter() - _t0) * 1000
                     _METRICS.record_query(cache_hit=False, elapsed_ms=_elapsed_ms)
                     span.set_attribute("node_count", node_count)
@@ -2387,6 +2652,15 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     node_count=node_count,
                 )
             except Exception as _exc:
+                with self._sync_state_lock:
+                    if self._outcome_current_locked(ledger, generation):
+                        ledger.record_tool("cashew_query", success=False)
+                        self._set_health_locked(
+                            "degraded",
+                            "backend_error",
+                            error=_exc,
+                            fallback="keyword",
+                        )
                 capture_exception(
                     _exc,
                     operation="cashew.query",
@@ -2417,6 +2691,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 or self._shutdown_started.is_set()
             ):
                 return build_extract_error_envelope()
+            with self._sync_state_lock:
+                ledger = self._outcomes
+                generation = self._health_generation
             try:
                 user = args["user_content"]  # KeyError caught below — tool-call failure
                 assistant = args["assistant_content"]
@@ -2429,11 +2706,22 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     conversation_text=f"User: {user}\nAssistant: {assistant}",
                     model_fn=self._model_fn,
                 )
+                with self._sync_state_lock:
+                    if self._outcome_current_locked(ledger, generation):
+                        ledger.record_tool(
+                            "cashew_extract",
+                            success=True,
+                            empty=not result.new_nodes and not result.new_edges,
+                        )
                 return build_extract_success_envelope(
                     new_nodes=len(result.new_nodes),
                     new_edges=len(result.new_edges),
                 )
             except Exception as _exc:
+                with self._sync_state_lock:
+                    if self._outcome_current_locked(ledger, generation):
+                        ledger.record_tool("cashew_extract", success=False)
+                        self._set_health_locked("degraded", "backend_error", error=_exc)
                 capture_exception(
                     _exc,
                     operation="cashew.extract",

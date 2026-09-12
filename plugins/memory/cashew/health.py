@@ -43,6 +43,8 @@ class OutcomeLedger:
     accepted: int = 0
     completed: int = 0
     failed: int = 0
+    partial: int = 0
+    uncertain: int = 0
     dropped: int = 0
     rejected: int = 0
     pending: int = 0
@@ -71,10 +73,15 @@ class OutcomeLedger:
             self.in_flight -= 1
         self.completed += 1
 
-    def fail(self) -> None:
+    def fail(self, *, partial: bool = False, uncertain: bool = False) -> None:
         if self.in_flight:
             self.in_flight -= 1
-        self.failed += 1
+        if partial:
+            self.partial += 1
+        elif uncertain:
+            self.uncertain += 1
+        else:
+            self.failed += 1
 
     def drop_pending(self) -> None:
         if self.pending:
@@ -85,6 +92,14 @@ class OutcomeLedger:
         if self.in_flight:
             self.in_flight -= 1
         self.dropped += 1
+
+    def reject_in_flight(self) -> None:
+        """Remove work that never entered the provider admission boundary."""
+        if self.in_flight:
+            self.in_flight -= 1
+        if self.accepted:
+            self.accepted -= 1
+        self.rejected += 1
 
     def record_tool(self, tool: str, *, success: bool, empty: bool = False) -> None:
         if tool == "cashew_query":
@@ -106,11 +121,13 @@ class OutcomeLedger:
         reconciled = self.accepted == (
             self.completed
             + self.failed
+            + self.partial
+            + self.uncertain
             + self.dropped
             + self.pending
             + self.in_flight
         )
-        return {
+        snapshot = {
             "accepted": self.accepted,
             "completed": self.completed,
             "failed": self.failed,
@@ -120,6 +137,12 @@ class OutcomeLedger:
             "in_flight": self.in_flight,
             "reconciled": reconciled,
         }
+        # Preserve the compact pre-initialization health contract while
+        # exposing the richer terminal states as soon as work exists.
+        if self.accepted or self.partial or self.uncertain:
+            snapshot["partial"] = self.partial
+            snapshot["uncertain"] = self.uncertain
+        return snapshot
 
     def tool_snapshot(self) -> dict[str, int]:
         return {

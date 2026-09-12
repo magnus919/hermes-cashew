@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import importlib
 import inspect
+import sqlite3
 import textwrap
 import threading
 from pathlib import Path
@@ -270,6 +271,11 @@ def test_unknown_model_dimension_is_published_only_after_child_handshake(
     assert isinstance(supervisor, VerifiedSupervisor)
     assert supervisor.started is True
     assert core.embedding_service._KNOWN_DIMS[model] == 7
+    with sqlite3.connect(tmp_path / "embedding-cache.db") as conn:
+        assert conn.execute(
+            "SELECT embedding_dim FROM hermes_cashew_cache_meta WHERE model=?",
+            (model,),
+        ).fetchone() == (7,)
 
 
 def test_same_model_profiles_keep_distinct_cache_and_late_close_cannot_clobber_binding(

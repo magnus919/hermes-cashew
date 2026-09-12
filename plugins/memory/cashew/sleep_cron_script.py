@@ -12,11 +12,16 @@ reinstalling it to refresh the generated script.
 import importlib
 import json
 import os
+import sqlite3
 import sys
 import types
 from pathlib import Path
 
 _INSTALLATION_MARKER = None
+
+
+class _CronAdmissionError(RuntimeError):
+    """The standalone job cannot safely establish its profile identity."""
 
 
 def _find_hermes_home() -> Path:
@@ -74,6 +79,8 @@ def _load_profile_modules(hermes_home: Path):
         or not (implementation / "sleep_refactor.py").is_file()
         or not (implementation / "embedding_process.py").is_file()
         or not (implementation / "embedding_worker.py").is_file()
+        or not (implementation / "admission.py").is_file()
+        or not (implementation / "locking.py").is_file()
     ):
         raise RuntimeError(
             "Cashew installation is incomplete for this cron job; reinstall or "
@@ -111,6 +118,35 @@ def _resolve_db_path(hermes_home: Path, db_path_value: str, config_module=None) 
     return str(config_module.resolve_db_path(hermes_home, db_path_value))
 
 
+def _runtime_epoch(db_path: str, model: str, dimension: int) -> int:
+    """Read the identity that a standalone maintenance cycle is allowed to own."""
+    path = Path(db_path).resolve(strict=False)
+    conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    try:
+        metadata = dict(
+            conn.execute(
+                "SELECT key, value FROM hermes_provider_meta WHERE key IN "
+                "('embedding_model','embedding_dim','vec_dim','maintenance_epoch')"
+            ).fetchall()
+        )
+    finally:
+        conn.close()
+    try:
+        epoch = int(metadata["maintenance_epoch"])
+        embedding_dim = int(metadata["embedding_dim"])
+        vec_dim = int(metadata["vec_dim"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _CronAdmissionError("Cashew cron runtime identity is incomplete") from exc
+    if (
+        epoch < 1
+        or metadata.get("embedding_model") != model
+        or embedding_dim != dimension
+        or vec_dim != dimension
+    ):
+        raise _CronAdmissionError("Cashew cron runtime identity is stale")
+    return epoch
+
+
 def main() -> None:
     """Discover config, import sleep_refactor, run one cycle, print JSON."""
     hermes_home = _find_hermes_home()
@@ -131,6 +167,10 @@ def main() -> None:
         process_module = importlib.import_module(
             f"{sleep_module.__package__}.embedding_process"
         )
+        admission_module = importlib.import_module(
+            f"{sleep_module.__package__}.admission"
+        )
+        locking_module = importlib.import_module(f"{sleep_module.__package__}.locking")
         supervisor = process_module.EmbeddingSupervisor(
             model=config.embedding_model,
             device=config.embedding_device,
@@ -141,18 +181,50 @@ def main() -> None:
             # Validate the child model/dimension before sleep reads or writes any
             # semantic state; no parent-process model fallback is permitted.
             supervisor.start()
-            result = sleep_module.run_sleep_cycle(
-                db_path=db_path,
-                limit=config.sleep_max_nodes,
-                model_fn=model_fn,
-                # This process owns the scheduled cycle and exits immediately after
-                # printing the result. Keep dream generation and orphan embedding
-                # synchronous so they complete before interpreter shutdown.
-                background_dream=False,
-                embedding_model=config.embedding_model,
-                embedding_device=config.embedding_device,
-                embedding_client=supervisor,
-            )
+            dimension = int(supervisor.dimension)
+            # Maintenance obtains graph then cache exclusively before it asks
+            # upstream to mutate either store. Read and validate the persisted
+            # identity only after both leases are owned, eliminating the cron
+            # startup TOCTOU window.
+            with admission_module.admit_operation(
+                graph_path=db_path,
+                cache_path=Path(db_path).parent / "embedding-cache.db",
+                model=config.embedding_model,
+                embedding_dim=dimension,
+                vec_dim=dimension,
+                supervisor=supervisor,
+                embedding_generation=supervisor.generation,
+                exclusive=True,
+                cache_exclusive=True,
+                deadline=1.5,
+            ):
+                _runtime_epoch(db_path, config.embedding_model, dimension)
+                conn = sqlite3.connect(db_path)
+                try:
+                    locking_module.guard_sqlite_journal(conn)
+                finally:
+                    conn.close()
+                result = sleep_module.run_sleep_cycle(
+                    db_path=db_path,
+                    limit=config.sleep_max_nodes,
+                    model_fn=model_fn,
+                    # This process owns the scheduled cycle and exits immediately
+                    # after printing the result. Keep dream generation and orphan
+                    # embedding synchronous until interpreter shutdown.
+                    background_dream=False,
+                    embedding_model=config.embedding_model,
+                    embedding_device=config.embedding_device,
+                    embedding_client=supervisor,
+                )
+        except (
+            _CronAdmissionError,
+            admission_module.OperationAdmissionError,
+            locking_module.MaintenanceLockAcquisitionError,
+            locking_module.SQLiteWALUnsupportedError,
+        ):
+            # Cron is best-effort. Contention or an unsafe journal leaves the
+            # profile untouched and does not trigger a partial retry.
+            result = {}
         finally:
             supervisor.close()
         print(json.dumps(result, indent=2))

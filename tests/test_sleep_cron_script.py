@@ -34,8 +34,16 @@ def _write_installation(implementation: Path, identity: str) -> None:
     implementation.mkdir(parents=True)
     source_template = Path(provider_module.__file__).parent / "sleep_cron_script.py"
     (implementation / "sleep_cron_script.py").write_text(source_template.read_text())
+    source_root = Path(provider_module.__file__).parent
+    # The generated entry point must exercise the same admission and journal
+    # modules as a profile install, rather than a test-only replacement.
+    (implementation / "admission.py").write_text(
+        (source_root / "admission.py").read_text()
+    )
+    (implementation / "locking.py").write_text((source_root / "locking.py").read_text())
     (implementation / "config.py").write_text(
         "import json\n"
+        "import sqlite3\n"
         "from pathlib import Path\n"
         "class Config:\n"
         "    def __init__(self, values):\n"
@@ -45,7 +53,13 @@ def _write_installation(implementation: Path, identity: str) -> None:
         "        self.embedding_device = values.get('embedding_device', 'cpu')\n"
         "def load_config(home):\n"
         "    path = Path(home) / 'cashew.json'\n"
-        "    return Config(json.loads(path.read_text()) if path.exists() else {})\n"
+        "    config = Config(json.loads(path.read_text()) if path.exists() else {})\n"
+        "    db = Path(home) / config.cashew_db_path\n"
+        "    db.parent.mkdir(parents=True, exist_ok=True)\n"
+        "    with sqlite3.connect(db) as conn:\n"
+        "        conn.execute('CREATE TABLE IF NOT EXISTS hermes_provider_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)')\n"
+        "        conn.executemany('INSERT OR REPLACE INTO hermes_provider_meta VALUES (?, ?)', [('embedding_model', config.embedding_model), ('embedding_dim', '384'), ('vec_dim', '384'), ('maintenance_epoch', '1')])\n"
+        "    return config\n"
         "def resolve_db_path(home, raw):\n"
         "    return Path(home) / raw\n"
         "def resolve_model_fn(*, hermes_home, config):\n"
@@ -60,8 +74,8 @@ def _write_installation(implementation: Path, identity: str) -> None:
         "    if path:\n"
         "        with open(path, 'a') as handle: handle.write(value + '\\n')\n"
         "class EmbeddingSupervisor:\n"
-        "    def __init__(self, **kwargs): self.kwargs = kwargs\n"
-        "    def start(self): _event('start'); return 384\n"
+        "    def __init__(self, **kwargs): self.kwargs = kwargs; self.dimension = kwargs.get('dimension', 0); self.generation = 'fake-generation'\n"
+        "    def start(self): self.dimension = 384; _event('start'); return 384\n"
         "    def close(self): _event('close')\n"
     )
     (implementation / "embedding_worker.py").write_text("# test worker marker\n")

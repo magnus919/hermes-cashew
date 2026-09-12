@@ -27,8 +27,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
+import pathlib
 import random
 import sqlite3
 import threading
@@ -39,7 +41,18 @@ from typing import Any, Optional
 
 import numpy as np
 
-from .locking import MaintenanceLockAcquisitionError, try_maintenance_lock
+from .admission import (
+    OperationAdmission,
+    OperationAdmissionError,
+    current_admission,
+    install_admission,
+)
+from .locking import (
+    MaintenanceLockAcquisitionError,
+    guard_sqlite_journal,
+    sqlite_wal_reset_vulnerable,
+    try_maintenance_lock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -720,6 +733,7 @@ def _run_dream_async(
     embedding_device: str = "cpu",
     embedding_client: Any = None,
     expected_dimension: int | None = None,
+    admission: OperationAdmission | None = None,
 ) -> None:
     """Run Phase 8 (dream) + Phase 9 (orphan embedding) in a daemon thread.
 
@@ -729,19 +743,35 @@ def _run_dream_async(
     cross-process coordination with ordinary writers remains issue #191.
     """
 
+    owner = admission.lease_owner if admission is not None else None
+    if owner is not None:
+        owner.transfer()
+
     def _task() -> None:
         try:
-            with closing(sqlite3.connect(db_path)) as conn:
-                conn.execute("PRAGMA busy_timeout=5000")
-                _set_wal(conn)
-                dream_id = _generate_dream(conn, cross_link_tuples, model_fn=model_fn)
-                orphans = _embed_orphans(
-                    conn,
-                    embedding_model=embedding_model,
-                    embedding_device=embedding_device,
-                    embedding_client=embedding_client,
-                    expected_dimension=expected_dimension,
-                )
+            with (
+                install_admission(admission)
+                if admission is not None
+                else contextlib.nullcontext()
+            ):
+                with closing(sqlite3.connect(db_path)) as conn:
+                    conn.execute("PRAGMA busy_timeout=5000")
+                    if sqlite_wal_reset_vulnerable(sqlite3.sqlite_version_info):
+                        # Affected SQLite runtimes must never reset an existing
+                        # journal while deferred work is opening its connection.
+                        guard_sqlite_journal(conn)
+                    else:
+                        _set_wal(conn)
+                    dream_id = _generate_dream(
+                        conn, cross_link_tuples, model_fn=model_fn
+                    )
+                    orphans = _embed_orphans(
+                        conn,
+                        embedding_model=embedding_model,
+                        embedding_device=embedding_device,
+                        embedding_client=embedding_client,
+                        expected_dimension=expected_dimension,
+                    )
             logger.info(
                 "sleep: background dream complete (id=%s, orphans=%d)",
                 dream_id or "none",
@@ -749,9 +779,17 @@ def _run_dream_async(
             )
         except Exception:
             logger.warning("sleep: background dream failed", exc_info=True)
+        finally:
+            if owner is not None:
+                owner.close()
 
     t = threading.Thread(target=_task, daemon=True)
-    t.start()
+    try:
+        t.start()
+    except BaseException:
+        if owner is not None:
+            owner.close()
+        raise
     logger.debug("sleep: background dream thread spawned")
 
 
@@ -789,8 +827,30 @@ def run_sleep_cycle(
     # This lock serializes migration and the synchronous portion of sleep.
     # Background dream work is observable through dream_pending and has a
     # separate connection; broader writer coordination belongs to issue #191.
+    existing_admission = current_admission()
+    owns_graph_admission = existing_admission is not None and (
+        existing_admission.graph_path == pathlib.Path(db_path).resolve(strict=False)
+    )
+    if existing_admission is not None and not owns_graph_admission:
+        raise OperationAdmissionError("sleep admission graph identity mismatch")
+    if owns_graph_admission:
+        assert existing_admission is not None
+        if not existing_admission.exclusive:
+            raise OperationAdmissionError("sleep requires an exclusive graph admission")
+        if existing_admission.model not in (None, embedding_model):
+            raise OperationAdmissionError("sleep admission model identity mismatch")
+        if (
+            existing_admission.cache_path is not None
+            and existing_admission.cache_lease is None
+        ):
+            raise OperationAdmissionError("sleep admission cache lease is missing")
+    lock_context = (
+        contextlib.nullcontext(object())
+        if owns_graph_admission
+        else try_maintenance_lock(db_path)
+    )
     try:
-        with try_maintenance_lock(db_path) as lock_fd:
+        with lock_context as lock_fd:
             if lock_fd is None:
                 logger.info("sleep: another cycle is already running — skipping")
                 return {}
@@ -798,7 +858,10 @@ def run_sleep_cycle(
             t_start = time.perf_counter()
             with closing(sqlite3.connect(db_path)) as conn:
                 conn.execute("PRAGMA busy_timeout=5000")
-                _set_wal(conn)
+                if owns_graph_admission:
+                    guard_sqlite_journal(conn)
+                else:
+                    _set_wal(conn)
 
                 # Select nodes for this cycle (lowest-degree-first heuristic)
                 rows = conn.execute(
@@ -844,6 +907,7 @@ def run_sleep_cycle(
                     embedding_client=embedding_client,
                     expected_dimension=expected_dimension,
                     t_start=t_start,
+                    admission=current_admission(),
                 )
     except MaintenanceLockAcquisitionError:
         logger.warning(
@@ -869,6 +933,7 @@ def _run_sleep_cycle_locked(
     embedding_client: Any,
     expected_dimension: int | None,
     t_start: float,
+    admission: OperationAdmission | None = None,
 ) -> dict:
     """Run synchronous sleep phases while the caller owns DB and lock resources."""
     # Phase 1: candidate discovery
@@ -939,6 +1004,7 @@ def _run_sleep_cycle_locked(
                 embedding_device=embedding_device,
                 embedding_client=embedding_client,
                 expected_dimension=expected_dimension,
+                admission=admission,
             )
             dream_pending = True
             dream_status = "pending"

@@ -28,16 +28,13 @@ def test_main_exercises_real_provider_without_leaving_state(
 ) -> None:
     verify_home = tmp_path / "verify-home"
     _fixed_temp_dir(monkeypatch, verify_home)
-    previous_cache = "/existing/embedding-cache.db"
-    monkeypatch.setenv("CASHEW_EMBD_CACHE", previous_cache)
-
     assert verify.main() == 0
 
     captured = capsys.readouterr()
     assert captured.out == "[cashew] verify: all checks passed\n"
     assert "[cashew] ERROR" not in captured.err
     assert not verify_home.exists()
-    assert os.environ["CASHEW_EMBD_CACHE"] == previous_cache
+    assert "CASHEW_EMBD_CACHE" not in os.environ
 
 
 def test_main_reports_initialize_failure_and_cleans_up(
@@ -68,7 +65,7 @@ def test_main_reports_initialize_failure_and_cleans_up(
     assert "CASHEW_EMBD_CACHE" not in os.environ
 
 
-def test_module_entrypoint_consumes_health_status_without_path_leakage() -> None:
+def test_module_entrypoint_reports_unavailable_child_without_path_leakage() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     result = subprocess.run(
         [sys.executable, "-m", "plugins.memory.cashew.verify"],
@@ -83,7 +80,12 @@ def test_module_entrypoint_consumes_health_status_without_path_leakage() -> None
         },
         timeout=30,
     )
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "[cashew] verify: all checks passed"
+    # The subprocess environment deliberately has no cached model.  A real
+    # verifier must now report that failed child handshake instead of silently
+    # falling back to a parent-local embedding service.
+    assert result.returncode == 1
+    assert (
+        "[cashew] ERROR: health_status() did not report an operational state"
+        in result.stderr
+    )
     assert "health_status" not in result.stdout
-    assert "Traceback" not in result.stderr

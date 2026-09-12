@@ -31,6 +31,16 @@ with try_maintenance_lock(sys.argv[1]) as lock_fd:
 """
 
 
+class _VerifiedSupervisor:
+    dimension = 1024
+
+    def _when_closed(self, callback) -> None:
+        callback()
+
+    def close(self, **_kwargs) -> None:
+        return None
+
+
 def _start_lock_holder(db_path: Path) -> subprocess.Popen[str]:
     process = subprocess.Popen(
         [sys.executable, "-c", _HOLDER, str(db_path)],
@@ -175,10 +185,10 @@ def test_unexpected_lock_acquisition_error_is_not_reported_as_contention(
     assert isinstance(error.value.__cause__, PermissionError)
 
 
-def test_initialize_survives_acquisition_failure_when_inspection_needs_no_migration(
+def test_initialize_is_keyword_only_when_lock_inspection_needs_no_migration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A healthy database remains usable when only maintenance lock access fails."""
+    """Lock failure is observable and never authorizes semantic mutation."""
     import plugins.memory.cashew as cashew_module
 
     (tmp_path / "cashew.json").write_text("{}")
@@ -191,11 +201,16 @@ def test_initialize_survives_acquisition_failure_when_inspection_needs_no_migrat
 
     monkeypatch.setattr(locking.fcntl, "flock", denied_lock)
     monkeypatch.setattr(
-        cashew_module, "_patch_upstream_embedding", lambda *_, **__: None
+        cashew_module,
+        "_bind_upstream_embedding",
+        lambda *_, **__: _VerifiedSupervisor(),
     )
     monkeypatch.setattr(CashewMemoryProvider, "_ensure_db_schema", lambda *_: None)
     monkeypatch.setattr(
         CashewMemoryProvider, "_embedding_dimensions", lambda *_: (set(), None)
+    )
+    monkeypatch.setattr(
+        CashewMemoryProvider, "_active_embedding_models", lambda *_: set()
     )
     monkeypatch.setattr(
         CashewMemoryProvider,
@@ -211,15 +226,19 @@ def test_initialize_survives_acquisition_failure_when_inspection_needs_no_migrat
         provider.initialize("session", hermes_home=str(tmp_path))
         assert provider._config is not None
         assert provider._retriever is not None
-        assert "migration not needed; unable to acquire" in caplog.text
+        assert provider._embedding_identity_ready is False
+        assert provider.health_status()["reason_code"] == "identity_unresolved"
+        assert (
+            "embedding identity inspection deferred; unable to acquire" in caplog.text
+        )
     finally:
         provider.shutdown()
 
 
-def test_initialize_degrades_when_acquisition_failure_hides_required_migration(
+def test_initialize_is_keyword_only_when_acquisition_failure_hides_required_migration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Initialization fails closed if a lock failure prevents needed migration."""
+    """A needed repair lock failure preserves read-only keyword query access."""
     import core.embedding_service
 
     import plugins.memory.cashew as cashew_module
@@ -234,11 +253,16 @@ def test_initialize_degrades_when_acquisition_failure_hides_required_migration(
 
     monkeypatch.setattr(locking.fcntl, "flock", denied_lock)
     monkeypatch.setattr(
-        cashew_module, "_patch_upstream_embedding", lambda *_, **__: None
+        cashew_module,
+        "_bind_upstream_embedding",
+        lambda *_, **__: _VerifiedSupervisor(),
     )
     monkeypatch.setattr(CashewMemoryProvider, "_ensure_db_schema", lambda *_: None)
     monkeypatch.setattr(
         CashewMemoryProvider, "_embedding_dimensions", lambda *_: ({384}, 384)
+    )
+    monkeypatch.setattr(
+        CashewMemoryProvider, "_active_embedding_models", lambda *_: {"old/model"}
     )
     monkeypatch.setattr(core.embedding_service, "resolve_embedding_dim", lambda _: 1024)
     monkeypatch.setattr(cashew_module, "ContextRetriever", lambda **_: object())
@@ -248,10 +272,14 @@ def test_initialize_degrades_when_acquisition_failure_hides_required_migration(
     provider = CashewMemoryProvider()
     try:
         provider.initialize("session", hermes_home=str(tmp_path))
-        assert provider._config is None
-        assert provider._db_path is None
-        assert provider._retriever is None
-        assert "provider will report unavailable" in caplog.text
+        assert provider._config is not None
+        assert provider._db_path is not None
+        assert provider._retriever is not None
+        assert provider._embedding_identity_ready is False
+        assert provider.health_status()["reason_code"] == "identity_unresolved"
+        assert (
+            "embedding identity could not be verified; unable to acquire" in caplog.text
+        )
     finally:
         provider.shutdown()
 
@@ -280,7 +308,9 @@ def test_initialize_respects_held_aged_lock_without_removing_it(
         migration_called = True
 
     monkeypatch.setattr(
-        cashew_module, "_patch_upstream_embedding", lambda *_, **__: None
+        cashew_module,
+        "_bind_upstream_embedding",
+        lambda *_, **__: _VerifiedSupervisor(),
     )
     monkeypatch.setattr(CashewMemoryProvider, "_ensure_db_schema", lambda *_: None)
     monkeypatch.setattr(

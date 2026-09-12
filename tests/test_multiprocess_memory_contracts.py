@@ -105,6 +105,7 @@ import fcntl, hashlib, json, os, sqlite3, sys, time
 from pathlib import Path
 import numpy as np
 os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_DATASETS_OFFLINE="1")
+import plugins.memory.cashew as cashew_module
 from plugins.memory.cashew import CashewMemoryProvider
 from plugins.memory.cashew.config import CashewConfig
 import core.session
@@ -137,6 +138,15 @@ class DeterministicEmbeddingService:
 
 _embedding_service = DeterministicEmbeddingService()
 core.embedding_service.get_default_service = lambda: _embedding_service
+
+class VerifiedSupervisor:
+    def __init__(self, model):
+        self.model = model
+        self.dimension = 384 if model == "thenlper/gte-small" else 1024
+    def _when_closed(self, callback): callback()
+    def close(self, **_kwargs): pass
+
+cashew_module._bind_upstream_embedding = lambda model, *_args, **_kwargs: VerifiedSupervisor(model)
 
 def emit(event, **payload):
     message = json.dumps({"event": event, "core": core.session.__file__, **payload})
@@ -249,13 +259,16 @@ elif action == "sleep":
 elif action == "migration":
     import logging
 
-    from plugins.memory.cashew import _patch_upstream_embedding
-
-    _patch_upstream_embedding("thenlper/gte-small", "cpu")
+    supervisor = VerifiedSupervisor("thenlper/gte-small")
     _embedding_service.model = "thenlper/gte-small"
     _embedding_service.dim = 384
+    import core.config
+    core.config.config.embedding_model = "thenlper/gte-small"
+    core.embedding_service._KNOWN_DIMS["thenlper/gte-small"] = 384
+    core.embedding_service._default_service = _embedding_service
     provider = CashewMemoryProvider()
     provider._config = CashewConfig(embedding_model="thenlper/gte-small")
+    provider._embedding_supervisor = supervisor
     original_repair = provider._repair_embedding_dimension_locked
     migration_records = []
     class MigrationCapture(logging.Handler):

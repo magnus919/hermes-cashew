@@ -39,6 +39,7 @@ def _provider(tmp_path: Path, **changes) -> CashewMemoryProvider:
     provider = CashewMemoryProvider()
     provider._hermes_home = tmp_path
     provider._config = replace(CashewConfig(), **changes)
+    provider._embedding_identity_ready = True
     return provider
 
 

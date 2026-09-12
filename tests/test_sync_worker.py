@@ -513,10 +513,14 @@ def test_shutdown_blocks_public_old_profile_access_until_cleanup(tmp_path, monke
         if old_worker is not None:
             old_worker.join(timeout=1.0)
         for _ in range(100):
-            if p._sync_queue is None:
+            if p._sync_queue is None and not p._shutdown_started.is_set():
                 break
             threading.Event().wait(0.01)
         assert p._sync_queue is None
+        # The queue can clear before the owned embedding child has reaped.
+        # Reinitialization stays blocked until that lifecycle admission gate
+        # releases, so no later profile can inherit a closed service/cache.
+        assert not p._shutdown_started.is_set()
 
         p.save_config({}, str(home_b))
         p.initialize("session-b", hermes_home=str(home_b))

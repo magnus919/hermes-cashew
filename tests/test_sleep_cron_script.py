@@ -54,9 +54,15 @@ def _write_installation(implementation: Path, identity: str) -> None:
     (implementation / "companion.py").write_text(f"IDENTITY = {identity!r}\n")
     (implementation / "embedding.py").write_text("MODEL = 'test-embedding'\n")
     (implementation / "embedding_process.py").write_text(
+        "import os\n"
+        "def _event(value):\n"
+        "    path = os.environ.get('CRON_EVENTS')\n"
+        "    if path:\n"
+        "        with open(path, 'a') as handle: handle.write(value + '\\n')\n"
         "class EmbeddingSupervisor:\n"
         "    def __init__(self, **kwargs): self.kwargs = kwargs\n"
-        "    def close(self): pass\n"
+        "    def start(self): _event('start'); return 384\n"
+        "    def close(self): _event('close')\n"
     )
     (implementation / "embedding_worker.py").write_text("# test worker marker\n")
     (implementation / "sleep_refactor.py").write_text(
@@ -65,6 +71,11 @@ def _write_installation(implementation: Path, identity: str) -> None:
         "from .companion import IDENTITY\n"
         "from . import embedding\n"
         "def run_sleep_cycle(**kwargs):\n"
+        "    path = os.environ.get('CRON_EVENTS')\n"
+        "    if path:\n"
+        "        with open(path, 'a') as handle: handle.write('run\\n')\n"
+        "    if os.environ.get('CRON_RAISE'):\n"
+        "        raise RuntimeError('synthetic cron failure')\n"
         "    assert kwargs['background_dream'] is False\n"
         "    Path(os.environ['PHASE_MARKER']).write_text(IDENTITY)\n"
         "    return {\n"
@@ -104,6 +115,7 @@ def _generate_script(
     provider = CashewMemoryProvider()
     provider._hermes_home = hermes_home
     provider._config = replace(CashewConfig(), sleep_schedule="every 1h")
+    provider._embedding_identity_ready = True
     provider._register_sleep_cron()
 
     return (
@@ -119,6 +131,7 @@ def test_generated_cron_script_runs_from_registered_installation(
 ) -> None:
     hermes_home, script, _implementation = _generate_script(tmp_path, monkeypatch, kind)
     marker = tmp_path / "phase-complete"
+    events = tmp_path / "cron-events"
     custom_db = "owned/custom-cashew.db"
     (hermes_home / "cashew.json").write_text(
         json.dumps(
@@ -143,6 +156,7 @@ def test_generated_cron_script_runs_from_registered_installation(
             "PATH": os.defpath,
             "PYTHONPATH": "",
             "PHASE_MARKER": str(marker),
+            "CRON_EVENTS": str(events),
         },
     )
 
@@ -156,6 +170,35 @@ def test_generated_cron_script_runs_from_registered_installation(
     assert result["embedding_model"] == "test/embedding-model"
     assert result["embedding_device"] == "mps"
     assert result["embedding_client"] == "EmbeddingSupervisor"
+    assert events.read_text().splitlines() == ["start", "run", "close"]
+
+
+def test_generated_cron_script_closes_owned_child_after_sleep_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hermes_home, script, _implementation = _generate_script(
+        tmp_path, monkeypatch, "flat"
+    )
+    events = tmp_path / "cron-events"
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        cwd=tmp_path,
+        env={
+            "HERMES_HOME": str(hermes_home),
+            "PATH": os.defpath,
+            "PYTHONPATH": "",
+            "CRON_EVENTS": str(events),
+            "CRON_RAISE": "1",
+        },
+    )
+
+    assert completed.returncode != 0
+    assert "synthetic cron failure" in completed.stderr
+    assert events.read_text().splitlines() == ["start", "run", "close"]
 
 
 @pytest.mark.parametrize("kind", ["flat", "development"])

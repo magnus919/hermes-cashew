@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime
 import math
 import sqlite3
+import threading
 import warnings
 
 import numpy as np
@@ -115,6 +116,28 @@ def _insert_embedding(
         "VALUES (?, ?, ?, datetime('now'))",
         (nid, vec.tobytes(), model),
     )
+
+
+def test_load_embedding_matrix_filters_non_active_dimensions(small_graph):
+    """Mixed historical vectors cannot participate in an active profile cycle."""
+    import plugins.memory.cashew.sleep_refactor as sleep
+
+    conn = sqlite3.connect(small_graph)
+    try:
+        _insert_node(conn, "wrong-dimension", "wrong dimension")
+        conn.execute(
+            "INSERT INTO embeddings (node_id, vector, model, updated_at) VALUES (?, ?, ?, datetime('now'))",
+            ("wrong-dimension", np.ones(1024, dtype=np.float32).tobytes(), "other"),
+        )
+        conn.commit()
+        ids, matrix = sleep._load_embedding_matrix(
+            conn, ["a", "wrong-dimension"], expected_dimension=384
+        )
+    finally:
+        conn.close()
+
+    assert ids == ["a"]
+    assert matrix.shape == (1, 384)
 
 
 def _insert_edge(
@@ -801,6 +824,27 @@ def test_embed_orphans_uses_injected_process_client(db_path):
     conn.close()
 
 
+def test_embed_orphans_rejects_wrong_child_dimension(db_path):
+    """An orphan write cannot introduce a vector from another generation."""
+    conn = sqlite3.connect(db_path)
+    _insert_node(conn, "wrong-child-vector", "dimension must match")
+    conn.commit()
+
+    client = type(
+        "Client",
+        (),
+        {"encode": lambda _self, texts: np.ones((len(texts), 7), dtype=np.float32)},
+    )()
+    assert _embed_orphans(conn, embedding_client=client, expected_dimension=384) == 0
+    assert (
+        conn.execute(
+            "SELECT node_id FROM embeddings WHERE node_id='wrong-child-vector'"
+        ).fetchone()
+        is None
+    )
+    conn.close()
+
+
 def test_embed_orphans_mixed_orphans(db_path):
     """Embedding gap closure works with a mix of orphaned and already-embedded nodes."""
     conn = sqlite3.connect(db_path)
@@ -1354,6 +1398,37 @@ def test_run_dream_async_handles_exception(small_graph):
 
     time.sleep(0.3)
     assert True
+
+
+def test_run_dream_async_captures_owned_client_and_verified_dimension(
+    small_graph, monkeypatch
+):
+    """Deferred work must retain the generation's child client and dimension."""
+    import plugins.memory.cashew.sleep_refactor as sleep
+
+    completed = threading.Event()
+    client = object()
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(sleep, "_generate_dream", lambda *_args, **_kwargs: None)
+
+    def record_orphans(_conn, **kwargs):
+        observed["client"] = kwargs["embedding_client"]
+        observed["dimension"] = kwargs["expected_dimension"]
+        completed.set()
+        return 0
+
+    monkeypatch.setattr(sleep, "_embed_orphans", record_orphans)
+    sleep._run_dream_async(
+        small_graph,
+        [],
+        None,
+        embedding_client=client,
+        expected_dimension=384,
+    )
+
+    assert completed.wait(timeout=2.0)
+    assert observed == {"client": client, "dimension": 384}
 
 
 def test_background_dream_flag_requires_model_fn_and_tuples(small_graph, monkeypatch):

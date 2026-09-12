@@ -12,7 +12,7 @@ import re
 import sqlite3
 import threading
 import time
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, cast
 
 from .embedding import (
     DEFAULT_EMBEDDING_DEVICE,
@@ -145,6 +145,36 @@ class _InitializationCancelledError(RuntimeError):
     """Private control flow for shutdown cancelling a slow initialize()."""
 
 
+class _GenerationBoundEmbeddingService:
+    """Make one upstream service unavailable once its owner closes.
+
+    Upstream's service returns cache hits and zero vectors without consulting a
+    backend.  The outer generation gate prevents those convenience paths from
+    letting a closed profile serve another profile's global singleton.
+    """
+
+    def __init__(self, service: Any, supervisor: EmbeddingSupervisor) -> None:
+        self._service = service
+        self._supervisor = supervisor
+
+    @property
+    def model(self) -> str:
+        return cast(str, self._service.model)
+
+    @property
+    def dim(self) -> int:
+        return cast(int, self._service.dim)
+
+    def embed_np(self, texts: list[str]) -> Any:
+        with self._supervisor.serve_generation():
+            return self._service.embed_np(texts)
+
+    def embed(self, text: Any) -> Any:
+        """Keep upstream's public single-text route behind the same gate."""
+        with self._supervisor.serve_generation():
+            return self._service.embed(text)
+
+
 # Probe for the Hermes cron module. In a full Hermes Agent environment the
 # cron.jobs package is importable (the agent root is on sys.path). In CI and
 # standalone test environments it is not — the sleep cycle cron job cannot be
@@ -221,6 +251,27 @@ _UPSTREAM_KNOWN_DIMS: dict[str, int] = {
     "BAAI/bge-small-en-v1.5": 384,
 }
 
+# Cashew-brain at dd57ef0 has no instance-scoped migration or embedding API.
+# These are the only private compatibility seams retained by this adapter:
+#
+# * ``core.config.config.embedding_model`` selects the model used by pinned
+#   migration helpers, which call ``resolve_embedding_dim()`` without args.
+# * ``core.embedding_service._default_service`` is read by ``embed_nodes()``
+#   without accepting a service/backend argument.
+# * ``core.embedding_service._KNOWN_DIMS[model]`` prevents that no-argument
+#   resolver from constructing an in-process LocalBackend for an *unknown*
+#   model after the child has already verified its dimension.
+#
+# Retire these assignments once upstream accepts an explicit service or
+# dimension in its embedding and migration entry points.  Do not add backend
+# method patches, reset the singleton, or write DEFAULT_MODEL/EMBEDDING_DIM:
+# those process-wide compatibility constants cannot safely represent profiles.
+_UPSTREAM_COMPATIBILITY_SHIMS = (
+    "core.config.config.embedding_model",
+    "core.embedding_service._default_service",
+    "core.embedding_service._KNOWN_DIMS[model]",
+)
+
 
 def _open_profile_embedding_cache(cache_path: pathlib.Path) -> Any:
     """Serialize only upstream's one-time shared cache schema initialization."""
@@ -237,13 +288,19 @@ def _open_profile_embedding_cache(cache_path: pathlib.Path) -> Any:
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
-def _patch_upstream_embedding(
+def _bind_upstream_embedding(
     model_name: str,
     device: str = DEFAULT_EMBEDDING_DEVICE,
     *,
     cache_path: pathlib.Path | None = None,
 ) -> EmbeddingSupervisor | None:
-    """Bind upstream embedding to an owned subprocess for one provider."""
+    """Bind one active profile to the owned child embedding service.
+
+    This deliberately publishes the three pinned upstream compatibility shims
+    only after the supervisor owns the process boundary, completes its child
+    handshake, and opens the profile-scoped cache.  A rejected profile therefore
+    cannot alter the active profile's upstream globals.
+    """
     try:
         import core.config
         import core.embedding_service
@@ -251,33 +308,30 @@ def _patch_upstream_embedding(
         logger.warning("cashew-brain not installed; cannot patch embedding model")
         return None
 
-    dim = _UPSTREAM_KNOWN_DIMS.get(model_name, 0)
-    selected_device = normalize_embedding_device(device)
     if cache_path is None:
-        core.config.config.embedding_model = model_name
-        # Retain the public compatibility constants for upstream consumers that
-        # still import them directly.
-        core.embedding_service.DEFAULT_MODEL = model_name
-        if dim:
-            core.embedding_service.EMBEDDING_DIM = dim
-        core.embedding_service.reset_default_service()
-        return None
+        raise ValueError("profile-scoped embedding cache path is required")
+
+    expected_dim = _UPSTREAM_KNOWN_DIMS.get(model_name, 0)
+    selected_device = normalize_embedding_device(device)
 
     supervisor = EmbeddingSupervisor(
         model=model_name,
         device=selected_device,
-        dimension=dim,
+        dimension=expected_dim,
         cache_dir=cache_path.parent / "model-cache",
     )
     try:
-        if dim == 0:
-            dim = supervisor.start()
-        service = core.embedding_service.EmbeddingService(
+        # Starting every model, including known ones, is intentional: the child
+        # owns model construction and validates known-model dimensions before
+        # any schema/migration write can occur.
+        dim = supervisor.start()
+        raw_service = core.embedding_service.EmbeddingService(
             model=model_name,
             cache=_open_profile_embedding_cache(cache_path),
             daemon=ProcessEmbeddingBackend(supervisor),
             local=NoInProcessEmbeddingBackend(dim),
         )
+        service = _GenerationBoundEmbeddingService(raw_service, supervisor)
     except Exception:
         supervisor.close()
         raise
@@ -285,9 +339,8 @@ def _patch_upstream_embedding(
     # dimension discovery, and cache setup all succeed. A rejected second
     # provider must not disturb the active owner's model or service.
     core.config.config.embedding_model = model_name
-    core.embedding_service.DEFAULT_MODEL = model_name
-    core.embedding_service.EMBEDDING_DIM = dim
-    core.embedding_service._KNOWN_DIMS[model_name] = dim
+    if expected_dim == 0:
+        core.embedding_service._KNOWN_DIMS[model_name] = dim
     core.embedding_service._default_service = service
     logger.info(
         "configured upstream embedding: model=%s dim=%d device=%s",
@@ -409,6 +462,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         self._health_last_error_at: float | None = None
         self._outcomes = OutcomeLedger()
         self._vector_available: bool | None = None
+        # Set only after the owned child has proved the configured embedding
+        # identity and any required backup-backed repair has succeeded.  It is
+        # deliberately independent of sqlite-vec availability: a ready brain
+        # may still use upstream BFS when that optional extension is absent.
+        self._embedding_identity_ready = False
         self._embedding_supervisor: EmbeddingSupervisor | None = None
 
     @property
@@ -576,6 +634,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._health_last_error = None
                 self._health_last_error_at = None
                 self._vector_available = None
+                self._embedding_identity_ready = False
                 self._set_health_locked("initializing", "initializing")
         try:
             self._session_id = session_id
@@ -599,7 +658,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._db_path = resolve_db_path(
                     self._hermes_home, self._config.cashew_db_path
                 )
-                self._embedding_supervisor = _patch_upstream_embedding(
+                self._embedding_supervisor = _bind_upstream_embedding(
                     self._config.embedding_model,
                     self._config.embedding_device,
                     cache_path=self._db_path.parent / "embedding-cache.db",
@@ -612,8 +671,28 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         "cashew-brain dependency missing"
                     )
                 self._db_path.parent.mkdir(parents=True, exist_ok=True)
+                # Keep the wrapper-owned sqlite-vec migration behind the same
+                # backup boundary as upstream's destructive re-embedding.  In
+                # particular, an old vec table must not be dropped before a
+                # failed embedding repair has a chance to restore it.
                 self._ensure_db_schema(self._db_path)
-                self._repair_embedding_dimension(self._db_path)
+                identity_ready = self._repair_embedding_dimension(self._db_path)
+                with self._sync_state_lock:
+                    self._embedding_identity_ready = identity_ready
+                    if not identity_ready:
+                        self._warm_cache.clear()
+                        self._prefetch_pending = None
+                if identity_ready:
+                    self._finalize_vec_schema(self._db_path)
+                else:
+                    # Do not expose an embedding service whose persisted
+                    # identity could not be proved or restored.  Query stays
+                    # available through keyword search, but all semantic
+                    # mutation and embedding-backed retrieval are fail-closed
+                    # until a later successful initialize.
+                    self._vector_available = False
+                    self._suspend_sleep_cron()
+                    self._close_embedding_runtime(self._embedding_supervisor)
                 self._retriever = ContextRetriever(db_path=str(self._db_path))
                 self._model_fn = self._build_model_fn()
                 # Finish all synchronous setup before publishing the worker.
@@ -627,7 +706,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 with self._lifecycle_lock:
                     if self._initialization_cancelled:
                         raise _InitializationCancelledError()
-                if self._write_enabled and _HAS_HERMES_CRON:
+                if (
+                    self._write_enabled
+                    and self._embedding_identity_ready
+                    and _HAS_HERMES_CRON
+                ):
                     self._register_sleep_cron()
                 set_plugin_context(
                     session_id=session_id,
@@ -658,7 +741,14 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         )
                         config = self._config
                         model_fn = self._model_fn
-                        if self._vector_available is False:
+                        if not self._embedding_identity_ready:
+                            self._set_health_locked(
+                                "degraded",
+                                "identity_unresolved",
+                                fallback="keyword",
+                                cron=cron_state,
+                            )
+                        elif self._vector_available is False:
                             self._set_health_locked(
                                 "degraded",
                                 "vector_unavailable",
@@ -691,6 +781,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._db_path = None
                 self._retriever = None
                 self._model_fn = None
+                self._embedding_identity_ready = False
                 self._sync_queue = None
                 self._shutdown_started.set()
                 self._set_health_locked("stopped", "initialization_cancelled")
@@ -722,6 +813,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._db_path = None
                 self._retriever = None
                 self._model_fn = None
+                self._embedding_identity_ready = False
                 self._sync_worker = None
                 self._sync_queue = None
                 self._shutdown_started.set()
@@ -764,7 +856,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
     def _register_sleep_cron(self) -> None:
         """Reconcile the persistent cron job and managed script with config."""
-        if self._hermes_home is None or self._config is None:
+        if (
+            self._hermes_home is None
+            or self._config is None
+            or not self._embedding_identity_ready
+        ):
             return
         try:
             from cron.jobs import create_job, list_jobs, remove_job
@@ -873,6 +969,26 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             )
             self._sleep_cron_job_id = None
 
+    def _suspend_sleep_cron(self) -> None:
+        """Remove a stale sleep job when this profile's identity is unresolved."""
+        try:
+            from cron.jobs import list_jobs, remove_job
+
+            for job in list_jobs():
+                if (
+                    job.get("name") == "cashew-sleep-cycle"
+                    and job.get("script") == "cashew-sleep-cycle.py"
+                ):
+                    remove_job(job["id"])
+        except ImportError:
+            pass
+        except Exception:
+            logger.warning("sleep: failed to suspend unresolved identity cron")
+        finally:
+            self._sleep_cron_job_id = None
+            with self._sync_state_lock:
+                self._health_cron = "disabled"
+
     def _remove_sleep_cron(self) -> None:
         """Deregister the sleep cycle cron job.
 
@@ -931,6 +1047,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             config = self._config
             if (
                 not self._write_enabled
+                or not self._embedding_identity_ready
                 or config is None
                 or self._initializing
                 or self._shutdown_started.is_set()
@@ -1086,7 +1203,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         upstream table creation (thought_nodes, derivation_edges, embeddings,
         hotspots, metrics), column migrations, index creation, and schema
         version stamping (PRAGMA user_version = 3). Then applies hermes-specific
-        extensions (vec_embeddings virtual table for sqlite-vec).
+        extensions (provider metadata).  The sqlite-vec schema is finalized
+        only after the backup-backed embedding repair has succeeded.
         """
         from core.db import ensure_schema
 
@@ -1094,6 +1212,21 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         import sqlite3
 
+        conn = sqlite3.connect(str(db_path))
+        try:
+            # Hermes provider metadata store (persistent counters, flags).
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS hermes_provider_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _finalize_vec_schema(self, db_path: pathlib.Path) -> None:
+        """Apply the reversible-wrapper vec schema work after repair succeeds."""
         conn = sqlite3.connect(str(db_path))
         try:
             self._vector_available = True
@@ -1110,13 +1243,6 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 pass  # sqlite-vec not available at platform level; graceful degradation active
             self._migrate_vec_embeddings(conn)
             self._create_vec_embeddings(conn)
-            # Hermes provider metadata store (persistent counters, flags)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS hermes_provider_meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                )
-            """)
             conn.commit()
         finally:
             conn.close()
@@ -1158,8 +1284,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             target.close()
             source.close()
 
-    def _repair_embedding_dimension(self, db_path: pathlib.Path) -> None:
-        """Back up and re-embed a brain whose stored dimensions are inconsistent.
+    def _repair_embedding_dimension(self, db_path: pathlib.Path) -> bool:
+        """Back up and re-embed a brain whose stored identity is inconsistent.
 
         Migration runs during initialization, before the provider starts its
         worker or exposes a retriever. cashew-brain owns the destructive
@@ -1174,29 +1300,129 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             with try_maintenance_lock(db_path) as lock_fd:
                 if lock_fd is None:
                     logger.warning(
-                        "embedding dimension migration deferred; another Cashew process holds %s",
+                        "embedding migration deferred; another Cashew process holds %s",
                         lock_path,
                     )
-                    return
-                self._repair_embedding_dimension_locked(db_path)
+                    return False
+                return self._repair_embedding_dimension_locked(db_path)
         except MaintenanceLockAcquisitionError:
-            if self._embedding_migration_required(db_path):
-                raise
+            required = self._embedding_migration_required(db_path)
             logger.warning(
-                "embedding dimension migration not needed; unable to acquire %s",
+                "embedding identity %s; unable to acquire %s; using keyword-only recall",
+                "could not be verified" if required else "inspection deferred",
                 lock_path,
                 exc_info=True,
             )
+            return False
+
+    def _active_embedding_dimension(self) -> int | None:
+        """Return only a dimension verified by this provider's child worker."""
+        supervisor = self._embedding_supervisor
+        if supervisor is None or supervisor.dimension <= 0:
+            return None
+        return supervisor.dimension
+
+    @staticmethod
+    def _active_embedding_ids(db_path: pathlib.Path) -> set[str]:
+        """Return the exact upstream rows a migration is expected to re-embed."""
+        conn = sqlite3.connect(str(db_path))
+        try:
+            rows = conn.execute(
+                "SELECT id FROM thought_nodes "
+                "WHERE (decayed IS NULL OR decayed = 0) "
+                "AND content IS NOT NULL AND TRIM(content) != ''"
+            ).fetchall()
+            return {str(row[0]) for row in rows}
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _active_embedding_models(db_path: pathlib.Path) -> set[str]:
+        """Return model identities for the live rows a repair must replace."""
+        conn = sqlite3.connect(str(db_path))
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT e.model FROM embeddings e "
+                "JOIN thought_nodes n ON n.id = e.node_id "
+                "WHERE (n.decayed IS NULL OR n.decayed = 0) "
+                "AND n.content IS NOT NULL AND TRIM(n.content) != ''"
+            ).fetchall()
+            return {str(row[0]) for row in rows if row[0] is not None}
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _migration_postconditions(
+        db_path: pathlib.Path,
+        *,
+        expected_ids: set[str],
+        expected_model: str,
+        expected_dimension: int,
+        vec_dimension: int | None,
+    ) -> None:
+        """Validate every active embedding before retaining destructive work."""
+        conn = sqlite3.connect(str(db_path))
+        try:
+            rows = conn.execute(
+                "SELECT e.node_id, e.model, LENGTH(e.vector) / 4 "
+                "FROM embeddings e JOIN thought_nodes n ON n.id = e.node_id "
+                "WHERE (n.decayed IS NULL OR n.decayed = 0) "
+                "AND n.content IS NOT NULL AND TRIM(n.content) != ''"
+            ).fetchall()
+            actual_ids = {str(row[0]) for row in rows}
+            if actual_ids != expected_ids:
+                raise RuntimeError("migration postcondition active node IDs mismatch")
+            if any(
+                row[1] != expected_model or int(row[2]) != expected_dimension
+                for row in rows
+            ):
+                raise RuntimeError(
+                    "migration postcondition model or dimension mismatch"
+                )
+            if vec_dimension is not None:
+                extension_enabled = False
+                try:
+                    conn.enable_load_extension(True)
+                    extension_enabled = True
+                    import sqlite_vec
+
+                    sqlite_vec.load(conn)
+                except Exception:
+                    # sqlite-vec is optional at this boundary. A platform can
+                    # retain its schema while losing the native extension;
+                    # exact ordinary embedding identity still authorizes the
+                    # ready BFS path, while finalization reports vec degraded.
+                    logger.info(
+                        "sqlite-vec unavailable during migration postcondition validation; "
+                        "skipping vec row check"
+                    )
+                else:
+                    vec_ids = {
+                        str(row[0])
+                        for row in conn.execute(
+                            "SELECT node_id FROM vec_embeddings"
+                        ).fetchall()
+                    }
+                    if vec_ids != expected_ids:
+                        raise RuntimeError(
+                            "migration postcondition vec node IDs mismatch"
+                        )
+                finally:
+                    if extension_enabled:
+                        conn.enable_load_extension(False)
+        finally:
+            conn.close()
 
     def _embedding_migration_required(self, db_path: pathlib.Path) -> bool:
         """Fail closed unless a read-only inspection proves migration is unnecessary."""
         if self._config is None:
             return True
         try:
-            from core.embedding_service import resolve_embedding_dim
-
-            expected_dim = resolve_embedding_dim(self._config.embedding_model)
+            expected_dim = self._active_embedding_dimension()
+            if expected_dim is None:
+                return True
             stored_dims, vec_dim = self._embedding_dimensions(db_path)
+            stored_models = self._active_embedding_models(db_path)
         except Exception:
             logger.warning(
                 "could not inspect embedding dimensions after lock acquisition failure",
@@ -1206,28 +1432,38 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         stored_mismatch = bool(stored_dims) and stored_dims != {expected_dim}
         vec_mismatch = vec_dim is not None and vec_dim != expected_dim
-        return stored_mismatch or vec_mismatch
+        model_mismatch = bool(stored_models) and stored_models != {
+            self._config.embedding_model
+        }
+        return stored_mismatch or vec_mismatch or model_mismatch
 
-    def _repair_embedding_dimension_locked(self, db_path: pathlib.Path) -> None:
-        """Repair dimensions while the cross-process Cashew lock is held."""
+    def _repair_embedding_dimension_locked(self, db_path: pathlib.Path) -> bool:
+        """Repair embedding identity while the cross-process Cashew lock is held."""
         if self._config is None:
-            return
+            return False
         try:
-            from core.embedding_service import resolve_embedding_dim
-
-            expected_dim = resolve_embedding_dim(self._config.embedding_model)
+            expected_dim = self._active_embedding_dimension()
+            if expected_dim is None:
+                logger.warning(
+                    "embedding dimension unavailable from owned child; migration skipped"
+                )
+                return False
             stored_dims, vec_dim = self._embedding_dimensions(db_path)
+            stored_models = self._active_embedding_models(db_path)
         except Exception:
             logger.warning(
                 "could not inspect embedding dimensions; migration skipped",
                 exc_info=True,
             )
-            return
+            return False
 
         stored_mismatch = bool(stored_dims) and stored_dims != {expected_dim}
         vec_mismatch = vec_dim is not None and vec_dim != expected_dim
-        if not stored_mismatch and not vec_mismatch:
-            return
+        model_mismatch = bool(stored_models) and stored_models != {
+            self._config.embedding_model
+        }
+        if not stored_mismatch and not vec_mismatch and not model_mismatch:
+            return True
 
         from core.backup import create_backup
 
@@ -1235,19 +1471,33 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         backup = create_backup(str(db_path), str(backup_dir))
         if backup is None:
             logger.warning(
-                "embedding dimension mismatch detected (stored=%s vec=%s expected=%s), "
+                "embedding identity mismatch detected (stored=%s models=%s vec=%s expected=%s/%s), "
                 "but backup failed; migration skipped",
                 sorted(stored_dims),
+                sorted(stored_models),
                 vec_dim,
+                self._config.embedding_model,
                 expected_dim,
             )
-            return
+            return False
 
         backup_path = pathlib.Path(backup)
+        expected_ids = self._active_embedding_ids(db_path)
+        expected_count = len(expected_ids)
         try:
             from scripts.migrate_embeddings import migrate_embeddings
 
             summary = migrate_embeddings(str(db_path), confirm=True, quiet=True)
+            embedded_count = summary.get("nodes_embedded")
+            if (
+                not isinstance(embedded_count, int)
+                or isinstance(embedded_count, bool)
+                or embedded_count != expected_count
+            ):
+                raise RuntimeError(
+                    "migration embedded "
+                    f"{embedded_count!r} nodes; expected {expected_count}"
+                )
             stored_after, vec_after = self._embedding_dimensions(db_path)
             if stored_after and stored_after != {expected_dim}:
                 raise RuntimeError(
@@ -1255,6 +1505,13 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 )
             if vec_after is not None and vec_after != expected_dim:
                 raise RuntimeError(f"vec_embeddings remains at dimension {vec_after}")
+            self._migration_postconditions(
+                db_path,
+                expected_ids=expected_ids,
+                expected_model=self._config.embedding_model,
+                expected_dimension=expected_dim,
+                vec_dimension=vec_after,
+            )
         except Exception:
             logger.warning(
                 "embedding migration failed; restoring pre-migration backup %s",
@@ -1269,17 +1526,20 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     db_path,
                     exc_info=True,
                 )
-            return
+            return False
 
         logger.info(
-            "embedding dimension migration complete: stored=%s vec=%s expected=%s "
+            "embedding migration complete: stored=%s models=%s vec=%s expected=%s/%s "
             "nodes_embedded=%s backup=%s",
             sorted(stored_dims),
+            sorted(stored_models),
             vec_dim,
+            self._config.embedding_model,
             expected_dim,
             summary.get("nodes_embedded", 0),
             backup_path,
         )
+        return True
 
     def _migrate_vec_embeddings(self, conn: sqlite3.Connection) -> None:
         """Migrate vec_embeddings from old schema (no node_id, no distance_metric)
@@ -1327,16 +1587,15 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 sqlite_vec.load(conn)
             except (ImportError, AttributeError):
                 conn.load_extension("vec0")
-            # Resolve the configured embedding model's dimension at runtime
-            # instead of hardcoding float[384] — supports gte-large (1024),
-            # gte-base (768), MiniLM (384), etc. Without this, vec_embeddings
-            # silently refuses dual-writes from any model with a different dim.
-            try:
-                from core.embedding_service import resolve_embedding_dim
-
-                dim = resolve_embedding_dim()
-            except Exception:
-                dim = 384  # fallback for test environments without models
+            # sqlite-vec schema is semantic state.  It may only be created with
+            # the active child-worker dimension; never load a parent LocalBackend
+            # or guess a fallback dimension here.
+            dim = self._active_embedding_dimension()
+            if dim is None:
+                logger.warning(
+                    "embedding dimension unavailable from owned child; vec schema deferred"
+                )
+                return
             conn.execute(f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings
                 USING vec0(node_id TEXT primary key, embedding float[{dim}] distance_metric=cosine)
@@ -1404,7 +1663,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
     def _update_access_metrics(
         self, node_ids: list[str], db_path: pathlib.Path | str | None = None
     ) -> None:
-        if not self._write_enabled or not node_ids:
+        if (
+            not self._write_enabled
+            or not self._embedding_identity_ready
+            or not node_ids
+        ):
             return
         target_db = db_path if db_path is not None else self._db_path
         if target_db is None:
@@ -1447,7 +1710,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         # Short-circuit only after Python interpreter finalization has been
         # observed. Normal provider shutdown must drain accepted turns.
-        if self._shutdown_flag.is_set():
+        if self._shutdown_flag.is_set() or not self._embedding_identity_ready:
             logger.debug("cashew sync: interpreter shutdown flag set, dropping turn")
             return False
 
@@ -1489,6 +1752,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         # Run think cycle periodically if LLM is wired
         if (
             self._model_fn is not None
+            and self._embedding_identity_ready
             and self._config
             and self._config.think_cycles
             and self._config.think_interval > 0
@@ -1532,6 +1796,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
     def _save_think_counter(self, value: int) -> None:
         """Write persistent think counter to DB."""
+        if not self._embedding_identity_ready:
+            return
         try:
             import sqlite3
 
@@ -1563,6 +1829,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         """
         if (
             not self._write_enabled
+            or not self._embedding_identity_ready
             or self._model_fn is None
             or self._db_path is None
             or self._initializing
@@ -1674,6 +1941,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         Silent-degrades: logs warning on failure, never raises.
         """
+        if not self._embedding_identity_ready:
+            return 0
+
         from core.embeddings import embed_nodes
         from core.session import _create_node, _set_node_tags
 
@@ -1978,6 +2248,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._db_path = None
             self._retriever = None
             self._model_fn = None
+            self._embedding_identity_ready = False
             supervisor = self._embedding_supervisor
             self._warm_cache.clear()
             self._prefetch_generation += 1
@@ -2026,6 +2297,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 exclude_tags=exclude_tags,
             )
             max_nodes = config.recall_k
+            identity_ready = self._embedding_identity_ready
             # Consume the pending result and snapshot the warm cache while
             # the same runtime identity is admitted. Releasing the lock
             # between these steps could let a reinitialized profile publish a
@@ -2067,6 +2339,25 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 "prefetch warm cache MISS (%d cue(s) in cache) — falling through to cold retrieval",
                 len(warm_cache),
             )
+        if not identity_ready:
+            try:
+                return self._format_context(
+                    self._keyword_search(
+                        query,
+                        max_nodes,
+                        domain,
+                        tag,
+                        exclude_tags,
+                        db_path=db_path,
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "cashew keyword-only recall failed (query_len=%d)",
+                    len(query),
+                    exc_info=True,
+                )
+                return ""
         with trace_operation(
             "cashew.prefetch",
             {"query.length": len(query)},
@@ -2175,7 +2466,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 query=query,
                 db_path=str(db_path),
                 top_k=config.prefetch_k,
-                use_llm=self._model_fn is not None and config.prefetch_cues > 0,
+                use_llm=(
+                    self._embedding_identity_ready
+                    and self._model_fn is not None
+                    and config.prefetch_cues > 0
+                ),
             )
             if self._prefetch_pending_request is not None:
                 _METRICS.record_prefetch_coalesced()
@@ -2270,19 +2565,12 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 if not self._prefetch_request_is_current(identity):
                     _METRICS.record_prefetch_cancelled()
                     return
-                results = _retrieve_with_embedding_wait(
-                    db_path=request.db_path,
-                    query=cue,
-                    top_k=request.top_k,
-                )
-                if results:
-                    node_ids = [r.node_id for r in results]
-                    nodes = self._enrich_results(node_ids, db_path=request.db_path)
-                    for node in nodes:
-                        node_id = node.get("id", "")
-                        if node_id not in seen_ids:
-                            seen_ids.add(node_id)
-                            all_nodes.append(node)
+                nodes = self._prefetch_nodes_for_cue(cue, request)
+                for node in nodes:
+                    node_id = node.get("id", "")
+                    if node_id not in seen_ids:
+                        seen_ids.add(node_id)
+                        all_nodes.append(node)
             if not self._prefetch_request_is_current(identity):
                 _METRICS.record_prefetch_cancelled()
                 return
@@ -2302,6 +2590,24 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 )
             else:
                 _METRICS.record_prefetch_cancelled()
+
+    def _prefetch_nodes_for_cue(
+        self, cue: str, request: _PrefetchRequest
+    ) -> list[dict]:
+        """Retrieve one cue without embedding when identity is unresolved."""
+        with self._sync_state_lock:
+            identity_ready = self._embedding_identity_ready
+        if identity_ready:
+            results = _retrieve_with_embedding_wait(
+                db_path=request.db_path,
+                query=cue,
+                top_k=request.top_k,
+            )
+            if results:
+                return self._enrich_results(
+                    [result.node_id for result in results], db_path=request.db_path
+                )
+        return self._keyword_search(cue, request.top_k, db_path=request.db_path)
 
     def _prefetch_request_is_current(self, identity: _PrefetchRequestIdentity) -> bool:
         """Check request and complete runtime identity without slow work."""
@@ -2536,6 +2842,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             with self._sync_state_lock:
                 ledger = self._outcomes
                 generation = self._health_generation
+                identity_ready = self._embedding_identity_ready
             try:
                 _t0 = time.perf_counter()
                 query = args["query"]
@@ -2548,17 +2855,20 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     tag = args.get("tag")
                     exclude_tags = args.get("exclude_tags")
                     vector_failed = False
-                    try:
-                        results = _retrieve_with_embedding_wait(
-                            db_path=str(self._db_path),
-                            query=query,
-                            top_k=max_nodes,
-                            domain=domain,
-                            tags=[tag] if tag else None,
-                            exclude_tags=exclude_tags,
-                        )
-                    except Exception:
-                        vector_failed = True
+                    if identity_ready:
+                        try:
+                            results = _retrieve_with_embedding_wait(
+                                db_path=str(self._db_path),
+                                query=query,
+                                top_k=max_nodes,
+                                domain=domain,
+                                tags=[tag] if tag else None,
+                                exclude_tags=exclude_tags,
+                            )
+                        except Exception:
+                            vector_failed = True
+                            results = None
+                    else:
                         results = None
                     if results:
                         node_ids = [r.node_id for r in results]
@@ -2579,7 +2889,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                             ledger.record_tool(
                                 "cashew_query", success=True, empty=node_count == 0
                             )
-                            if vector_failed and not self._shutdown_started.is_set():
+                            if (
+                                vector_failed
+                                and identity_ready
+                                and not self._shutdown_started.is_set()
+                            ):
                                 self._set_health_locked(
                                     "degraded",
                                     "vector_unavailable",
@@ -2628,6 +2942,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             # set _db_path / _config to None.
             if (
                 not self._write_enabled
+                or not self._embedding_identity_ready
                 or self._db_path is None
                 or self._config is None
                 or self._initializing

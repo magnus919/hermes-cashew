@@ -60,6 +60,9 @@ packages = ["plugins"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "--durations=10"
+markers = [
+    "real_embedding_child: exercise the isolated embedding worker with the offline child fixture",
+]
 
 [tool.ruff]
 target-version = "py310"

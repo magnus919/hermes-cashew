@@ -39,7 +39,7 @@ def _write_installation(implementation: Path, identity: str) -> None:
         "def resolve_db_path(home, raw):\n"
         "    return Path(home) / raw\n"
         "def resolve_model_fn(*, hermes_home):\n"
-        "    return None\n"
+        "    return 'resolved-memory-model'\n"
     )
     (implementation / "companion.py").write_text(f"IDENTITY = {identity!r}\n")
     (implementation / "sleep_refactor.py").write_text(
@@ -53,6 +53,10 @@ def _write_installation(implementation: Path, identity: str) -> None:
         "        'installation': IDENTITY,\n"
         "        'db_path': kwargs['db_path'],\n"
         "        'limit': kwargs['limit'],\n"
+        "        'model_fn': kwargs['model_fn'],\n"
+        "        'background_dream': kwargs['background_dream'],\n"
+        "        'embedding_model': kwargs['embedding_model'],\n"
+        "        'embedding_device': kwargs['embedding_device'],\n"
         "    }\n"
     )
 
@@ -98,7 +102,14 @@ def test_generated_cron_script_runs_from_registered_installation(
     marker = tmp_path / "phase-complete"
     custom_db = "owned/custom-cashew.db"
     (hermes_home / "cashew.json").write_text(
-        json.dumps({"cashew_db_path": custom_db, "sleep_max_nodes": 7})
+        json.dumps(
+            {
+                "cashew_db_path": custom_db,
+                "sleep_max_nodes": 7,
+                "embedding_model": "test/embedding-model",
+                "embedding_device": "mps",
+            }
+        )
     )
 
     completed = subprocess.run(
@@ -106,6 +117,7 @@ def test_generated_cron_script_runs_from_registered_installation(
         check=True,
         capture_output=True,
         text=True,
+        timeout=5,
         cwd=tmp_path,
         env={
             "HERMES_HOME": str(hermes_home),
@@ -120,6 +132,10 @@ def test_generated_cron_script_runs_from_registered_installation(
     assert result["installation"] == kind
     assert result["db_path"] == str(hermes_home / custom_db)
     assert result["limit"] == 7
+    assert result["model_fn"] == "resolved-memory-model"
+    assert result["background_dream"] is False
+    assert result["embedding_model"] == "test/embedding-model"
+    assert result["embedding_device"] == "mps"
 
 
 @pytest.mark.parametrize("kind", ["flat", "development"])
@@ -145,6 +161,7 @@ def test_generated_script_uses_registered_anchor_without_stale_fallback(
         check=True,
         capture_output=True,
         text=True,
+        timeout=5,
         cwd=tmp_path,
         env={
             "HERMES_HOME": str(hermes_home),
@@ -171,12 +188,63 @@ def test_generated_script_rejects_moved_or_reinstalled_provider(
         [sys.executable, str(script)],
         capture_output=True,
         text=True,
+        timeout=5,
         cwd=tmp_path,
         env={"HERMES_HOME": str(hermes_home), "PATH": os.defpath, "PYTHONPATH": ""},
     )
 
     assert completed.returncode == 1
     assert "reinitialize Cashew" in completed.stderr
+
+
+def test_copied_generated_script_rejects_different_hermes_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _hermes_home, script, _implementation = _generate_script(
+        tmp_path, monkeypatch, "flat"
+    )
+    other_home = tmp_path / "other-profile"
+    _write_installation(
+        other_home / "plugins" / "cashew" / "plugins" / "memory" / "cashew",
+        "other-profile",
+    )
+    copied_script = other_home / "scripts" / "cashew-sleep-cycle.py"
+    copied_script.parent.mkdir(parents=True)
+    copied_script.write_text(script.read_text())
+
+    completed = subprocess.run(
+        [sys.executable, str(copied_script)],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        cwd=tmp_path,
+        env={"HERMES_HOME": str(other_home), "PATH": os.defpath, "PYTHONPATH": ""},
+    )
+
+    assert completed.returncode == 1
+    assert "no longer matches this cron registration" in completed.stderr
+
+
+@pytest.mark.parametrize("missing_file", ["config.py", "sleep_refactor.py"])
+def test_generated_script_rejects_incomplete_installation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_file: str
+) -> None:
+    hermes_home, script, implementation = _generate_script(
+        tmp_path, monkeypatch, "flat"
+    )
+    (implementation / missing_file).unlink()
+
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        cwd=tmp_path,
+        env={"HERMES_HOME": str(hermes_home), "PATH": os.defpath, "PYTHONPATH": ""},
+    )
+
+    assert completed.returncode == 1
+    assert "installation is incomplete" in completed.stderr
 
 
 def test_generated_script_rejects_malformed_installation_marker(
@@ -193,6 +261,7 @@ def test_generated_script_rejects_malformed_installation_marker(
         [sys.executable, str(script)],
         capture_output=True,
         text=True,
+        timeout=5,
         cwd=tmp_path,
         env={"HERMES_HOME": str(hermes_home), "PATH": os.defpath, "PYTHONPATH": ""},
     )
@@ -209,6 +278,7 @@ def test_unmarked_copied_script_requests_reinitialization(tmp_path: Path) -> Non
         [sys.executable, str(script)],
         capture_output=True,
         text=True,
+        timeout=5,
         cwd=tmp_path,
         env={
             "HERMES_HOME": str(tmp_path / "profile"),

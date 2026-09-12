@@ -12,14 +12,24 @@ helpers; tests in tests/test_config_roundtrip.py exercise them directly.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import errno
 import json
 import logging
+import math
 import os
 import pathlib
+import stat
+import tempfile
+import threading
+from collections.abc import Iterator
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
+
+_CONFIG_SAVE_LOCK = threading.RLock()
+"""Serialize in-process config writes before taking the profile lock."""
 
 CONFIG_FILENAME: str = "cashew.json"
 """The flat-layout JSON file save_config writes under hermes_home."""
@@ -104,7 +114,7 @@ class CashewConfig:
     think_cycles: bool = DEFAULTS["think_cycles"]
     sleep_cycles: bool = DEFAULTS["sleep_cycles"]
     # LLM integration
-    llm_aux_role: str = DEFAULTS["llm_aux_role"]
+    llm_aux_role: str | None = DEFAULTS["llm_aux_role"]
     think_interval: int = DEFAULTS["think_interval"]
     # Prefetch warmup
     prefetch_k: int = DEFAULTS["prefetch_k"]
@@ -157,6 +167,200 @@ def get_ai_domain(config: CashewConfig) -> str:
 
 ENV_VAR_MAP: dict[str, str] = {key: _env_var_name(key) for key in DEFAULTS}
 """Mapping from config key to its CASHEW_* environment variable name."""
+
+
+_COUNT_RANGES: dict[str, tuple[int, int]] = {
+    "recall_k": (1, 20),
+    "think_interval": (0, 10_000),
+    "prefetch_k": (1, 20),
+    "prefetch_cues": (0, 20),
+    "sleep_max_nodes": (1, 2_000),
+}
+_BOOL_FIELDS = {"auto_extraction", "think_cycles", "sleep_cycles"}
+_NONEMPTY_STRING_FIELDS = {
+    "embedding_model",
+    "embedding_device",
+    "user_domain",
+    "ai_domain",
+}
+
+
+def _invalid_value(key: str, expectation: str) -> ValueError:
+    """Build concise config errors without including untrusted values."""
+    return ValueError(f"{key} must be {expectation}")
+
+
+def _validate_nonempty_string(key: str, value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise _invalid_value(key, "a non-empty string")
+    return value
+
+
+def _validate_count(key: str, value: Any) -> int:
+    lower, upper = _COUNT_RANGES[key]
+    if type(value) is not int or not lower <= value <= upper:
+        raise _invalid_value(key, f"an integer from {lower} to {upper}")
+    return value
+
+
+def _validate_timeout(value: Any) -> float:
+    if (
+        type(value) not in (int, float)
+        or not math.isfinite(value)
+        or not 0 <= value <= 300
+    ):
+        raise _invalid_value("sync_queue_timeout", "a finite number from 0 to 300")
+    return float(value)
+
+
+def _validate_features(value: Any) -> dict[str, bool]:
+    if not isinstance(value, dict):
+        raise _invalid_value("_features", "a JSON object of boolean feature flags")
+    if any(not isinstance(name, str) or not name for name in value):
+        raise _invalid_value("_features", "an object with non-empty string flag names")
+    if any(type(enabled) is not bool for enabled in value.values()):
+        raise _invalid_value("_features", "an object of boolean feature flags")
+    return dict(value)
+
+
+def _validate_field(key: str, value: Any, hermes_home: pathlib.Path) -> Any:
+    """Validate and normalize one persisted runtime setting."""
+    if key == "cashew_db_path":
+        value = _validate_nonempty_string(key, value)
+        resolve_db_path(hermes_home, value)
+        return value
+
+    if key in _NONEMPTY_STRING_FIELDS:
+        return _validate_nonempty_string(key, value)
+
+    if key == "llm_aux_role":
+        if value is not None and not isinstance(value, str):
+            raise _invalid_value(key, "a string, empty string, or null")
+        return value
+
+    if key == "sleep_schedule":
+        if not isinstance(value, str):
+            raise _invalid_value(key, "a string")
+        return value
+
+    if key in _BOOL_FIELDS:
+        if type(value) is not bool:
+            raise _invalid_value(key, "a boolean")
+        return value
+
+    if key in _COUNT_RANGES:
+        return _validate_count(key, value)
+
+    if key == "sync_queue_timeout":
+        return _validate_timeout(value)
+
+    if key == "_features":
+        return _validate_features(value)
+
+    raise AssertionError(f"Unhandled Cashew config field: {key}")
+
+
+def _validate_config_values(
+    values: dict[str, Any], hermes_home: pathlib.Path
+) -> dict[str, Any]:
+    """Validate all known fields and return a normalized dataclass payload."""
+    return {key: _validate_field(key, values[key], hermes_home) for key in DEFAULTS}
+
+
+def _coerce_environment_value(key: str, value: str) -> Any:
+    """Parse one CASHEW_* override before normal field validation."""
+    default = DEFAULTS[key]
+    if isinstance(default, bool):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        raise ValueError("invalid boolean")
+    if isinstance(default, int):
+        return int(value)
+    if isinstance(default, float):
+        return float(value)
+    if key == "_features":
+        parsed = json.loads(value)
+        if not isinstance(parsed, dict):
+            raise ValueError("invalid feature object")
+        return parsed
+    return value
+
+
+@contextlib.contextmanager
+def _exclusive_config_lock(path: pathlib.Path) -> Iterator[None]:
+    """Hold a stable profile-local advisory lock for a complete read/replace."""
+    import fcntl
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    with _CONFIG_SAVE_LOCK:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+
+def _read_existing_config(path: pathlib.Path) -> dict[str, Any]:
+    """Read an existing config without turning corruption into data loss."""
+    if not path.exists():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(
+            f"Cannot save Cashew config because {path} is not valid JSON; "
+            "correct the file before saving."
+        ) from exc
+    if not isinstance(loaded, dict):
+        raise ValueError(
+            f"Cannot save Cashew config because {path} must contain a JSON object."
+        )
+    return loaded
+
+
+def _fsync_directory(directory: pathlib.Path) -> None:
+    """Persist an atomic replacement's directory entry before reporting success."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(directory, flags)
+    try:
+        try:
+            os.fsync(directory_fd)
+        except OSError as exc:
+            if exc.errno not in {errno.EINVAL, errno.ENOTSUP, errno.EPERM}:
+                raise
+            logger.warning(
+                "Directory fsync is unsupported for %s; configuration replacement "
+                "completed but directory-entry durability is filesystem-dependent",
+                directory,
+            )
+    finally:
+        os.close(directory_fd)
+
+
+def _atomic_write_config(path: pathlib.Path, contents: str) -> None:
+    """Write config through a unique same-directory temporary file and replace."""
+    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temp_path = pathlib.Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temp_path, mode)
+        os.replace(temp_path, path)
+        _fsync_directory(path.parent)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 def get_config_schema() -> list[dict[str, Any]]:
@@ -373,6 +577,34 @@ def _read_cashew_config(hermes_home: pathlib.Path) -> CashewConfig | None:
         return None
 
 
+def _auxiliary_role_config(raw: Any, role: str) -> dict[str, Any] | None:
+    """Extract one auxiliary role mapping without trusting YAML shapes."""
+    if not isinstance(raw, dict):
+        logger.warning(
+            "llm_aux_role=%r: config.yaml must contain an object; "
+            "falling back to heuristic extraction",
+            role,
+        )
+        return None
+    auxiliary = raw.get("auxiliary", {})
+    if not isinstance(auxiliary, dict):
+        logger.warning(
+            "llm_aux_role=%r: auxiliary config must be an object; "
+            "falling back to heuristic extraction",
+            role,
+        )
+        return None
+    aux_config = auxiliary.get(role, {})
+    if not isinstance(aux_config, dict):
+        logger.warning(
+            "llm_aux_role=%r: auxiliary role config must be an object; "
+            "falling back to heuristic extraction",
+            role,
+        )
+        return None
+    return aux_config
+
+
 def resolve_model_fn(
     hermes_home: pathlib.Path,
     config: CashewConfig | None = None,
@@ -419,7 +651,6 @@ def resolve_model_fn(
         import yaml  # type: ignore[import-untyped, unused-ignore]
 
         raw = yaml.safe_load(config_yaml_path.read_text(encoding="utf-8"))
-        aux_config = (raw or {}).get("auxiliary", {}).get(role, {})
     except Exception:
         logger.warning(
             "llm_aux_role=%r: failed to parse %s; falling back to heuristic extraction",
@@ -429,8 +660,12 @@ def resolve_model_fn(
         )
         return None
 
+    aux_config = _auxiliary_role_config(raw, role)
+    if aux_config is None:
+        return None
+
     model = aux_config.get("model")
-    if not model:
+    if not isinstance(model, str) or not model:
         logger.warning(
             "llm_aux_role=%r: no model in auxiliary.%s config; "
             "falling back to heuristic extraction",
@@ -440,8 +675,23 @@ def resolve_model_fn(
         return None
 
     provider = aux_config.get("provider", "openai")
+    if not isinstance(provider, str) or not provider:
+        logger.warning(
+            "llm_aux_role=%r: provider must be a non-empty string; "
+            "falling back to heuristic extraction",
+            role,
+        )
+        return None
+    configured_base_url = aux_config.get("base_url")
+    if configured_base_url is not None and not isinstance(configured_base_url, str):
+        logger.warning(
+            "llm_aux_role=%r: base_url must be a string; "
+            "falling back to heuristic extraction",
+            role,
+        )
+        return None
     base_url = (
-        aux_config.get("base_url")
+        configured_base_url
         or _PROVIDER_BASE_URLS.get(provider, "https://api.openai.com/v1")
     ).rstrip("/")
 
@@ -452,7 +702,7 @@ def resolve_model_fn(
         if env_var:
             api_key = os.environ.get(env_var)
 
-    if not api_key:
+    if not isinstance(api_key, str) or not api_key:
         logger.warning(
             "llm_aux_role=%r: no API key for provider=%r; "
             "falling back to heuristic extraction",
@@ -538,16 +788,12 @@ def load_config(hermes_home: str | os.PathLike[str]) -> CashewConfig:
     `CashewConfig(**DEFAULTS)` — callers that need to distinguish "no file" from
     "default values" should use `resolve_config_path(...).exists()` directly.
 
-    CASHEW_* environment variables override corresponding config keys with type coercion:
-    - bool: env_val.lower() in ("1", "true", "yes", "on")
-    - int: int(env_val)
-    - float: float(env_val)
-    - list: split on comma, strip whitespace, drop empties
-    - str: pass through as-is
-
-    Invalid env var values are logged and skipped (do NOT crash load_config).
+    CASHEW_* environment variables override corresponding config keys with
+    validated type coercion. Invalid overrides are logged without their values
+    and leave the JSON/default value in place.
     """
-    path = resolve_config_path(hermes_home)
+    home = pathlib.Path(hermes_home)
+    path = resolve_config_path(home)
     if not path.exists():
         merged: dict[str, Any] = dict(DEFAULTS)
     else:
@@ -558,44 +804,20 @@ def load_config(hermes_home: str | os.PathLike[str]) -> CashewConfig:
             )
         merged = {**DEFAULTS, **raw}
 
-    for key, default_val in DEFAULTS.items():
-        env_name = _env_var_name(key)
+    for key in DEFAULTS:
+        env_name = ENV_VAR_MAP[key]
         env_val = os.environ.get(env_name)
         if env_val is not None:
             try:
-                if isinstance(default_val, bool):
-                    merged[key] = env_val.lower() in ("1", "true", "yes", "on")
-                elif isinstance(default_val, int):
-                    merged[key] = int(env_val)
-                elif isinstance(default_val, float):
-                    merged[key] = float(env_val)
-                elif isinstance(default_val, list):
-                    env_trimmed = env_val.strip()
-                    if env_trimmed.startswith("[") and env_trimmed.endswith("]"):
-                        # Handle repr()/JSON format: "['a', 'b']" or '["a", "b"]'
-                        try:
-                            merged[key] = json.loads(env_trimmed.replace("'", '"'))
-                        except (json.JSONDecodeError, ValueError):
-                            inner = env_trimmed[1:-1]
-                            merged[key] = [
-                                item.strip().strip("'\"").strip()
-                                for item in inner.split(",")
-                                if item.strip()
-                            ]
-                    else:
-                        merged[key] = [
-                            item.strip() for item in env_val.split(",") if item.strip()
-                        ]
-                else:
-                    merged[key] = env_val
-            except ValueError:
+                candidate = _coerce_environment_value(key, env_val)
+                merged[key] = _validate_field(key, candidate, home)
+            except (TypeError, ValueError, json.JSONDecodeError):
                 logger.warning(
-                    "Invalid value for %s (%s), skipping: %r", key, env_name, env_val
+                    "Ignoring invalid value for environment variable %s", env_name
                 )
 
-    known = {f.name for f in dataclasses.fields(CashewConfig)}
-    filtered = {k: v for k, v in merged.items() if k in known}
-    return CashewConfig(**filtered)
+    known_values = {key: merged[key] for key in DEFAULTS}
+    return CashewConfig(**_validate_config_values(known_values, home))
 
 
 def generate_default_config(hermes_home: str | os.PathLike[str]) -> pathlib.Path:
@@ -623,34 +845,29 @@ def save_config(
     Returns the path written.
 
     Writes are UTF-8, 2-space indent, sorted keys, trailing newline — stable
-    diff-friendly format. Parent directory is created with `parents=True,
-    exist_ok=True`.
+    diff-friendly format. A profile-local stable lock serializes writers; each
+    writer re-reads under that lock, so non-overlapping updates are retained and
+    the last completed write wins for the same key. The replacement is atomic,
+    and malformed existing JSON is left untouched for correction.
     """
-    path = resolve_config_path(hermes_home)
-    existing: dict[str, Any] = {}
-    if path.exists():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                existing = {
-                    key: value
-                    for key, value in loaded.items()
-                    if key not in REMOVED_LEGACY_CONFIG_KEYS
-                }
-        except (json.JSONDecodeError, ValueError):
-            existing = {}
-    known = {f.name for f in dataclasses.fields(CashewConfig)}
-    merged: dict[str, Any] = dict(existing)
-    for k, v in DEFAULTS.items():
-        if k not in merged:
-            merged[k] = v
-    for k, v in values.items():
-        if k in known:
-            merged[k] = v
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(merged, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    home = pathlib.Path(hermes_home)
+    path = resolve_config_path(home)
+    known = set(DEFAULTS)
+    with _exclusive_config_lock(path):
+        existing = {
+            key: value
+            for key, value in _read_existing_config(path).items()
+            if key not in REMOVED_LEGACY_CONFIG_KEYS
+        }
+        merged: dict[str, Any] = {**DEFAULTS, **existing}
+        for key, value in values.items():
+            if key in known:
+                merged[key] = value
+        validated = _validate_config_values(
+            {key: merged[key] for key in DEFAULTS}, home
+        )
+        merged.update(validated)
+        contents = json.dumps(merged, indent=2, sort_keys=True) + "\n"
+        _atomic_write_config(path, contents)
     logger.debug("wrote cashew config to %s", path)
     return path

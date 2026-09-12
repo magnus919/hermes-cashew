@@ -210,7 +210,8 @@ def test_prefetch_filtered_request_cold_falls_through_unfiltered_warm_result(
         {"id": "private", "content": "private identity"},
     ]
 
-    def cold_nodes(query, max_nodes, domain, tag, exclude_tags):
+    def cold_nodes(query, max_nodes, domain, tag, exclude_tags, db_path=None):
+        assert db_path == provider._db_path
         assert query == "shared project memory"
         if domain == "work":
             return [{"id": "work", "content": "work identity"}]
@@ -239,7 +240,7 @@ def test_prefetch_empty_or_whitespace_query_never_matches_cached_cue(
     monkeypatch.setattr(
         provider,
         "_keyword_search",
-        lambda *args: [{"id": "cold", "content": "cold empty result"}],
+        lambda *args, **kwargs: [{"id": "cold", "content": "cold empty result"}],
     )
     for query in ("", "   "):
         _stage_prefetch_result(

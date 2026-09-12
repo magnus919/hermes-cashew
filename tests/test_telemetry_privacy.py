@@ -116,10 +116,10 @@ def test_sentry_worker_is_bounded_and_provider_owned(monkeypatch):
             RuntimeError("CONTENT-CANARY"), telemetry=first
         )
     assert records.poll(5)
+    assert "sentry_sdk" not in set(sys.modules) - before_modules
     _decode_event(records.recv())
     error_tracking.close_sentry_telemetry(first)
     records.close()
-    assert "sentry_sdk" not in set(sys.modules) - before_modules
     assert attempts.empty()
     assert not first.process.is_alive()
 

@@ -13,8 +13,9 @@ consolidation on a persistent Hermes cron schedule.
 ## Prerequisites
 
 - [Hermes Agent](https://github.com/nousresearch/hermes-agent) installed
-- `cashew-brain>=1.2.1,<2.0.0` — installed automatically by `hermes plugins install`
-- `sqlite-vec` — enables vector similarity search. Installed automatically.
+- `cashew-brain` from the reviewed upstream source commit documented below
+- SQLite 3.35 or newer, required for Cashew's legacy v1 schema migration
+- `sqlite-vec` — enables vector similarity search; included in the manual install below
 
 ## Install
 
@@ -23,9 +24,33 @@ hermes plugins install magnus919/hermes-cashew
 ```
 
 This clones the repository to `~/.hermes/plugins/cashew/` and registers the
-plugin entry point. After install, restart the gateway:
+plugin entry point. This interim source baseline uses a direct URL that the
+current Hermes dependency installer intentionally rejects. Install the exact
+source archive into the Hermes environment before setup:
 
 ```bash
+CASHEW_PIN='cashew-brain @ https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz#sha256=38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab'
+uv pip install \
+  --python ~/.hermes/hermes-agent/venv/bin/python3 \
+  --reinstall "$CASHEW_PIN" sqlite-vec
+~/.hermes/hermes-agent/venv/bin/python3 \
+  ~/.hermes/plugins/cashew/scripts/verify-cashew-baseline.py
+```
+
+The verification step is required because the selected source and the older
+PyPI release both report version `1.2.1`. A version-only check cannot tell them
+apart. It also checks the linked SQLite version and source ID. Both the selected
+source and the existing PyPI `1.2.1` code require SQLite 3.35 or newer to
+migrate a legacy v1 database because that migration uses `ALTER TABLE ... DROP
+COLUMN`; this requirement was discovered by the source-pin gate rather than
+introduced by it. `hermes memory setup` may warn that it refused the direct
+URL; that warning is expected and does not replace or downgrade a manually
+installed candidate.
+
+After install, run setup and restart the gateway:
+
+```bash
+hermes memory setup
 hermes gateway restart
 ```
 
@@ -43,6 +68,26 @@ Or use the interactive setup (v0.2.0 now includes cashew in the provider picker)
 ```bash
 hermes memory setup
 ```
+
+### Update and rollback
+
+`hermes plugins update cashew`, `hermes update`, and a Hermes virtual-environment
+rebuild do not install this direct URL automatically. Re-run the exact
+`uv pip install` and provenance verification commands above after any of those
+operations, then restart the gateway.
+
+To roll the engine back to the published upstream release:
+
+```bash
+uv pip install \
+  --python ~/.hermes/hermes-agent/venv/bin/python3 \
+  --reinstall 'cashew-brain==1.2.1'
+hermes gateway restart
+```
+
+Do not run `hermes memory setup` expecting it to restore the source pin. To
+return to the selected source later, re-run the full pinned install and
+provenance verification commands.
 
 ## Zero-Config Startup
 
@@ -349,11 +394,14 @@ rm -rf ~/.hermes/cashew   # optional: remove the local graph data
 
 ### `Plugin: NOT installed` in `hermes memory status`
 
-1. **cashew-brain not installed in Hermes venv** — `hermes plugins install` does not
-   automatically install Python package dependencies into Hermes's venv. Install it manually:
+1. **cashew-brain not installed in Hermes venv** — install and verify the exact
+   source baseline from [Install](#install). If `uv` is unavailable, bootstrap
+   pip in the Hermes environment and pass the same quoted `CASHEW_PIN` value:
    ```bash
+   CASHEW_PIN='cashew-brain @ https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz#sha256=38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab'
    ~/.hermes/hermes-agent/venv/bin/python3 -m ensurepip
-   ~/.hermes/hermes-agent/venv/bin/python3 -m pip install cashew-brain
+   ~/.hermes/hermes-agent/venv/bin/python3 -m pip install \
+     --force-reinstall "$CASHEW_PIN" sqlite-vec
    ```
 
 2. **Stale pycache or entry point not registered** — If cashew-brain is installed

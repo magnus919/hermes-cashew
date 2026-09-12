@@ -39,6 +39,11 @@ git push -u origin HEAD
 
 Releases are triggered by pushing a `v*` tag. The release workflow gates on tests passing, auto-syncs plugin manifest versions, builds the wheel, and publishes to PyPI via trusted publishing.
 
+While `pyproject.toml` contains the approved direct Cashew source reference,
+the release workflow deliberately fails before tests or build because PyPI
+rejects direct URL dependencies. Do not create a release tag until a tested
+upstream release replaces the source reference.
+
 **Important:** You only bump the version in `pyproject.toml` and `CHANGELOG.md` — CI automatically syncs both `plugin.yaml` files to match before building. See [Plugin Version Manifest](#plugin-version-manifest).
 
 ```bash
@@ -99,7 +104,16 @@ done
 
 - **No `~/.hermes` writes.** All paths scope under `hermes_home`. Tests use `tmp_path` fixture.
 - **`sync_turn` must return <10 ms.** Bounded queue + daemon worker; shutdown gives already-accepted turns a bounded opportunity to drain.
-- **Cashew dependency**: `cashew-brain>=1.2.1,<2.0.0` on PyPI.
+- **Cashew dependency**: source archive at upstream commit
+  `dd57ef029cf9a6dce0b8145d335a55202dd1bac4`, pinned by its full commit and
+  SHA-256 in `pyproject.toml`, both manifests, and `uv.lock`. The upstream
+  package still reports version `1.2.1`, so version metadata alone does not
+  identify the selected code.
+- **SQLite baseline**: SQLite `>=3.35` is required because the upstream legacy
+  v1 migration uses `ALTER TABLE ... DROP COLUMN`. The PyPI `1.2.1` artifact
+  has the same requirement even though its package metadata does not declare
+  it. This minimum does not establish safety from the separate SQLite WAL-reset
+  issue tracked by #191.
 - **sqlite-vec** enables vector similarity search. It's a standard dependency
   (not optional) — the plugin requires it. If your platform doesn't support
   sqlite-vec's native extension, the plugin degrades gracefully to keyword + BFS

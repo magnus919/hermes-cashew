@@ -30,13 +30,16 @@ EOF
 
 Create a separate host environment from the pinned checkout before the
 offline run. Hermes' frozen lock supplies its host dependencies; Cashew's
-runtime artifacts are pinned explicitly:
+runtime artifacts are pinned explicitly. The source and the older PyPI release
+both report version `1.2.1`, so reinstall the source and verify its provenance:
 
 ```sh
 HERMES_TEST_ENV=/tmp/hermes-agent-$REV-venv
 UV_PROJECT_ENVIRONMENT="$HERMES_TEST_ENV" uv sync --frozen --no-install-project --project "$DEST"
+CASHEW_PIN='cashew-brain @ https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz#sha256=38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab'
 uv pip install --python "$HERMES_TEST_ENV/bin/python" \
-  'cashew-brain==1.2.1' 'sqlite-vec==0.1.9'
+  --reinstall "$CASHEW_PIN" 'sqlite-vec==0.1.9'
+"$HERMES_TEST_ENV/bin/python" scripts/verify-cashew-baseline.py
 ```
 
 Run the lane with the interpreter that has Hermes and Cashew installed:
@@ -50,7 +53,9 @@ The command runs both the flat `hermes plugins install` loader and the
 bundled/development loader. A missing or mismatched host source is an explicit
 setup failure. The test patches only the embedding model and external client
 resolution; Hermes loader, `MemoryManager`, `MemoryProvider`, auxiliary task
-routing, and `cron.jobs` remain real imports.
+routing, `cron.jobs`, and SQLite remain real. It proves loader and lifecycle
+compatibility with the verified source pin, not native embedding-model health
+or complete process-crash containment.
 
 Cron subprocess execution is part of the default command. The current main
 branch includes the flat-install import fix from issue #186, so both the flat

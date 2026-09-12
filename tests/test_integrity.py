@@ -165,9 +165,12 @@ def test_audit_reports_fixed_row_and_byte_budgets(
     report = audit_integrity(path)
     assert report["status"] == "audit_incomplete"
     assert report["reasons"]["audit_row_cap"] == 1
+    assert "schema_table_missing" not in report["reasons"]
+    assert "provider_identity_missing" not in report["reasons"]
+    assert "profile_verification_failed" not in report["reasons"]
     assert report["limits"]["rows_scanned"] == 1
     assert report["limits"]["complete"] is False
-    assert report["completeness"]
+    assert report["completeness"] == {}
 
 
 def test_audit_marks_graph_scan_incomplete_without_leaking_schema_names(
@@ -193,7 +196,7 @@ def test_audit_marks_graph_scan_incomplete_without_leaking_schema_names(
     assert report["status"] == "audit_incomplete"
     assert report["limits"]["complete"] is False
     assert "SECRET-CANARY-schema" not in encoded
-    assert "unexpected_table_fingerprint" in report["schema"]
+    assert report["schema"] == {}
 
 
 def test_audit_reports_aggregate_byte_budget(
@@ -222,6 +225,9 @@ def test_audit_deadline_is_explicitly_incomplete(tmp_path: Path) -> None:
     report = audit_integrity(path, deadline_seconds=0)
     assert report["status"] == "audit_incomplete"
     assert report["reasons"]["audit_deadline"] >= 1
+    assert "schema_table_missing" not in report["reasons"]
+    assert "provider_identity_missing" not in report["reasons"]
+    assert "profile_verification_failed" not in report["reasons"]
 
 
 def test_audit_installs_deadline_before_profile_verification(
@@ -276,12 +282,6 @@ def test_profile_verification_preserves_non_deadline_budget_reason(
         raise sqlite3.OperationalError("interrupted")
 
     monkeypatch.setattr(integrity, "verify_readonly_profile", fail_at_row_cap)
-    monkeypatch.setattr(
-        integrity,
-        "_inspect_profile",
-        lambda _conn, _mode, _budget: {"reasons": {}},
-    )
-
     report = audit_integrity(path)
 
     assert report["reasons"] == {"audit_row_cap": 1}

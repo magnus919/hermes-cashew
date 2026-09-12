@@ -1796,7 +1796,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             and self._db_path is not None
             and path == pathlib.Path(self._db_path).resolve(strict=False)
         ):
-            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
             conn.execute("PRAGMA query_only=ON")
             if conn.execute("PRAGMA query_only").fetchone()[0] != 1:
                 conn.close()

@@ -121,7 +121,7 @@ def _resolve_db_path(hermes_home: Path, db_path_value: str, config_module=None) 
 def _runtime_epoch(db_path: str, model: str, dimension: int) -> int:
     """Read the identity that a standalone maintenance cycle is allowed to own."""
     path = Path(db_path).resolve(strict=False)
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
     try:
         metadata = dict(
             conn.execute(

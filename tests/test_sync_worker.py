@@ -295,6 +295,49 @@ def test_shutdown_drains_accepted_turns_and_rejects_new_ones(tmp_path, monkeypat
     assert calls == ["User: u1\nAssistant: a1", "User: u2\nAssistant: a2"]
 
 
+def test_shutdown_keeps_model_open_until_accepted_turns_drain(tmp_path, monkeypatch):
+    """Shutdown does not downgrade accepted LLM turns before their worker runs."""
+    first_started = threading.Event()
+    release_first = threading.Event()
+    model_results: list[str] = []
+    closed = threading.Event()
+
+    def model_fn(_prompt: str) -> str:
+        return "" if closed.is_set() else "[]"
+
+    setattr(model_fn, "_cashew_close", closed.set)
+
+    def controlled_end_session(**kwargs):
+        if not first_started.is_set():
+            first_started.set()
+            assert release_first.wait(timeout=2.0)
+        model_results.append(kwargs["model_fn"]("accepted turn"))
+        return types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[])
+
+    monkeypatch.setattr(
+        "core.session.end_session", controlled_end_session, raising=False
+    )
+    p = make_initialized_provider(tmp_path)
+    p._model_fn = model_fn
+    try:
+        p.sync_turn("u1", "a1")
+        assert first_started.wait(timeout=1.0)
+        p.sync_turn("u2", "a2")
+        shutdown_thread = threading.Thread(target=p.shutdown)
+        shutdown_thread.start()
+        assert p._shutdown_started.wait(timeout=1.0)
+        assert not closed.is_set()
+        release_first.set()
+        shutdown_thread.join(timeout=2.0)
+
+        assert not shutdown_thread.is_alive()
+        assert model_results == ["[]", "[]"]
+        assert closed.is_set()
+    finally:
+        release_first.set()
+        p.shutdown()
+
+
 def test_shutdown_full_queue_drains_after_blocked_backend_without_watcher_leak(
     tmp_path, monkeypatch
 ):

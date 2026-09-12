@@ -278,6 +278,13 @@ it is a ``no_agent`` script, meaning zero LLM overhead per tick. The script
 reads ``cashew.json`` at runtime to discover its database path and
 ``sleep_max_nodes`` setting.
 
+The generated script is pinned to the Cashew installation that registered the
+job. This keeps one Hermes profile from loading another profile's provider.
+After moving, reinstalling, or changing the plugin layout, reinitialize
+Cashew to refresh the script and cron registration. Development installs may
+use the documented ``$HERMES_HOME/hermes-agent/plugins/memory/cashew`` symlink
+to an external checkout.
+
 ### What happens during a cron tick
 
 1. Reads ``cashew.json`` to get ``cashew_db_path`` and ``sleep_max_nodes``

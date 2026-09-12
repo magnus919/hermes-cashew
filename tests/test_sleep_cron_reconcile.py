@@ -7,6 +7,7 @@ import types
 from dataclasses import replace
 from pathlib import Path
 
+import plugins.memory.cashew as provider_module
 from plugins.memory.cashew import CashewMemoryProvider
 from plugins.memory.cashew.config import CashewConfig
 
@@ -31,6 +32,10 @@ def _install_fake_cron(monkeypatch, jobs: list[dict]):
 
 
 def _provider(tmp_path: Path, **changes) -> CashewMemoryProvider:
+    source = Path(__file__).parents[1] / "plugins" / "memory" / "cashew"
+    anchor = tmp_path / "hermes-agent" / "plugins" / "memory" / "cashew"
+    anchor.parent.mkdir(parents=True, exist_ok=True)
+    anchor.symlink_to(source, target_is_directory=True)
     provider = CashewMemoryProvider()
     provider._hermes_home = tmp_path
     provider._config = replace(CashewConfig(), **changes)
@@ -66,8 +71,7 @@ def test_schedule_change_replaces_job_and_refreshes_script(tmp_path, monkeypatch
     assert removed == ["old"]
     assert created[0]["schedule"] == "every 6h"
     assert provider._sleep_cron_job_id == "replacement"
-    packaged = Path(__file__).parents[1] / "plugins/memory/cashew/sleep_cron_script.py"
-    assert script.read_text() == packaged.read_text()
+    assert "_INSTALLATION_MARKER = {" in script.read_text()
 
 
 def test_matching_job_is_adopted_without_reset(tmp_path, monkeypatch):
@@ -82,3 +86,26 @@ def test_matching_job_is_adopted_without_reset(tmp_path, monkeypatch):
     assert removed == []
     assert created == []
     assert provider._sleep_cron_job_id == "current"
+
+
+def test_tampered_cron_template_does_not_install_script_or_job(
+    tmp_path, monkeypatch, caplog
+):
+    _removed, created = _install_fake_cron(monkeypatch, [])
+    provider = _provider(tmp_path)
+    template = Path(provider_module.__file__).parent / "sleep_cron_script.py"
+    original_read_text = Path.read_text
+
+    def read_tampered_template(path, *args, **kwargs):
+        if path == template:
+            return "# marker removed by a damaged installation\n"
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_tampered_template)
+
+    provider._register_sleep_cron()
+
+    assert created == []
+    assert provider._sleep_cron_job_id is None
+    assert not (tmp_path / "scripts" / "cashew-sleep-cycle.py").exists()
+    assert "cron script template is invalid" in caplog.text

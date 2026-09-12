@@ -702,11 +702,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
     def _build_model_fn(self) -> Callable[[str], str] | None:
         """Construct an LLM callable from the configured auxiliary.memory role.
 
-        Delegates to ``config.resolve_model_fn()`` which reads Hermes'
-        ``config.yaml`` and resolves the API key from config or well-known
-        env vars. Returns None when:
+        Delegates to ``config.resolve_model_fn()``, which verifies the active
+        Hermes profile's explicit auxiliary role and resolves its public client.
+        Returns None when:
         - No llm_aux_role is configured (heuristic-only mode)
-        - The auxiliary section or API key cannot be found (logs warning)
+        - The auxiliary role is absent, null, or malformed
         """
         if not self._config or not self._config.llm_aux_role:
             return None

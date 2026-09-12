@@ -5,8 +5,8 @@ that stores conversation context in a local [Cashew](https://github.com/rajkripa
 thought graph with semantic search and automatic context recall. Get from zero to
 a working install in under five minutes.
 
-The plugin auto-generates `cashew.json` with defaults on first load, enables
-LLM-powered extraction by default (no manual `auxiliary.memory` setup), adds
+The plugin auto-generates `cashew.json` with defaults on first load, can use an
+explicit Hermes `auxiliary.memory` mapping for LLM-powered extraction, adds
 forest-level insight extraction via `on_pre_compress`, and runs graph
 consolidation on a persistent Hermes cron schedule.
 
@@ -47,13 +47,12 @@ hermes memory setup
 ## Zero-Config Startup
 
 hermes-cashew works out of the box — all 17 persisted configuration fields have
-sane defaults and are backed by current runtime behavior. On
-first agent startup, the plugin auto-generates `~/.hermes/cashew.json`
-with the full default configuration and auto-populates `auxiliary.memory` in
-Hermes `config.yaml` from the main model config, so LLM-powered extraction
-is active without any manual setup.
+sane defaults and are backed by current runtime behavior. On first agent
+startup, the plugin creates `~/.hermes/cashew.json` with the full default
+configuration. It never edits Hermes `config.yaml`; until an auxiliary role is
+explicitly configured there, extraction remains heuristic-only.
 
-Created `~/.hermes/cashew.json` only if you want to override specific defaults.
+Edit `~/.hermes/cashew.json` only if you want to override specific defaults.
 The file is never overwritten once it exists:
 
 ```bash
@@ -195,16 +194,30 @@ This works in both the vector search and keyword fallback paths. Common use case
 
 ## LLM Integration
 
-hermes-cashew enables LLM-powered extraction by default — `llm_aux_role` is
-set to `"memory"`, and the plugin auto-populates `auxiliary.memory` in Hermes
-`config.yaml` from the main model config on first load.
+`llm_aux_role` selects a Hermes auxiliary role. Its default, `"memory"`, is a
+selector rather than an implicit configuration: add a complete
+`auxiliary.memory` mapping to Hermes `config.yaml` to opt in. The plugin never
+creates or changes that mapping.
 
-No manual configuration is needed. To verify LLM extraction is active:
-
-```bash
-grep "using" ~/.hermes/logs/agent.log | grep "llm_aux_role"
-# Expected: llm_aux_role='memory': using <provider> <model> via <base_url>
+```yaml
+auxiliary:
+  memory:
+    provider: your-provider
+    model: your-model
 ```
+
+For each extraction, Cashew uses Hermes' public auxiliary-client resolver for
+the selected profile's transport and authentication, then makes one bounded
+chat-completions request. Prompts are capped at 32,000 characters, responses at
+1,024 tokens, and the caller waits up to 30 seconds. A timed-out provider call
+cannot be forcibly cancelled and may finish later; no more than four such
+backend calls may be outstanding process-wide, and later requests fail closed
+until a slot is released. Cashew intentionally does not use Hermes'
+task-level retry and fallback ladder for these calls.
+
+The configured role is used when Cashew next performs extraction, insight, or
+dream work. If Hermes cannot resolve it, Cashew silently uses its heuristic
+extractor instead.
 
 To disable LLM extraction (heuristic-only mode), set `llm_aux_role` to null in
 `cashew.json`:
@@ -213,7 +226,7 @@ To disable LLM extraction (heuristic-only mode), set `llm_aux_role` to null in
 {"llm_aux_role": null}
 ```
 
-Or remove the section entirely — the default will regenerate it on next start.
+An absent, null, or incomplete role mapping also keeps extraction heuristic-only.
 
 ### What the LLM enables upstream
 
@@ -226,9 +239,8 @@ Or remove the section entirely — the default will regenerate it on next start.
   garbage collection, permanence evaluation, core memory promotion, and
   LLM-powered dream generation. Runs as a **Hermes cron job** on a configurable
   schedule (default: every 12 hours), not at session boundaries. The cron script
-  reads `cashew.json` at runtime and operates without an LLM — if LLM-powered
-  dream synthesis is desired, it requires additional configuration (see
-  [Sleep Cycle Cron Scheduling](#sleep-cycle-cron-scheduling) below).
+  reads `cashew.json` at runtime and uses the same explicit auxiliary role when
+  one is configured; otherwise it runs without an LLM.
   Processes up to `sleep_max_nodes` per cycle (default 2,000).
 - **Pre-compress insight extraction** — Before context compression discards
   old messages, extracts conversation-arc patterns (topic shifts, framing
@@ -236,8 +248,8 @@ Or remove the section entirely — the default will regenerate it on next start.
   `insight`/`observation` nodes in the graph. Requires `llm_aux_role`
   configuration. Silent-degrades without LLM.
 
-Without `llm_aux_role`, the plugin uses heuristic-only extraction — no
-API calls, no LLM cost, zero-config.
+Without an explicitly enabled `llm_aux_role` mapping, the plugin uses
+heuristic-only extraction — no API calls and no LLM cost.
 
 **Design note:** The `auxiliary.memory` convention is provider-agnostic.
 Any memory provider plugin can declare `llm_aux_role` and reference the
@@ -273,10 +285,11 @@ registration to prevent N jobs accumulating across N restarts.
 ### When the cron job runs
 
 On the configured schedule (default ``every 12h``), the Hermes scheduler
-executes ``$HERMES_HOME/scripts/cashew-sleep-cycle.py`` with **no LLM** —
-it is a ``no_agent`` script, meaning zero LLM overhead per tick. The script
-reads ``cashew.json`` at runtime to discover its database path and
-``sleep_max_nodes`` setting.
+executes ``$HERMES_HOME/scripts/cashew-sleep-cycle.py`` as a ``no_agent``
+script. It reads ``cashew.json`` at runtime to discover its database path and
+``sleep_max_nodes`` setting. The cycle uses LLM dream synthesis only when the
+profile has an explicit configured auxiliary role; otherwise it runs with no
+LLM overhead.
 
 The generated script is pinned to the Cashew installation that registered the
 job. This keeps one Hermes profile from loading another profile's provider.
@@ -296,9 +309,9 @@ to an external checkout.
 7. Promotes frequently-accessed nodes to permanent / core memory status
 8. Prints a JSON summary (captured by the cron scheduler's output log)
 
-**No LLM-powered dream generation** occurs in cron mode — the script passes
-``model_fn=None``. Cross-linking, dedup, and GC are the 80% benefit without
-the API key dependency in a subprocess.
+Without an explicit auxiliary role, no LLM-powered dream generation occurs in
+cron mode. Cross-linking, dedup, and GC still provide the graph-maintenance
+benefit without a provider dependency in the subprocess.
 
 ### Maintenance lock scope
 

@@ -558,7 +558,7 @@ def _raw_role_mapping(role: str) -> bool:
 
         raw = read_raw_config_readonly()
     except Exception:
-        logger.warning(
+        logger.debug(
             "llm_aux_role=%r: unable to read the active Hermes profile; "
             "using heuristic extraction",
             role,
@@ -751,7 +751,7 @@ def resolve_model_fn(
         finally:
             reset_hermes_home_override(token)
     except Exception:
-        logger.warning(
+        logger.debug(
             "llm_aux_role=%r: Hermes profile scope is unavailable; using heuristic extraction",
             role,
             exc_info=True,

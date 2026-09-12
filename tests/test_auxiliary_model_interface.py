@@ -110,6 +110,19 @@ def test_resolver_uses_profile_scoped_host_client_and_fixed_bounds(fake_host, tm
     ]
 
 
+def test_prompt_budget_preserves_instructions_and_recent_context(fake_host, tmp_path):
+    client = _FakeClient(lambda _: _response("[]"))
+    model_fn = _enabled_model(fake_host, tmp_path, client)
+    prompt = "I" * config_module._AUXILIARY_PROMPT_PREFIX + "middle" * 9_000 + "R" * 64
+
+    assert model_fn(prompt) == "[]"
+    sent_prompt = client.calls[0]["messages"][0]["content"]
+    assert len(sent_prompt) == config_module._AUXILIARY_PROMPT_LIMIT
+    assert sent_prompt.startswith("I" * config_module._AUXILIARY_PROMPT_PREFIX)
+    assert "[Cashew truncated older prompt content.]" in sent_prompt
+    assert sent_prompt.endswith("R" * 64)
+
+
 def test_role_changed_to_null_after_closure_never_auto_routes(fake_host, tmp_path):
     client = _FakeClient(lambda _: _response("[]"))
     model_fn = _enabled_model(fake_host, tmp_path, client)
@@ -117,6 +130,33 @@ def test_role_changed_to_null_after_closure_never_auto_routes(fake_host, tmp_pat
 
     assert model_fn("must not call") == ""
     assert fake_host.resolved_homes == []
+    assert client.calls == []
+
+
+def test_failed_request_resets_profile_context_and_does_not_log_prompt(
+    fake_host, tmp_path, caplog
+):
+    secret_prompt = "do-not-log-this-sensitive-prompt"
+    model_fn = _enabled_model(
+        fake_host,
+        tmp_path,
+        _FakeClient(lambda _: (_ for _ in ()).throw(RuntimeError("transport failed"))),
+    )
+
+    assert model_fn(secret_prompt) == ""
+    assert fake_host.active_home.get() is None
+    assert fake_host.resets
+    assert secret_prompt not in caplog.text
+
+
+def test_closing_callable_rejects_new_calls(fake_host, tmp_path):
+    client = _FakeClient(lambda _: _response("[]"))
+    model_fn = _enabled_model(fake_host, tmp_path, client)
+
+    close = getattr(model_fn, "_cashew_close")
+    close()
+
+    assert model_fn("after shutdown") == ""
     assert client.calls == []
 
 
@@ -176,24 +216,34 @@ def test_process_wide_gate_caps_hung_calls_across_new_closures(
 
     client = _FakeClient(block)
     functions = [_enabled_model(fake_host, tmp_path, client) for _ in range(100)]
-    for model_fn in functions:
-        assert model_fn("hung") == ""
+    try:
+        for model_fn in functions:
+            assert model_fn("hung") == ""
 
-    assert started.wait(timeout=1)
-    assert calls == config_module._MAX_OUTSTANDING_AUXILIARY_CALLS
-    assert (
-        config_module._OUTSTANDING_AUXILIARY_CALLS
-        == config_module._MAX_OUTSTANDING_AUXILIARY_CALLS
-    )
+        assert started.wait(timeout=1)
+        assert calls == config_module._MAX_OUTSTANDING_AUXILIARY_CALLS
+        assert (
+            config_module._OUTSTANDING_AUXILIARY_CALLS
+            == config_module._MAX_OUTSTANDING_AUXILIARY_CALLS
+        )
 
-    release.set()
-    deadline = time.monotonic() + 1
-    while config_module._OUTSTANDING_AUXILIARY_CALLS and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert config_module._OUTSTANDING_AUXILIARY_CALLS == 0
+        release.set()
+        deadline = time.monotonic() + 1
+        while (
+            config_module._OUTSTANDING_AUXILIARY_CALLS and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert config_module._OUTSTANDING_AUXILIARY_CALLS == 0
 
-    assert functions[0]("recovered") == "[]"
-    assert calls == config_module._MAX_OUTSTANDING_AUXILIARY_CALLS + 1
+        assert functions[0]("recovered") == "[]"
+        assert calls == config_module._MAX_OUTSTANDING_AUXILIARY_CALLS + 1
+    finally:
+        release.set()
+        deadline = time.monotonic() + 1
+        while (
+            config_module._OUTSTANDING_AUXILIARY_CALLS and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
 
 
 def test_empty_response_uses_upstream_heuristic_while_json_array_does_not(

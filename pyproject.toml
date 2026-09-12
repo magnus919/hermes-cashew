@@ -11,7 +11,7 @@ license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [{ name = "Magnus Hedemark", email = "magnus919@pm.me" }]
 dependencies = [
-    "cashew-brain>=1.2.1,<2.0.0",
+    "cashew-brain @ https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz#sha256=38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab",
     "numpy",
     "scikit-learn",
     "sentence-transformers",

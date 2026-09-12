@@ -64,6 +64,14 @@ _MAX_VECTOR_BYTES = 4 * 1024 * 1024
 _AUDIT_BATCH_SIZE = 256
 
 
+class _AuditBudgetError(RuntimeError):
+    """The audit cannot safely continue within its fixed work budget."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 @dataclasses.dataclass
 class _AuditBudget:
     """Small, explicit work budget shared by every potentially large scan."""
@@ -72,6 +80,7 @@ class _AuditBudget:
     rows: int = 0
     bytes: int = 0
     incomplete_reasons: set[str] = dataclasses.field(default_factory=set)
+    scans: dict[str, bool] = dataclasses.field(default_factory=dict)
 
     @property
     def incomplete(self) -> bool:
@@ -83,37 +92,109 @@ class _AuditBudget:
             return False
         return True
 
-    def consume(self, byte_count: int = 0) -> bool:
-        if not self.check():
-            return False
-        if self.rows >= _MAX_AUDIT_ROWS:
-            self.incomplete_reasons.add("audit_row_cap")
+    def ready(self) -> bool:
+        return self.check() and not self.incomplete_reasons
+
+    def reserve_bytes(self, byte_count: int) -> bool:
+        if not self.ready():
             return False
         if byte_count < 0 or self.bytes + byte_count > _MAX_AUDIT_BYTES:
             self.incomplete_reasons.add("audit_byte_cap")
             return False
-        self.rows += 1
         self.bytes += byte_count
+        return True
+
+    def consume(self, byte_count: int = 0) -> bool:
+        if not self.ready():
+            return False
+        if self.rows >= _MAX_AUDIT_ROWS:
+            self.incomplete_reasons.add("audit_row_cap")
+            return False
+        if not self.reserve_bytes(byte_count):
+            return False
+        self.rows += 1
         return True
 
     def progress(self) -> int:
         return 1 if time.monotonic() >= self.deadline else 0
 
 
-def _tables(conn: sqlite3.Connection) -> set[str]:
-    return {
-        str(row[0])
-        for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-        ).fetchall()
-    }
+def _table_exists(
+    conn: sqlite3.Connection, table: str, budget: _AuditBudget | None = None
+) -> bool:
+    if budget is not None and not budget.ready():
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (table,),
+    ).fetchone()
+    return row is not None
 
 
-def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+def _table_inventory(
+    conn: sqlite3.Connection, budget: _AuditBudget
+) -> tuple[set[str], dict[str, Any]]:
+    """Inspect known tables while hashing, never returning arbitrary names."""
+    known = {name: _table_exists(conn, name, budget) for name in _REQUIRED_TABLES}
+    unknown_count = 0
+    digest = hashlib.sha256()
+    complete = budget.ready()
+    if complete:
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' "
+            "AND name NOT IN (?, ?, ?, ?) "
+            "ORDER BY name "
+            f"LIMIT {_MAX_AUDIT_ROWS + 1}",
+            tuple(sorted(_REQUIRED_TABLES)),
+        )
+        while budget.ready():
+            batch = cursor.fetchmany(_AUDIT_BATCH_SIZE)
+            if not batch:
+                break
+            for row in batch:
+                name = str(row[0])
+                if not budget.consume(len(name.encode("utf-8")) + 1):
+                    complete = False
+                    break
+                unknown_count += 1
+                digest.update(name.encode("utf-8"))
+                digest.update(b"\0")
+            if budget.incomplete:
+                complete = False
+                break
+        if unknown_count > _MAX_AUDIT_ROWS:
+            complete = False
+    fingerprint = digest.hexdigest()[:16] if unknown_count else None
+    budget.scans["table_inventory"] = complete and not budget.incomplete
+    return (
+        {name for name, present in known.items() if present},
+        {
+            "required_tables": known,
+            "unexpected_table_count": unknown_count if complete else None,
+            "unexpected_table_fingerprint": fingerprint,
+            "inventory_complete": complete and not budget.incomplete,
+        },
+    )
+
+
+def _columns(
+    conn: sqlite3.Connection, table: str, budget: _AuditBudget | None = None
+) -> set[str]:
     # Table names are selected from sqlite_master or fixed constants above.
-    return {
-        str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
-    }
+    if budget is not None and not budget.ready():
+        return set()
+    cursor = conn.execute(f"PRAGMA table_info({table})")
+    result: set[str] = set()
+    while True:
+        batch = cursor.fetchmany(_AUDIT_BATCH_SIZE)
+        if not batch:
+            break
+        for row in batch:
+            if budget is not None and not budget.consume():
+                return result
+            result.add(str(row[1]))
+    return result
 
 
 def _safe_source_id(conn: sqlite3.Connection) -> str | None:
@@ -125,7 +206,9 @@ def _safe_source_id(conn: sqlite3.Connection) -> str | None:
 
 
 @contextmanager
-def _source_snapshot(path: pathlib.Path) -> Iterator[pathlib.Path]:
+def _source_snapshot(
+    path: pathlib.Path, budget: _AuditBudget
+) -> Iterator[pathlib.Path]:
     """Copy a profile and its live sidecars before opening any SQLite handle.
 
     SQLite may update reader marks in a WAL ``-shm`` file even for a query-only
@@ -135,17 +218,43 @@ def _source_snapshot(path: pathlib.Path) -> Iterator[pathlib.Path]:
     """
     if not path.is_file():
         raise FileNotFoundError(path)
+    source_files = [path]
+    source_files.extend(
+        pathlib.Path(f"{path}{suffix}")
+        for suffix in ("-wal", "-shm")
+        if pathlib.Path(f"{path}{suffix}").exists()
+    )
+    for source in source_files:
+        try:
+            size = source.stat().st_size
+        except OSError:
+            raise
+        if not budget.reserve_bytes(size):
+            raise _AuditBudgetError("audit_byte_cap")
     with tempfile.TemporaryDirectory(prefix="hermes-cashew-audit-") as directory:
         snapshot = pathlib.Path(directory) / "profile.db"
+        if not budget.ready():
+            raise _AuditBudgetError(
+                next(iter(budget.incomplete_reasons), "audit_deadline")
+            )
         shutil.copy2(path, snapshot)
-        for suffix in ("-wal", "-shm"):
-            sidecar = pathlib.Path(f"{path}{suffix}")
-            if sidecar.exists():
-                shutil.copy2(sidecar, pathlib.Path(f"{snapshot}{suffix}"))
+        if not budget.ready():
+            raise _AuditBudgetError(
+                next(iter(budget.incomplete_reasons), "audit_deadline")
+            )
+        for source in source_files[1:]:
+            suffix = source.name[len(path.name) :]
+            shutil.copy2(source, pathlib.Path(f"{snapshot}{suffix}"))
+            if not budget.ready():
+                raise _AuditBudgetError(
+                    next(iter(budget.incomplete_reasons), "audit_deadline")
+                )
         yield snapshot
 
 
-def _provenance(conn: sqlite3.Connection, journal_mode: str) -> dict[str, Any]:
+def _provenance(
+    conn: sqlite3.Connection, journal_mode: str, budget: _AuditBudget | None = None
+) -> dict[str, Any]:
     result: dict[str, Any] = {
         "sqlite_version": sqlite3.sqlite_version,
         "sqlite_source_id": _safe_source_id(conn),
@@ -160,16 +269,27 @@ def _provenance(conn: sqlite3.Connection, journal_mode: str) -> dict[str, Any]:
         result["user_version"] = int(conn.execute("PRAGMA user_version").fetchone()[0])
     except (TypeError, ValueError, sqlite3.Error):
         pass
-    if "hermes_provider_meta" not in _tables(conn):
+    if not _table_exists(conn, "hermes_provider_meta", budget):
         return result
     try:
         rows = conn.execute(
             "SELECT key, value FROM hermes_provider_meta WHERE key IN "
             "('embedding_model','embedding_dim','vec_dim','maintenance_epoch')"
-        ).fetchall()
+        )
+        bounded_rows = []
+        while True:
+            batch = rows.fetchmany(_AUDIT_BATCH_SIZE)
+            if not batch:
+                break
+            for row in batch:
+                if budget is not None and not budget.consume():
+                    break
+                bounded_rows.append(tuple(row))
+            if budget is not None and budget.incomplete:
+                break
     except sqlite3.Error:
         return result
-    meta = {str(key): value for key, value in rows}
+    meta = {str(key): value for key, value in bounded_rows}
     result["provider_model"] = meta.get("embedding_model")
     result["provider_epoch"] = meta.get("maintenance_epoch")
     for key, output_key in (
@@ -270,6 +390,7 @@ def _inspect_vec(
         "SELECT name, sql FROM sqlite_master WHERE type='table' AND name='vec_embeddings'"
     ).fetchone()
     if vec is None:
+        budget.scans["vec_index"] = True
         _add_reason(reasons, "vec_index_missing", len(ordinary_ids))
         return {
             "available": False,
@@ -280,6 +401,7 @@ def _inspect_vec(
             "scan_complete": True,
         }
     if not _load_vec_readonly(conn):
+        budget.scans["vec_index"] = False
         _add_reason(reasons, "vec_index_unverifiable")
         return {
             "available": False,
@@ -302,7 +424,7 @@ def _inspect_vec(
             "SELECT node_id, LENGTH(embedding) FROM vec_embeddings "
             f"LIMIT {_MAX_AUDIT_ROWS + 1}"
         )
-        while budget.check():
+        while budget.ready():
             batch = cursor.fetchmany(_AUDIT_BATCH_SIZE)
             if not batch:
                 break
@@ -313,7 +435,9 @@ def _inspect_vec(
                 rows.append((row[0], row[1]))
             if budget.incomplete:
                 break
+        budget.scans["vec_index"] = not budget.incomplete
     except (sqlite3.Error, TypeError, ValueError):
+        budget.scans["vec_index"] = False
         _add_reason(reasons, "vec_index_unverifiable")
         return {
             "available": False,
@@ -336,6 +460,7 @@ def _inspect_vec(
         ):
             invalid_lengths += 1
     _add_reason(reasons, "vec_blob_dimension_mismatch", invalid_lengths)
+    budget.scans["vec_index"] = not budget.incomplete
     return {
         "available": True,
         "entries": len(rows),
@@ -350,36 +475,64 @@ def _graph_findings(
     conn: sqlite3.Connection, reasons: Counter[str], budget: _AuditBudget
 ) -> dict[str, int]:
     """Report referential graph defects without invoking upstream mutators."""
-    if not budget.check():
+    if not budget.ready():
+        budget.scans["graph"] = False
         return {"orphan_edges": 0, "self_edges": 0}
     try:
-        orphan_edges = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM derivation_edges e "
-                "LEFT JOIN thought_nodes p ON p.id=e.parent_id "
-                "LEFT JOIN thought_nodes c ON c.id=e.child_id "
-                "WHERE p.id IS NULL OR c.id IS NULL"
-            ).fetchone()[0]
+        orphan_edges = _bounded_count(
+            conn,
+            "SELECT 1 FROM derivation_edges e "
+            "LEFT JOIN thought_nodes p ON p.id=e.parent_id "
+            "LEFT JOIN thought_nodes c ON c.id=e.child_id "
+            "WHERE p.id IS NULL OR c.id IS NULL",
+            budget,
+            label="orphan_edges",
         )
-        self_edges = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM derivation_edges WHERE parent_id=child_id"
-            ).fetchone()[0]
+        self_edges = _bounded_count(
+            conn,
+            "SELECT 1 FROM derivation_edges WHERE parent_id=child_id",
+            budget,
+            label="self_edges",
         )
     except sqlite3.Error:
+        budget.scans["graph"] = False
         _add_reason(reasons, "graph_unverifiable")
         return {"orphan_edges": 0, "self_edges": 0}
     _add_reason(reasons, "orphan_edge", orphan_edges)
     _add_reason(reasons, "self_edge", self_edges)
+    budget.scans["graph"] = not budget.incomplete
     return {"orphan_edges": orphan_edges, "self_edges": self_edges}
+
+
+def _bounded_count(
+    conn: sqlite3.Connection, sql: str, budget: _AuditBudget, *, label: str
+) -> int:
+    """Count matches through a capped row stream, preserving completeness state."""
+    if not budget.ready():
+        budget.scans[label] = False
+        return 0
+    count = 0
+    cursor = conn.execute(sql + f" LIMIT {_MAX_AUDIT_ROWS + 1}")
+    while budget.ready():
+        batch = cursor.fetchmany(_AUDIT_BATCH_SIZE)
+        if not batch:
+            budget.scans[label] = True
+            return count
+        for _row in batch:
+            if not budget.consume():
+                budget.scans[label] = False
+                return count
+            count += 1
+    budget.scans[label] = False
+    return count
 
 
 def _inspect_profile(  # noqa: C901
     conn: sqlite3.Connection, journal_mode: str, budget: _AuditBudget
 ) -> dict[str, Any]:
     reasons: Counter[str] = Counter()
-    provenance = _provenance(conn, journal_mode)
-    tables = _tables(conn)
+    provenance = _provenance(conn, journal_mode, budget)
+    tables, table_report = _table_inventory(conn, budget)
     missing_tables = sorted(_REQUIRED_TABLES - tables)
     _add_reason(reasons, "schema_table_missing", len(missing_tables))
     if provenance["user_version"] != 3:
@@ -393,15 +546,21 @@ def _inspect_profile(  # noqa: C901
     ):
         if table not in tables:
             continue
-        missing = sorted(required - _columns(conn, table))
+        missing = sorted(required - _columns(conn, table, budget))
         if missing:
             missing_columns[table] = missing
             _add_reason(reasons, "schema_column_missing", len(missing))
     try:
-        meta_keys = {
-            str(row[0])
-            for row in conn.execute("SELECT key FROM hermes_provider_meta").fetchall()
-        }
+        meta_cursor = conn.execute(
+            "SELECT key FROM hermes_provider_meta WHERE key IN "
+            "('embedding_model','embedding_dim','vec_dim','maintenance_epoch') "
+            "LIMIT 4"
+        )
+        meta_keys: set[str] = set()
+        for row in meta_cursor.fetchmany(4):
+            if not budget.consume():
+                break
+            meta_keys.add(str(row[0]))
     except sqlite3.Error:
         meta_keys = set()
     missing_meta = (
@@ -420,7 +579,7 @@ def _inspect_profile(  # noqa: C901
         "declared_dimension": None,
     }
     graph_report = {"orphan_edges": 0, "self_edges": 0}
-    if not missing_tables and not missing_columns and budget.check():
+    if not missing_tables and not missing_columns and budget.ready():
         try:
             integrity = str(
                 conn.execute("PRAGMA integrity_check").fetchone()[0]
@@ -438,7 +597,7 @@ def _inspect_profile(  # noqa: C901
             "SELECT e.node_id, e.vector, e.model FROM embeddings e "
             f"LIMIT {_MAX_AUDIT_ROWS + 1}"
         )
-        while budget.check():
+        while budget.ready():
             batch = cursor.fetchmany(_AUDIT_BATCH_SIZE)
             if not batch:
                 break
@@ -462,21 +621,24 @@ def _inspect_profile(  # noqa: C901
                     _add_reason(reasons, "embedding_node_id_invalid")
             if budget.incomplete:
                 break
+        budget.scans["embeddings"] = not budget.incomplete
         if budget.incomplete:
             for incomplete_reason in budget.incomplete_reasons:
                 _add_reason(reasons, incomplete_reason)
-        if budget.check():
-            counts["orphan_embeddings"] = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM embeddings e "
-                    "LEFT JOIN thought_nodes n ON n.id=e.node_id WHERE n.id IS NULL"
-                ).fetchone()[0]
+        if budget.ready():
+            counts["orphan_embeddings"] = _bounded_count(
+                conn,
+                "SELECT 1 FROM embeddings e "
+                "LEFT JOIN thought_nodes n ON n.id=e.node_id WHERE n.id IS NULL",
+                budget,
+                label="orphan_embeddings",
             )
-            counts["nodes_without_embeddings"] = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM thought_nodes n "
-                    "LEFT JOIN embeddings e ON e.node_id=n.id WHERE e.node_id IS NULL"
-                ).fetchone()[0]
+            counts["nodes_without_embeddings"] = _bounded_count(
+                conn,
+                "SELECT 1 FROM thought_nodes n "
+                "LEFT JOIN embeddings e ON e.node_id=n.id WHERE e.node_id IS NULL",
+                budget,
+                label="nodes_without_embeddings",
             )
         else:
             counts["orphan_embeddings"] = 0
@@ -486,17 +648,19 @@ def _inspect_profile(  # noqa: C901
             reasons, "node_embedding_missing", counts["nodes_without_embeddings"]
         )
         try:
-            counts["permanent_and_decayed"] = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM thought_nodes WHERE COALESCE(permanent,0) != 0 "
-                    "AND COALESCE(decayed,0) != 0"
-                ).fetchone()[0]
+            counts["permanent_and_decayed"] = _bounded_count(
+                conn,
+                "SELECT 1 FROM thought_nodes WHERE COALESCE(permanent,0) != 0 "
+                "AND COALESCE(decayed,0) != 0",
+                budget,
+                label="permanent_and_decayed",
             )
-            counts["permanent_core_nodes"] = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM thought_nodes WHERE node_type='core_memory' "
-                    "AND COALESCE(permanent,0) != 0"
-                ).fetchone()[0]
+            counts["permanent_core_nodes"] = _bounded_count(
+                conn,
+                "SELECT 1 FROM thought_nodes WHERE node_type='core_memory' "
+                "AND COALESCE(permanent,0) != 0",
+                budget,
+                label="permanent_core_nodes",
             )
         except sqlite3.Error:
             counts["permanent_and_decayed"] = 0
@@ -505,9 +669,9 @@ def _inspect_profile(  # noqa: C901
         _add_reason(reasons, "permanent_and_decayed", counts["permanent_and_decayed"])
         # A permanent core_memory node is expected state.  Contradictory
         # permanent+decayed state is still reported above.
-        if budget.check():
+        if budget.ready():
             vec_report = _inspect_vec(conn, ordinary_ids, expected_dim, reasons, budget)
-        if budget.check():
+        if budget.ready():
             graph_report = _graph_findings(conn, reasons, budget)
     else:
         counts["embeddings"] = 0
@@ -521,7 +685,7 @@ def _inspect_profile(  # noqa: C901
     return {
         "provenance": _safe_provenance(provenance),
         "schema": {
-            "tables": sorted(tables),
+            **table_report,
             "missing_tables": missing_tables,
             "missing_columns": missing_columns,
             "missing_provider_keys": missing_meta,
@@ -529,6 +693,7 @@ def _inspect_profile(  # noqa: C901
         "counts": dict(counts),
         "vector_index": vec_report,
         "graph": graph_report,
+        "completeness": dict(sorted(budget.scans.items())),
         "uncertainty": uncertainty,
         "reasons": dict(sorted(reasons.items())),
         "informational": {
@@ -539,6 +704,7 @@ def _inspect_profile(  # noqa: C901
             "bytes_scanned": budget.bytes,
             "row_cap": _MAX_AUDIT_ROWS,
             "byte_cap": _MAX_AUDIT_BYTES,
+            "complete": not budget.incomplete,
         },
     }
 
@@ -563,32 +729,63 @@ def _unavailable(path: pathlib.Path, reason: str) -> dict[str, Any]:
     }
 
 
+def _incomplete(
+    path: pathlib.Path, budget: _AuditBudget, reason: str
+) -> dict[str, Any]:
+    budget.incomplete_reasons.add(reason)
+    return {
+        "schema_version": 1,
+        "status": "audit_incomplete",
+        "read_only": True,
+        "mutated": False,
+        "profile_fingerprint": _fingerprint(path),
+        "provenance": {},
+        "counts": {},
+        "vector_index": {},
+        "graph": {},
+        "uncertainty": [],
+        "reasons": {item: 1 for item in sorted(budget.incomplete_reasons)},
+        "limits": {
+            "rows_scanned": budget.rows,
+            "bytes_scanned": budget.bytes,
+            "row_cap": _MAX_AUDIT_ROWS,
+            "byte_cap": _MAX_AUDIT_BYTES,
+            "complete": False,
+        },
+        "repair": {
+            "status": "unavailable",
+            "reason": "stable_targeted_repair_api_unavailable",
+            "explicit_apply_required": True,
+        },
+    }
+
+
 def audit_integrity(
     db_path: str | pathlib.Path, *, deadline_seconds: float = _AUDIT_DEADLINE_SECONDS
 ) -> dict[str, Any]:
     """Return a bounded, query-only integrity report for an existing profile."""
     path = pathlib.Path(db_path).resolve(strict=False)
+    budget = _AuditBudget(deadline=time.monotonic() + max(0.0, deadline_seconds))
     try:
         with admit_operation(graph_path=path, deadline=deadline_seconds):
             try:
-                with _source_snapshot(path) as snapshot:
+                with _source_snapshot(path, budget) as snapshot:
                     try:
                         conn, journal_mode = open_readonly_verified(snapshot)
                     except Exception as exc:
                         del exc
                         return _unavailable(path, "readonly_open_failed")
                     try:
-                        budget = _AuditBudget(
-                            deadline=time.monotonic() + max(0.0, deadline_seconds)
-                        )
                         conn.set_progress_handler(budget.progress, 1000)
                         profile_error: str | None = None
                         try:
-                            verify_readonly_profile(conn)
+                            verify_readonly_profile(conn, budget=budget)
+                        except _AuditBudgetError as exc:
+                            return _incomplete(path, budget, exc.reason)
                         except Exception as exc:
                             del exc
                             profile_error = "profile_verification_failed"
-                            if not budget.check():
+                            if not budget.ready():
                                 profile_error = "audit_deadline"
                         report = _inspect_profile(conn, journal_mode, budget)
                         if profile_error is not None:
@@ -607,9 +804,13 @@ def audit_integrity(
                         except Exception:
                             pass
                         conn.close()
+            except _AuditBudgetError as exc:
+                return _incomplete(path, budget, exc.reason)
             except Exception as exc:
                 del exc
                 return _unavailable(path, "readonly_snapshot_failed")
+    except _AuditBudgetError as exc:
+        return _incomplete(path, budget, exc.reason)
     except Exception as exc:
         del exc
         return _unavailable(path, "readonly_admission_failed")

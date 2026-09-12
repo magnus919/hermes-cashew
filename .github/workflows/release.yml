@@ -14,11 +14,46 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Release policy — PyPI rejects distributions with direct URL dependencies.
+  # Keep this first so a source-pinned baseline fails clearly before test/build.
+  # ---------------------------------------------------------------------------
+  release-policy:
+    name: Check PyPI release policy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Reject direct URL dependencies before build
+        run: |
+          python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          project = tomllib.loads(Path("pyproject.toml").read_text())
+          direct = [
+              dependency
+              for dependency in project["project"]["dependencies"]
+              if "@" in dependency or "://" in dependency
+          ]
+          if direct:
+              print("::error::PyPI release blocked: direct URL dependencies are not accepted by PyPI.")
+              print("Replace the source pin with a tested upstream release before tagging:")
+              for dependency in direct:
+                  print(f"  - {dependency}")
+              raise SystemExit(1)
+          PY
+
+  # ---------------------------------------------------------------------------
   # Tests — gate: never publish with red tests
   # ---------------------------------------------------------------------------
   test:
     name: Run tests
     runs-on: ubuntu-latest
+    needs: release-policy
     env:
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"

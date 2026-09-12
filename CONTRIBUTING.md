@@ -37,7 +37,8 @@ This project is governed by the [Apache 2.0 License](./LICENSE) and the followin
 
 ### Development Install
 
-hermes-cashew depends on `cashew-brain` (available on PyPI) and Hermes Agent. For development:
+hermes-cashew depends on an immutable, hash-pinned upstream `cashew-brain`
+source archive and Hermes Agent. For development:
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then:
 
@@ -256,6 +257,10 @@ This project uses **pytest** with `pytest-asyncio` and `pytest-mock`.
 ## Release Process
 
 Maintainers handle releases. The process is:
+
+The current direct Cashew source pin is an explicit publication hold. The
+release workflow fails before tests or build until a tested upstream release
+replaces that direct URL; do not create a release tag while the hold is active.
 
 1. Version is bumped in `pyproject.toml` and `CHANGELOG.md` is updated
 2. A tag is pushed (`vX.Y.Z`)

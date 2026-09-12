@@ -6,6 +6,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import yaml
+
 from plugins.memory.cashew.config import DEFAULTS, get_config_schema
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +18,18 @@ def test_release_workflow_syncs_both_manifests_from_pyproject() -> None:
     assert re.search(r"VERSION=.*\^version = .*pyproject\.toml", release, re.MULTILINE)
     assert "for f in plugin.yaml plugins/memory/cashew/plugin.yaml" in release
     assert 'sed -i "s/^version: .*/version: ${VERSION}/" "$f"' in release
+
+
+def test_release_workflow_blocks_direct_dependencies_before_tests() -> None:
+    release_path = ROOT / ".github/workflows/release.yml"
+    release_text = release_path.read_text()
+    workflow = yaml.safe_load(release_text)
+    jobs = workflow["jobs"]
+
+    assert "direct URL dependencies are not accepted by PyPI" in release_text
+    assert "release-policy" in jobs
+    assert jobs["test"]["needs"] == "release-policy"
+    assert jobs["build"]["needs"] == "test"
 
 
 def test_documented_config_surface_matches_runtime() -> None:

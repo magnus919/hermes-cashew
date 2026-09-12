@@ -238,6 +238,71 @@ def test_request_send_stall_obeys_active_deadline(tmp_path: Path) -> None:
         supervisor.close()
 
 
+def test_request_thread_start_failure_releases_slot_and_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = _supervisor(tmp_path)
+    real_start = threading.Thread.start
+
+    def fail_request_start(thread: threading.Thread) -> None:
+        if thread.name == "cashew-embedding-request":
+            raise RuntimeError("simulated request thread start failure")
+        real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_request_start)
+    with pytest.raises(EmbeddingUnavailable) as raised:
+        supervisor.encode(["one"])
+    assert raised.value.reason is EmbeddingFailure.STARTUP
+    assert supervisor._request_lock.acquire(blocking=False)
+    supervisor._request_lock.release()
+    supervisor.close()
+    replacement = _supervisor(tmp_path)
+    replacement.close()
+
+
+def test_cleanup_thread_start_failure_still_releases_owner(
+    tmp_path: Path,
+    child_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = _supervisor(tmp_path, active_timeout=1.0)
+    supervisor.start()
+    request_errors: list[Exception] = []
+
+    def request() -> None:
+        try:
+            supervisor.encode(["slow"])
+        except Exception as exc:
+            request_errors.append(exc)
+
+    caller = threading.Thread(target=request)
+    caller.start()
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        if not supervisor._request_lock.acquire(blocking=False):
+            break
+        supervisor._request_lock.release()
+        time.sleep(0.005)
+    else:
+        pytest.fail("embedding request did not acquire its active slot")
+
+    real_start = threading.Thread.start
+
+    def fail_cleanup_start(thread: threading.Thread) -> None:
+        if thread.name == "cashew-embedding-close":
+            raise RuntimeError("simulated cleanup thread start failure")
+        real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_cleanup_start)
+    supervisor.close(timeout=0.0)
+    caller.join(timeout=1.0)
+    assert not caller.is_alive()
+    assert request_errors
+    assert supervisor._owner_released.wait(timeout=1.0)
+    replacement = _supervisor(tmp_path)
+    replacement.close()
+
+
 def test_second_provider_fails_closed_even_with_identical_identity(
     tmp_path: Path, child_python: Path
 ) -> None:

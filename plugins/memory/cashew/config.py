@@ -12,6 +12,7 @@ helpers; tests in tests/test_config_roundtrip.py exercise them directly.
 
 from __future__ import annotations
 
+import builtins
 import contextlib
 import dataclasses
 import errno
@@ -24,9 +25,39 @@ import stat
 import tempfile
 import threading
 from collections.abc import Iterator
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 logger = logging.getLogger(__name__)
+
+_AUXILIARY_PROMPT_LIMIT = 32_000
+_AUXILIARY_PROMPT_PREFIX = 4_096
+_AUXILIARY_MAX_TOKENS = 1_024
+_AUXILIARY_DEADLINE_SECONDS = 30.0
+_MAX_OUTSTANDING_AUXILIARY_CALLS = 4
+
+
+@dataclasses.dataclass
+class _AuxiliaryCallGate:
+    """Shared admission state for every loader alias in this interpreter."""
+
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    outstanding: int = 0
+
+
+# Flat and bundled Hermes loaders can import this source under different package
+# names. Keep the process-wide budget on builtins so those aliases cannot each
+# admit their own set of late backend threads.
+_AUXILIARY_GATE_KEY = "_hermes_cashew_auxiliary_call_gate_v1"
+_auxiliary_gate = builtins.__dict__.setdefault(
+    _AUXILIARY_GATE_KEY, _AuxiliaryCallGate()
+)
+if not (hasattr(_auxiliary_gate, "lock") and hasattr(_auxiliary_gate, "outstanding")):
+    # The private key is only ever populated above. Retain a defensive repair
+    # for a hostile or stale interpreter, while normal loader aliases use the
+    # atomic setdefault path and therefore share one gate.
+    _auxiliary_gate = _AuxiliaryCallGate()
+    builtins.__dict__[_AUXILIARY_GATE_KEY] = _auxiliary_gate
+_AUXILIARY_CALL_GATE = cast(_AuxiliaryCallGate, _auxiliary_gate)
 
 _CONFIG_SAVE_LOCK = threading.RLock()
 """Serialize in-process config writes before taking the profile lock."""
@@ -48,9 +79,9 @@ DEFAULTS: dict[str, Any] = {
     "auto_extraction": True,
     "think_cycles": True,
     "sleep_cycles": True,
-    # LLM integration — "memory" activates LLM-powered extraction by default
-    # via auxiliary.memory in Hermes config.yaml. On first load, the plugin
-    # auto-populates auxiliary.memory from the main model config if absent.
+    # LLM integration — "memory" selects auxiliary.memory when that role is
+    # explicitly configured in Hermes config.yaml. Cashew never writes that
+    # host config, so a fresh profile stays heuristic-only.
     "llm_aux_role": "memory",
     "think_interval": 10,
     # Prefetch warmup
@@ -449,10 +480,9 @@ def get_config_schema() -> list[dict[str, Any]]:
             "description": (
                 "Hermes auxiliary role for LLM-powered operations "
                 "(think cycles, sleep synthesis, LLM extraction). "
-                "Defaults to 'memory', which reads from auxiliary.memory "
-                "in Hermes config.yaml. The plugin auto-populates "
-                "auxiliary.memory from the main model config on first load "
-                "if absent. Set to null or empty string to disable LLM "
+                "Defaults to 'memory', which reads an explicitly configured "
+                "auxiliary.memory entry in Hermes config.yaml. Set to null "
+                "or empty string to disable LLM "
                 "extraction and use heuristic-only mode."
             ),
             "default": DEFAULTS["llm_aux_role"],
@@ -524,45 +554,6 @@ def get_config_schema() -> list[dict[str, Any]]:
     return schema
 
 
-_PROVIDER_ENV_MAP: dict[str, str] = {
-    "openai": "OPENAI_API_KEY",
-    "openrouter": "OPENROUTER_API_KEY",
-    "anthropic": "ANTHROPIC_API_KEY",
-    "opencode-go": "OPENCODE_GO_API_KEY",
-    "opencode-zen": "OPENCODE_ZEN_API_KEY",
-    "deepseek": "DEEPSEEK_API_KEY",
-    "google": "GOOGLE_API_KEY",
-    "xai": "XAI_API_KEY",
-    "github": "COPILOT_GITHUB_TOKEN",
-    "huggingface": "HF_TOKEN",
-    "qwen": "QWEN_API_KEY",
-    "minimax": "MINIMAX_API_KEY",
-    "minimax-cn": "MINIMAX_CN_API_KEY",
-    "nvidia": "NVIDIA_API_KEY",
-    "ollama": "OLLAMA_API_KEY",
-}
-
-# Well-known inference base URLs for OpenAI-compatible providers.
-# Mirrors Hermes core's PROVIDER_REGISTRY inference_base_url values.
-# Used as fallback when auxiliary.<role>.base_url is missing or empty.
-_PROVIDER_BASE_URLS: dict[str, str] = {
-    "openai": "https://api.openai.com/v1",
-    "openrouter": "https://openrouter.ai/api/v1",
-    "opencode-zen": "https://opencode.ai/zen/v1",
-    "opencode-go": "https://opencode.ai/zen/go/v1",
-    "deepseek": "https://api.deepseek.com/v1",
-    "xai": "https://api.x.ai/v1",
-    "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    "minimax": "https://api.minimaxi.chat/v1",
-    "minimax-cn": "https://api.minimax.chat/v1",
-    "nvidia": "https://integrate.api.nvidia.com/v1",
-    "ollama": "http://127.0.0.1:11434/v1",
-}
-# NOTE: "anthropic", "google", and "huggingface" are intentionally omitted.
-# They do not expose OpenAI-compatible /chat/completions endpoints natively;
-# users targeting them must set an explicit base_url in config.yaml.
-
-
 def _read_cashew_config(hermes_home: pathlib.Path) -> CashewConfig | None:
     """Read cashew.json and return a CashewConfig, or None if absent/unparseable."""
     cashew_path = resolve_config_path(hermes_home)
@@ -582,54 +573,226 @@ def _read_cashew_config(hermes_home: pathlib.Path) -> CashewConfig | None:
         return None
 
 
-def _auxiliary_role_config(raw: Any, role: str) -> dict[str, Any] | None:
-    """Extract one auxiliary role mapping without trusting YAML shapes."""
+def _raw_role_mapping(role: str) -> bool:
+    """True only when the active profile explicitly enables one auxiliary role.
+
+    Hermes treats an absent task as an ``auto`` route. Cashew deliberately does
+    not: an absent, null, or malformed role is heuristic-only and must never
+    discover a provider through an implicit fallback.
+    """
+    try:
+        from hermes_cli.config import read_raw_config_readonly
+
+        raw = read_raw_config_readonly()
+    except Exception:
+        logger.debug(
+            "Cashew auxiliary role check could not read the active Hermes profile; "
+            "using heuristic extraction (reason=profile_config_unavailable)"
+        )
+        return False
     if not isinstance(raw, dict):
-        logger.warning(
-            "llm_aux_role=%r: config.yaml must contain an object; "
-            "falling back to heuristic extraction",
-            role,
-        )
-        return None
-    auxiliary = raw.get("auxiliary", {})
+        return False
+    auxiliary = raw.get("auxiliary")
     if not isinstance(auxiliary, dict):
-        logger.warning(
-            "llm_aux_role=%r: auxiliary config must be an object; "
-            "falling back to heuristic extraction",
-            role,
-        )
-        return None
-    aux_config = auxiliary.get(role, {})
-    if not isinstance(aux_config, dict):
-        logger.warning(
-            "llm_aux_role=%r: auxiliary role config must be an object; "
-            "falling back to heuristic extraction",
-            role,
-        )
-        return None
-    return aux_config
+        return False
+    mapping = auxiliary.get(role)
+    if not isinstance(mapping, dict):
+        return False
+    # A mapping with no explicit provider is an implicit host ``auto`` route.
+    # Cashew permits ``provider: auto`` as an intentional opt-in, but rejects
+    # missing/empty selectors and malformed scalar route fields before Hermes
+    # has any opportunity to auto-route them.
+    provider = mapping.get("provider")
+    if not isinstance(provider, str) or not provider.strip():
+        return False
+    if "model" in mapping and (
+        not isinstance(mapping["model"], str) or not mapping["model"].strip()
+    ):
+        return False
+    for field in (
+        "base_url",
+        "api_key",
+        "key_env",
+        "api_key_env",
+        "api_mode",
+    ):
+        if (
+            field in mapping
+            and mapping[field] is not None
+            and not isinstance(mapping[field], str)
+        ):
+            return False
+    return True
+
+
+def _trim_auxiliary_prompt(prompt: str) -> str:
+    """Keep instructions and recent context within the fixed provider budget."""
+    if len(prompt) <= _AUXILIARY_PROMPT_LIMIT:
+        return prompt
+    marker = "\n\n[Cashew truncated older prompt content.]\n\n"
+    prefix = prompt[:_AUXILIARY_PROMPT_PREFIX]
+    suffix_size = _AUXILIARY_PROMPT_LIMIT - len(prefix) - len(marker)
+    return prefix + marker + prompt[-suffix_size:]
+
+
+def _claim_auxiliary_call() -> bool:
+    """Claim one process-wide late-call slot without queueing."""
+    with _AUXILIARY_CALL_GATE.lock:
+        if _AUXILIARY_CALL_GATE.outstanding >= _MAX_OUTSTANDING_AUXILIARY_CALLS:
+            return False
+        _AUXILIARY_CALL_GATE.outstanding += 1
+        return True
+
+
+def _release_auxiliary_call() -> None:
+    """Release one process-wide late-call slot after its backend actually exits."""
+    with _AUXILIARY_CALL_GATE.lock:
+        _AUXILIARY_CALL_GATE.outstanding -= 1
+
+
+def _message_content(response: Any, role: str) -> str:
+    """Return validated response text while preserving upstream fallback semantics."""
+    try:
+        choices = response.choices
+        message = choices[0].message
+        content = message.content
+    except (AttributeError, IndexError, TypeError):
+        logger.warning("llm_aux_role=%r: provider returned malformed response", role)
+        return ""
+    if content is None:
+        logger.warning("llm_aux_role=%r: provider returned null content", role)
+        return ""
+    if not isinstance(content, str):
+        logger.warning("llm_aux_role=%r: provider returned non-text content", role)
+        return ""
+    if not content.strip():
+        logger.info("llm_aux_role=%r: provider returned empty content", role)
+        return ""
+    return content
+
+
+@dataclasses.dataclass
+class _BoundedAuxiliaryModel:
+    """One callable's gate around at most one non-cancellable host request."""
+
+    hermes_home: pathlib.Path
+    role: str
+    _lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    _active: bool = False
+    _closed: bool = False
+
+    def close(self) -> None:
+        """Reject future calls; an already-running daemon owns only its local result."""
+        with self._lock:
+            self._closed = True
+
+    def __call__(self, prompt: str) -> str:
+        bounded_prompt = _trim_auxiliary_prompt(prompt)
+        done = threading.Event()
+        result: dict[str, str] = {"text": ""}
+        finished = False
+        with self._lock:
+            if self._closed or self._active:
+                logger.info(
+                    "llm_aux_role=%r: request skipped while another call is active",
+                    self.role,
+                )
+                return ""
+            if not _claim_auxiliary_call():
+                logger.warning(
+                    "llm_aux_role=%r: global auxiliary call cap reached", self.role
+                )
+                return ""
+            self._active = True
+
+        def _finish() -> None:
+            """Release this callable and its global permit exactly once."""
+            nonlocal finished
+            with self._lock:
+                if finished:
+                    return
+                finished = True
+                self._active = False
+            _release_auxiliary_call()
+            done.set()
+
+        def _run() -> None:
+            try:
+                from hermes_constants import (
+                    reset_hermes_home_override,
+                    set_hermes_home_override,
+                )
+
+                token = set_hermes_home_override(self.hermes_home)
+                try:
+                    # The check and resolver execute inside the bounded worker so
+                    # a role edited to null after initialization cannot auto-route.
+                    if not _raw_role_mapping(self.role):
+                        logger.info(
+                            "llm_aux_role=%r: role is disabled or absent", self.role
+                        )
+                        return
+                    from agent.auxiliary_client import get_text_auxiliary_client
+
+                    client, model = get_text_auxiliary_client(self.role)
+                    if client is None or not isinstance(model, str) or not model:
+                        logger.warning(
+                            "llm_aux_role=%r: Hermes could not resolve a client; "
+                            "using heuristic extraction",
+                            self.role,
+                        )
+                        return
+                    response = client.chat.completions.create(
+                        model=model,
+                        messages=[{"role": "user", "content": bounded_prompt}],
+                        max_tokens=_AUXILIARY_MAX_TOKENS,
+                        timeout=_AUXILIARY_DEADLINE_SECONDS,
+                    )
+                    result["text"] = _message_content(response, self.role)
+                finally:
+                    reset_hermes_home_override(token)
+            except Exception:
+                logger.warning(
+                    "Cashew auxiliary request failed; using heuristic extraction "
+                    "(reason=request_failed)"
+                )
+            finally:
+                _finish()
+
+        try:
+            worker = threading.Thread(
+                target=_run,
+                name="cashew-auxiliary-call",
+                daemon=True,
+            )
+            worker.start()
+        except Exception:
+            _finish()
+            logger.warning(
+                "Cashew auxiliary worker could not start; using heuristic extraction "
+                "(reason=worker_start_failed)"
+            )
+            return ""
+        if not done.wait(_AUXILIARY_DEADLINE_SECONDS):
+            logger.warning(
+                "llm_aux_role=%r: request exceeded %.0fs; future calls wait for "
+                "the active backend to finish",
+                self.role,
+                _AUXILIARY_DEADLINE_SECONDS,
+            )
+            return ""
+        return result["text"]
 
 
 def resolve_model_fn(
     hermes_home: pathlib.Path,
     config: CashewConfig | None = None,
 ) -> Callable[[str], str] | None:
-    """Resolve an OpenAI-compatible LLM callable from Hermes auxiliary config.
+    """Return a bounded, profile-scoped Hermes auxiliary callable.
 
-    Reads ``llm_aux_role`` from ``cashew.json`` (or the provided
-    *config*), then ``auxiliary.<role>`` from ``config.yaml``, resolves
-    the API key from config or well-known env vars, and returns an
-    ``httpx``-based callable suitable for dream generation and text
-    extraction.
-
-    Returns ``None`` when:
-    - No ``llm_aux_role`` is configured
-    - ``config.yaml`` is absent or unparseable
-    - The auxiliary section or API key cannot be found (logs warning)
-
-    Designed for use by both ``CashewMemoryProvider`` (which passes its
-    already-loaded ``CashewConfig``) and the sleep cron script (which
-    passes ``None`` and lets the function load ``cashew.json`` itself).
+    The host owns provider routing, credentials, and transports. Cashew makes
+    one direct request per call through that resolved client so it can enforce
+    a caller deadline without the host task retry/fallback ladder.
     """
     # Resolve llm_aux_role from config
     if config is None:
@@ -642,114 +805,35 @@ def resolve_model_fn(
         logger.debug("llm_aux_role not set; heuristic-only mode — no model_fn")
         return None
 
-    # Read auxiliary config from config.yaml
-    config_yaml_path = hermes_home / "config.yaml"
-    if not config_yaml_path.exists():
-        logger.info(
-            "llm_aux_role=%r but %s not found; falling back to heuristic extraction",
-            role,
-            config_yaml_path,
-        )
-        return None
-
     try:
-        import yaml  # type: ignore[import-untyped, unused-ignore]
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
 
-        raw = yaml.safe_load(config_yaml_path.read_text(encoding="utf-8"))
+        token = set_hermes_home_override(hermes_home)
+        try:
+            enabled = _raw_role_mapping(role)
+        finally:
+            reset_hermes_home_override(token)
     except Exception:
-        logger.warning(
-            "llm_aux_role=%r: failed to parse %s; falling back to heuristic extraction",
-            role,
-            config_yaml_path,
-            exc_info=True,
+        logger.debug(
+            "Cashew auxiliary profile scope is unavailable; using heuristic extraction "
+            "(reason=profile_scope_unavailable)"
+        )
+        return None
+    if not enabled:
+        logger.info(
+            "llm_aux_role=%r is not explicitly enabled; heuristic-only mode", role
         )
         return None
 
-    aux_config = _auxiliary_role_config(raw, role)
-    if aux_config is None:
-        return None
-
-    model = aux_config.get("model")
-    if not isinstance(model, str) or not model:
-        logger.warning(
-            "llm_aux_role=%r: no model in auxiliary.%s config; "
-            "falling back to heuristic extraction",
-            role,
-            role,
-        )
-        return None
-
-    provider = aux_config.get("provider", "openai")
-    if not isinstance(provider, str) or not provider:
-        logger.warning(
-            "llm_aux_role=%r: provider must be a non-empty string; "
-            "falling back to heuristic extraction",
-            role,
-        )
-        return None
-    configured_base_url = aux_config.get("base_url")
-    if configured_base_url is not None and not isinstance(configured_base_url, str):
-        logger.warning(
-            "llm_aux_role=%r: base_url must be a string; "
-            "falling back to heuristic extraction",
-            role,
-        )
-        return None
-    base_url = (
-        configured_base_url
-        or _PROVIDER_BASE_URLS.get(provider, "https://api.openai.com/v1")
-    ).rstrip("/")
-
-    # Resolve API key: explicit config > env var by provider convention
-    api_key = aux_config.get("api_key")
-    if not api_key:
-        env_var = _PROVIDER_ENV_MAP.get(provider)
-        if env_var:
-            api_key = os.environ.get(env_var)
-
-    if not isinstance(api_key, str) or not api_key:
-        logger.warning(
-            "llm_aux_role=%r: no API key for provider=%r; "
-            "falling back to heuristic extraction",
-            role,
-            provider,
-        )
-        return None
-
-    logger.info(
-        "llm_aux_role=%r: using %s %s via %s",
-        role,
-        provider,
-        model,
-        base_url,
-    )
+    bounded = _BoundedAuxiliaryModel(pathlib.Path(hermes_home), role)
 
     def _model_fn(prompt: str) -> str:
-        """OpenAI-compatible chat completion callable."""
-        try:
-            import httpx
+        return bounded(prompt)
 
-            resp = httpx.post(
-                f"{base_url}/chat/completions",
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-                headers={"Authorization": f"Bearer {api_key}"},
-                timeout=120,
-            )
-            resp.raise_for_status()
-            data: Any = resp.json()
-            return str(data["choices"][0]["message"]["content"])
-        except Exception:
-            logger.warning(
-                "LLM call failed for role=%r (model=%s)",
-                role,
-                model,
-                exc_info=True,
-            )
-            return ""
-
+    setattr(_model_fn, "_cashew_close", bounded.close)
     return _model_fn
 
 

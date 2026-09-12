@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -133,6 +133,9 @@ class EmbeddingSupervisor:
         self._failure_count = 0
         self._next_start = 0.0
         self._last_exit_code: int | None = None
+        self._owner_released = threading.Event()
+        self._close_callbacks_lock = threading.Lock()
+        self._close_callbacks: list[Callable[[], None]] = []
         self._claim_owner()
 
     def _child_environment(self) -> dict[str, str]:
@@ -165,9 +168,32 @@ class EmbeddingSupervisor:
 
     def _release_owner(self) -> None:
         global _OWNER
+        released = False
         with _OWNER_LOCK:
             if _OWNER is self:
                 _OWNER = None
+                released = True
+        if not released:
+            return
+        with self._close_callbacks_lock:
+            self._owner_released.set()
+            callbacks, self._close_callbacks = self._close_callbacks, []
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                logger.warning("embedding close callback failed", exc_info=True)
+
+    def _when_closed(self, callback: Callable[[], None]) -> None:
+        """Run *callback* once this supervisor no longer owns process state."""
+        call_now = False
+        with self._close_callbacks_lock:
+            if self._owner_released.is_set():
+                call_now = True
+            else:
+                self._close_callbacks.append(callback)
+        if call_now:
+            callback()
 
     def _read_exact(self, size: int, deadline: float) -> bytes:
         channel = self._socket
@@ -212,6 +238,7 @@ class EmbeddingSupervisor:
             pending = pending[sent:]
 
     def _start_once(self, device: str) -> None:
+        self._last_exit_code = None
         parent, child = socket.socketpair()
         worker = Path(__file__).with_name("embedding_worker.py")
         command = [
@@ -486,12 +513,17 @@ class EmbeddingSupervisor:
                 failure.append(exc)
             finally:
                 done.set()
+                if self._close_waiting:
+                    self._finish_close_after_request()
 
-        threading.Thread(
-            target=execute,
-            daemon=True,
-            name="cashew-embedding-request",
-        ).start()
+        request = threading.Thread(
+            target=execute, daemon=True, name="cashew-embedding-request"
+        )
+        try:
+            request.start()
+        except Exception as exc:
+            self._request_lock.release()
+            raise EmbeddingUnavailable(EmbeddingFailure.STARTUP) from exc
         if not done.wait(timeout=max(0.0, caller_deadline - time.monotonic())):
             raise EmbeddingUnavailable(EmbeddingFailure.BUSY)
         if failure:
@@ -579,14 +611,27 @@ class EmbeddingSupervisor:
             finally:
                 self._request_lock.release()
         else:
+            self._close_waiting = True
             self._terminate(deadline=deadline)
-            if not self._close_waiting:
-                self._close_waiting = True
-                threading.Thread(
-                    target=self._finish_close_after_request,
-                    daemon=True,
-                    name="cashew-embedding-close",
-                ).start()
+            cleanup = threading.Thread(
+                target=self._finish_close_after_request,
+                daemon=True,
+                name="cashew-embedding-close",
+            )
+            try:
+                cleanup.start()
+            except Exception:
+                # The request thread also observes _close_waiting in its
+                # finally block. Cover the narrow race where it finished just
+                # before that flag was published by claiming the now-free slot.
+                if self._request_lock.acquire(blocking=False):
+                    try:
+                        self._terminate(deadline=deadline)
+                    finally:
+                        self._request_lock.release()
+                    self._close_waiting = False
+                    if not self._reaping:
+                        self._release_owner()
             return
         if not self._reaping:
             self._release_owner()

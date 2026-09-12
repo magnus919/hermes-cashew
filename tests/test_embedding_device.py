@@ -129,14 +129,21 @@ def test_rejected_second_provider_does_not_replace_active_upstream_state(
         owner.close()
 
 
-def test_upstream_device_patch_is_idempotent() -> None:
+def test_repeated_compatibility_configuration_resets_default_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import core.config
     import core.embedding_service
 
+    first_service = object()
+    monkeypatch.setattr(core.embedding_service, "_default_service", first_service)
     _patch_upstream_embedding("thenlper/gte-large", "cpu")
-    ensure_model = core.embedding_service.LocalBackend._ensure_model
-    daemon_encode = core.embedding_service.DaemonBackend.encode
+    assert core.config.config.embedding_model == "thenlper/gte-large"
+    assert core.embedding_service.DEFAULT_MODEL == "thenlper/gte-large"
+    assert core.embedding_service.EMBEDDING_DIM == 1024
+    assert core.embedding_service._default_service is None
 
+    second_service = object()
+    monkeypatch.setattr(core.embedding_service, "_default_service", second_service)
     _patch_upstream_embedding("thenlper/gte-large", "cpu")
-
-    assert core.embedding_service.LocalBackend._ensure_model is ensure_model
-    assert core.embedding_service.DaemonBackend.encode is daemon_encode
+    assert core.embedding_service._default_service is None

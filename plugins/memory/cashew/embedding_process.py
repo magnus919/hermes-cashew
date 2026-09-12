@@ -403,7 +403,9 @@ class EmbeddingSupervisor:
             elapsed,
         )
 
-    def _encode_owned(self, texts: list[str]) -> np.ndarray:
+    def _encode_owned(
+        self, texts: list[str], *, request_id: str, request_payload: bytes
+    ) -> np.ndarray:
         import numpy as np
 
         try:
@@ -411,21 +413,10 @@ class EmbeddingSupervisor:
                 raise EmbeddingUnavailable(EmbeddingFailure.CLOSED)
             if self._process is None:
                 self._start()
-            request_id = uuid.uuid4().hex
             started = time.monotonic()
-            request = json.dumps(
-                {
-                    "op": "encode",
-                    "version": 1,
-                    "generation": self.generation,
-                    "request_id": request_id,
-                    "texts": texts,
-                },
-                separators=(",", ":"),
-            ).encode()
             deadline = time.monotonic() + self.active_timeout
             try:
-                self._send(request, deadline)
+                self._send(request_payload, deadline)
                 header = json.loads(self._receive(deadline))
                 raw = self._receive(deadline)
                 expected_bytes = len(texts) * self.dimension * 4
@@ -499,6 +490,19 @@ class EmbeddingSupervisor:
             for text in texts
         ):
             raise EmbeddingUnavailable(EmbeddingFailure.PROTOCOL)
+        request_id = uuid.uuid4().hex
+        request_payload = json.dumps(
+            {
+                "op": "encode",
+                "version": 1,
+                "generation": self.generation,
+                "request_id": request_id,
+                "texts": texts,
+            },
+            separators=(",", ":"),
+        ).encode()
+        if len(request_payload) > _MAX_FRAME:
+            raise EmbeddingUnavailable(EmbeddingFailure.PROTOCOL)
         wait = self.wait_timeout if wait_timeout is None else wait_timeout
         caller_deadline = time.monotonic() + max(0.0, wait)
         if not self._request_lock.acquire(timeout=max(0.0, wait)):
@@ -510,7 +514,13 @@ class EmbeddingSupervisor:
 
         def execute() -> None:
             try:
-                result.append(self._encode_owned(texts))
+                result.append(
+                    self._encode_owned(
+                        texts,
+                        request_id=request_id,
+                        request_payload=request_payload,
+                    )
+                )
             except Exception as exc:
                 failure.append(exc)
             finally:
@@ -519,10 +529,10 @@ class EmbeddingSupervisor:
                     self._finish_close_after_request()
 
         try:
-            request = threading.Thread(
+            request_thread = threading.Thread(
                 target=execute, daemon=True, name="cashew-embedding-request"
             )
-            request.start()
+            request_thread.start()
         except Exception as exc:
             self._request_lock.release()
             raise EmbeddingUnavailable(EmbeddingFailure.STARTUP) from exc

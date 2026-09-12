@@ -105,6 +105,34 @@ def test_production_worker_returns_validated_float32_vectors(
     assert supervisor._process is None
 
 
+def test_oversize_batch_does_not_poison_healthy_worker(
+    tmp_path: Path, child_python: Path
+) -> None:
+    supervisor = _supervisor(tmp_path, device="auto", backoff_base=1.0)
+    try:
+        assert supervisor.encode(["ready"]).shape == (1, 4)
+        process = supervisor._process
+        assert process is not None
+        initial_failure_count = supervisor._failure_count
+        initial_next_start = supervisor._next_start
+
+        maximum_text = "x" * 1048576
+        with pytest.raises(EmbeddingUnavailable) as raised:
+            supervisor.encode([maximum_text] * 16)
+
+        assert raised.value.reason is EmbeddingFailure.PROTOCOL
+        assert supervisor._process is process
+        assert process.poll() is None
+        assert supervisor._failure_count == initial_failure_count
+        assert supervisor._next_start == initial_next_start
+        assert supervisor._launch_device == "auto"
+        assert supervisor.effective_device == "cuda:7"
+        assert supervisor.encode(["still ready"]).shape == (1, 4)
+        assert supervisor._process is process
+    finally:
+        supervisor.close()
+
+
 def test_unknown_dimension_comes_only_from_worker_handshake(
     tmp_path: Path, child_python: Path
 ) -> None:

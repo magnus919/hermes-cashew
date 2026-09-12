@@ -115,6 +115,7 @@ def _generate_script(
     provider = CashewMemoryProvider()
     provider._hermes_home = hermes_home
     provider._config = replace(CashewConfig(), sleep_schedule="every 1h")
+    provider._embedding_identity_ready = True
     provider._register_sleep_cron()
 
     return (

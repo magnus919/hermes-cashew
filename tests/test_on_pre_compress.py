@@ -121,6 +121,7 @@ def provider_with_llm(tmp_db, monkeypatch) -> MagicMock:
     provider._config = MagicMock()
     provider._config.user_domain = "test_user"
     provider._config.ai_domain = "test_ai"
+    provider._embedding_identity_ready = True
 
     return provider
 
@@ -135,6 +136,7 @@ def provider_without_llm(tmp_db) -> MagicMock:
     provider._config = MagicMock()
     provider._config.user_domain = "test_user"
     provider._config.ai_domain = "test_ai"
+    provider._embedding_identity_ready = True
     return provider
 
 

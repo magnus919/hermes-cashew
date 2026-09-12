@@ -7,6 +7,7 @@ import importlib
 import inspect
 import textwrap
 import threading
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -429,16 +430,27 @@ def test_pinned_upstream_shims_are_bounded_and_have_retirement_provenance(
     assert "get_default_service" in {
         called_name(call) for call in calls(core_embeddings.embed_nodes)
     }
-    migration_calls = calls(migration_script.detect_mismatch) + calls(
-        migration_script.migrate_embeddings
-    )
-    assert any(
-        called_name(call) == "resolve_embedding_dim"
-        and not call.args
-        and not call.keywords
-        for call in migration_calls
-    )
-    assert "_resolve_default_model" in {called_name(call) for call in migration_calls}
+    for migration_entry in (
+        migration_script.detect_mismatch,
+        migration_script.migrate_embeddings,
+    ):
+        entry_calls = calls(migration_entry)
+        assert [
+            call for call in entry_calls if called_name(call) == "resolve_embedding_dim"
+        ] and all(
+            not call.args and not call.keywords
+            for call in entry_calls
+            if called_name(call) == "resolve_embedding_dim"
+        )
+        assert [
+            call
+            for call in entry_calls
+            if called_name(call) == "_resolve_default_model"
+        ] and all(
+            not call.args and not call.keywords
+            for call in entry_calls
+            if called_name(call) == "_resolve_default_model"
+        )
     resolver_tree = ast.parse(
         textwrap.dedent(inspect.getsource(core.embedding_service.resolve_embedding_dim))
     )
@@ -450,6 +462,10 @@ def test_pinned_upstream_shims_are_bounded_and_have_retirement_provenance(
         and node.attr == "dim"
         for node in ast.walk(resolver_tree)
     )
+    assert "get_embedding_model" in {
+        called_name(call)
+        for call in calls(core.embedding_service._resolve_default_model)
+    }
 
     def assigned_target(target: ast.expr) -> str | None:
         def dotted(node: ast.expr) -> str | None:
@@ -469,10 +485,11 @@ def test_pinned_upstream_shims_are_bounded_and_have_retirement_provenance(
 
     shim_writes = [
         assigned_target(target)
-        for node in ast.walk(ast.parse(textwrap.dedent(source)))
+        for source_path in Path(cashew_module.__file__).parent.glob("*.py")
+        for node in ast.walk(ast.parse(source_path.read_text()))
         if isinstance(node, (ast.Assign, ast.AnnAssign))
         for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
-        if assigned_target(target) is not None
+        if (assigned_target(target) or "").startswith("core.")
     ]
     assert len(shim_writes) == 3
     assert set(shim_writes) == {

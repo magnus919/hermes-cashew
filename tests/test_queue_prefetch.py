@@ -27,6 +27,7 @@ def _provider_with_mock_config(tmp_path):
     cfg.sync_queue_timeout = 1.0
     provider._config = cfg
     provider._db_path = tmp_path / "brain.db"
+    provider._embedding_identity_ready = True
     provider._model_fn = None  # no LLM for unit tests
     provider._session_id = "test-session"
     return provider

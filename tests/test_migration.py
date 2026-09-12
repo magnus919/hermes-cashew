@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import fcntl
 import importlib
+import json
 import pathlib
 import sqlite3
 
@@ -578,6 +579,117 @@ def test_initialize_failure_restores_legacy_vec_before_wrapper_migration(
         assert _logical_legacy_vec_snapshot(db_path) == before
         assert provider._vector_available is False
         assert "restoring pre-migration backup" in caplog.text
+    finally:
+        provider.shutdown()
+
+
+def test_unresolved_identity_is_keyword_only_and_recovers_after_reinitialize(
+    tmp_path, monkeypatch
+):
+    """Repair failure admits no semantic work, but leaves safe query available."""
+    db_path = tmp_path / "cashew" / "brain.db"
+    db_path.parent.mkdir(parents=True)
+    _make_dimension_mismatch_db(db_path)
+    before = _logical_embedding_snapshot(db_path)
+    removed: list[str] = []
+
+    class CronJobs:
+        @staticmethod
+        def list_jobs():
+            return [
+                {
+                    "id": "cashew",
+                    "name": "cashew-sleep-cycle",
+                    "script": "cashew-sleep-cycle.py",
+                },
+                {
+                    "id": "other",
+                    "name": "cashew-sleep-cycle",
+                    "script": "other.py",
+                },
+            ]
+
+        @staticmethod
+        def remove_job(job_id):
+            removed.append(job_id)
+
+    import sys
+    import types
+
+    cron_package = types.ModuleType("cron")
+    cron_package.__path__ = []  # type: ignore[attr-defined]
+    cron_jobs = types.ModuleType("cron.jobs")
+    cron_jobs.list_jobs = CronJobs.list_jobs
+    cron_jobs.remove_job = CronJobs.remove_job
+    monkeypatch.setitem(sys.modules, "cron", cron_package)
+    monkeypatch.setitem(sys.modules, "cron.jobs", cron_jobs)
+
+    def destructive_failure(path, *, confirm, quiet):
+        del confirm, quiet
+        conn = sqlite3.connect(str(path))
+        try:
+            _load_sqlite_vec(conn)
+            conn.execute("DELETE FROM embeddings")
+            conn.execute("DROP TABLE vec_embeddings")
+            conn.commit()
+        finally:
+            conn.close()
+        raise RuntimeError("synthetic migration failure")
+
+    monkeypatch.setattr(
+        "scripts.migrate_embeddings.migrate_embeddings", destructive_failure
+    )
+    called_embedding_retrieval = False
+
+    def must_not_embed(**_kwargs):
+        nonlocal called_embedding_retrieval
+        called_embedding_retrieval = True
+        raise AssertionError("identity-unresolved recall must not embed")
+
+    monkeypatch.setattr(cashew_module, "_retrieve_with_embedding_wait", must_not_embed)
+    provider = CashewMemoryProvider()
+    provider.save_config({"embedding_model": "thenlper/gte-large"}, str(tmp_path))
+    provider.initialize("unresolved", hermes_home=str(tmp_path))
+    try:
+        assert provider._embedding_identity_ready is False
+        assert provider.health_status()["reason_code"] == "identity_unresolved"
+        assert removed == ["cashew"]
+        assert provider.prefetch("dimension")
+        response = json.loads(
+            provider.handle_tool_call("cashew_query", {"query": "dimension"})
+        )
+        assert response["ok"] is True
+        assert "dimension migration" in response["context"]
+        assert called_embedding_retrieval is False
+
+        provider.sync_turn("new user", "new assistant")
+        assert provider._sync_queue is not None and provider._sync_queue.empty()
+        assert (
+            provider._drain_once(("new user", "new assistant", "unresolved")) is False
+        )
+        assert (
+            json.loads(
+                provider.handle_tool_call(
+                    "cashew_extract",
+                    {"user_content": "new user", "assistant_content": "new assistant"},
+                )
+            )["ok"]
+            is False
+        )
+        provider._model_fn = lambda _prompt: "[]"
+        assert provider.on_pre_compress([{"role": "user", "content": "one"}] * 6) == ""
+        provider._update_access_metrics(["n1"])
+        assert _logical_embedding_snapshot(db_path) == before
+    finally:
+        provider.shutdown()
+
+    monkeypatch.setattr(
+        "scripts.migrate_embeddings.migrate_embeddings", _fake_migrate_to_1024
+    )
+    provider.initialize("recovered", hermes_home=str(tmp_path))
+    try:
+        assert provider._embedding_identity_ready is True
+        assert provider._embedding_dimensions(db_path) == ({1024}, 1024)
     finally:
         provider.shutdown()
 

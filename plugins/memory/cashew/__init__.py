@@ -462,6 +462,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         self._health_last_error_at: float | None = None
         self._outcomes = OutcomeLedger()
         self._vector_available: bool | None = None
+        # Set only after the owned child has proved the configured embedding
+        # identity and any required backup-backed repair has succeeded.  It is
+        # deliberately independent of sqlite-vec availability: a ready brain
+        # may still use upstream BFS when that optional extension is absent.
+        self._embedding_identity_ready = False
         self._embedding_supervisor: EmbeddingSupervisor | None = None
 
     @property
@@ -629,6 +634,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._health_last_error = None
                 self._health_last_error_at = None
                 self._vector_available = None
+                self._embedding_identity_ready = False
                 self._set_health_locked("initializing", "initializing")
         try:
             self._session_id = session_id
@@ -670,13 +676,23 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 # particular, an old vec table must not be dropped before a
                 # failed embedding repair has a chance to restore it.
                 self._ensure_db_schema(self._db_path)
-                if self._repair_embedding_dimension(self._db_path):
+                identity_ready = self._repair_embedding_dimension(self._db_path)
+                with self._sync_state_lock:
+                    self._embedding_identity_ready = identity_ready
+                    if not identity_ready:
+                        self._warm_cache.clear()
+                        self._prefetch_pending = None
+                if identity_ready:
                     self._finalize_vec_schema(self._db_path)
                 else:
-                    # Do not expose a vec index whose identity could not be
-                    # proved or restored.  Retrieval remains on upstream's
-                    # non-vector paths and health reports the degradation.
+                    # Do not expose an embedding service whose persisted
+                    # identity could not be proved or restored.  Query stays
+                    # available through keyword search, but all semantic
+                    # mutation and embedding-backed retrieval are fail-closed
+                    # until a later successful initialize.
                     self._vector_available = False
+                    self._suspend_sleep_cron()
+                    self._close_embedding_runtime(self._embedding_supervisor)
                 self._retriever = ContextRetriever(db_path=str(self._db_path))
                 self._model_fn = self._build_model_fn()
                 # Finish all synchronous setup before publishing the worker.
@@ -690,7 +706,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 with self._lifecycle_lock:
                     if self._initialization_cancelled:
                         raise _InitializationCancelledError()
-                if self._write_enabled and _HAS_HERMES_CRON:
+                if (
+                    self._write_enabled
+                    and self._embedding_identity_ready
+                    and _HAS_HERMES_CRON
+                ):
                     self._register_sleep_cron()
                 set_plugin_context(
                     session_id=session_id,
@@ -721,7 +741,14 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         )
                         config = self._config
                         model_fn = self._model_fn
-                        if self._vector_available is False:
+                        if not self._embedding_identity_ready:
+                            self._set_health_locked(
+                                "degraded",
+                                "identity_unresolved",
+                                fallback="keyword",
+                                cron=cron_state,
+                            )
+                        elif self._vector_available is False:
                             self._set_health_locked(
                                 "degraded",
                                 "vector_unavailable",
@@ -754,6 +781,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._db_path = None
                 self._retriever = None
                 self._model_fn = None
+                self._embedding_identity_ready = False
                 self._sync_queue = None
                 self._shutdown_started.set()
                 self._set_health_locked("stopped", "initialization_cancelled")
@@ -785,6 +813,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._db_path = None
                 self._retriever = None
                 self._model_fn = None
+                self._embedding_identity_ready = False
                 self._sync_worker = None
                 self._sync_queue = None
                 self._shutdown_started.set()
@@ -827,7 +856,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
     def _register_sleep_cron(self) -> None:
         """Reconcile the persistent cron job and managed script with config."""
-        if self._hermes_home is None or self._config is None:
+        if (
+            self._hermes_home is None
+            or self._config is None
+            or not self._embedding_identity_ready
+        ):
             return
         try:
             from cron.jobs import create_job, list_jobs, remove_job
@@ -936,6 +969,26 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             )
             self._sleep_cron_job_id = None
 
+    def _suspend_sleep_cron(self) -> None:
+        """Remove a stale sleep job when this profile's identity is unresolved."""
+        try:
+            from cron.jobs import list_jobs, remove_job
+
+            for job in list_jobs():
+                if (
+                    job.get("name") == "cashew-sleep-cycle"
+                    and job.get("script") == "cashew-sleep-cycle.py"
+                ):
+                    remove_job(job["id"])
+        except ImportError:
+            pass
+        except Exception:
+            logger.warning("sleep: failed to suspend unresolved identity cron")
+        finally:
+            self._sleep_cron_job_id = None
+            with self._sync_state_lock:
+                self._health_cron = "disabled"
+
     def _remove_sleep_cron(self) -> None:
         """Deregister the sleep cycle cron job.
 
@@ -994,6 +1047,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             config = self._config
             if (
                 not self._write_enabled
+                or not self._embedding_identity_ready
                 or config is None
                 or self._initializing
                 or self._shutdown_started.is_set()
@@ -1252,10 +1306,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     return False
                 return self._repair_embedding_dimension_locked(db_path)
         except MaintenanceLockAcquisitionError:
-            if self._embedding_migration_required(db_path):
-                raise
+            required = self._embedding_migration_required(db_path)
             logger.warning(
-                "embedding dimension migration not needed; unable to acquire %s",
+                "embedding identity %s; unable to acquire %s; using keyword-only recall",
+                "could not be verified" if required else "inspection deferred",
                 lock_path,
                 exc_info=True,
             )
@@ -1594,7 +1648,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
     def _update_access_metrics(
         self, node_ids: list[str], db_path: pathlib.Path | str | None = None
     ) -> None:
-        if not self._write_enabled or not node_ids:
+        if (
+            not self._write_enabled
+            or not self._embedding_identity_ready
+            or not node_ids
+        ):
             return
         target_db = db_path if db_path is not None else self._db_path
         if target_db is None:
@@ -1637,7 +1695,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         # Short-circuit only after Python interpreter finalization has been
         # observed. Normal provider shutdown must drain accepted turns.
-        if self._shutdown_flag.is_set():
+        if self._shutdown_flag.is_set() or not self._embedding_identity_ready:
             logger.debug("cashew sync: interpreter shutdown flag set, dropping turn")
             return False
 
@@ -1679,6 +1737,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         # Run think cycle periodically if LLM is wired
         if (
             self._model_fn is not None
+            and self._embedding_identity_ready
             and self._config
             and self._config.think_cycles
             and self._config.think_interval > 0
@@ -1722,6 +1781,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
     def _save_think_counter(self, value: int) -> None:
         """Write persistent think counter to DB."""
+        if not self._embedding_identity_ready:
+            return
         try:
             import sqlite3
 
@@ -1753,6 +1814,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         """
         if (
             not self._write_enabled
+            or not self._embedding_identity_ready
             or self._model_fn is None
             or self._db_path is None
             or self._initializing
@@ -1864,6 +1926,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         Silent-degrades: logs warning on failure, never raises.
         """
+        if not self._embedding_identity_ready:
+            return 0
+
         from core.embeddings import embed_nodes
         from core.session import _create_node, _set_node_tags
 
@@ -2168,6 +2233,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._db_path = None
             self._retriever = None
             self._model_fn = None
+            self._embedding_identity_ready = False
             supervisor = self._embedding_supervisor
             self._warm_cache.clear()
             self._prefetch_generation += 1
@@ -2216,6 +2282,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 exclude_tags=exclude_tags,
             )
             max_nodes = config.recall_k
+            identity_ready = self._embedding_identity_ready
             # Consume the pending result and snapshot the warm cache while
             # the same runtime identity is admitted. Releasing the lock
             # between these steps could let a reinitialized profile publish a
@@ -2257,6 +2324,25 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 "prefetch warm cache MISS (%d cue(s) in cache) — falling through to cold retrieval",
                 len(warm_cache),
             )
+        if not identity_ready:
+            try:
+                return self._format_context(
+                    self._keyword_search(
+                        query,
+                        max_nodes,
+                        domain,
+                        tag,
+                        exclude_tags,
+                        db_path=db_path,
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "cashew keyword-only recall failed (query_len=%d)",
+                    len(query),
+                    exc_info=True,
+                )
+                return ""
         with trace_operation(
             "cashew.prefetch",
             {"query.length": len(query)},
@@ -2365,7 +2451,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 query=query,
                 db_path=str(db_path),
                 top_k=config.prefetch_k,
-                use_llm=self._model_fn is not None and config.prefetch_cues > 0,
+                use_llm=(
+                    self._embedding_identity_ready
+                    and self._model_fn is not None
+                    and config.prefetch_cues > 0
+                ),
             )
             if self._prefetch_pending_request is not None:
                 _METRICS.record_prefetch_coalesced()
@@ -2460,19 +2550,12 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 if not self._prefetch_request_is_current(identity):
                     _METRICS.record_prefetch_cancelled()
                     return
-                results = _retrieve_with_embedding_wait(
-                    db_path=request.db_path,
-                    query=cue,
-                    top_k=request.top_k,
-                )
-                if results:
-                    node_ids = [r.node_id for r in results]
-                    nodes = self._enrich_results(node_ids, db_path=request.db_path)
-                    for node in nodes:
-                        node_id = node.get("id", "")
-                        if node_id not in seen_ids:
-                            seen_ids.add(node_id)
-                            all_nodes.append(node)
+                nodes = self._prefetch_nodes_for_cue(cue, request)
+                for node in nodes:
+                    node_id = node.get("id", "")
+                    if node_id not in seen_ids:
+                        seen_ids.add(node_id)
+                        all_nodes.append(node)
             if not self._prefetch_request_is_current(identity):
                 _METRICS.record_prefetch_cancelled()
                 return
@@ -2492,6 +2575,24 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 )
             else:
                 _METRICS.record_prefetch_cancelled()
+
+    def _prefetch_nodes_for_cue(
+        self, cue: str, request: _PrefetchRequest
+    ) -> list[dict]:
+        """Retrieve one cue without embedding when identity is unresolved."""
+        with self._sync_state_lock:
+            identity_ready = self._embedding_identity_ready
+        if identity_ready:
+            results = _retrieve_with_embedding_wait(
+                db_path=request.db_path,
+                query=cue,
+                top_k=request.top_k,
+            )
+            if results:
+                return self._enrich_results(
+                    [result.node_id for result in results], db_path=request.db_path
+                )
+        return self._keyword_search(cue, request.top_k, db_path=request.db_path)
 
     def _prefetch_request_is_current(self, identity: _PrefetchRequestIdentity) -> bool:
         """Check request and complete runtime identity without slow work."""
@@ -2726,6 +2827,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             with self._sync_state_lock:
                 ledger = self._outcomes
                 generation = self._health_generation
+                identity_ready = self._embedding_identity_ready
             try:
                 _t0 = time.perf_counter()
                 query = args["query"]
@@ -2738,17 +2840,20 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     tag = args.get("tag")
                     exclude_tags = args.get("exclude_tags")
                     vector_failed = False
-                    try:
-                        results = _retrieve_with_embedding_wait(
-                            db_path=str(self._db_path),
-                            query=query,
-                            top_k=max_nodes,
-                            domain=domain,
-                            tags=[tag] if tag else None,
-                            exclude_tags=exclude_tags,
-                        )
-                    except Exception:
-                        vector_failed = True
+                    if identity_ready:
+                        try:
+                            results = _retrieve_with_embedding_wait(
+                                db_path=str(self._db_path),
+                                query=query,
+                                top_k=max_nodes,
+                                domain=domain,
+                                tags=[tag] if tag else None,
+                                exclude_tags=exclude_tags,
+                            )
+                        except Exception:
+                            vector_failed = True
+                            results = None
+                    else:
                         results = None
                     if results:
                         node_ids = [r.node_id for r in results]
@@ -2769,7 +2874,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                             ledger.record_tool(
                                 "cashew_query", success=True, empty=node_count == 0
                             )
-                            if vector_failed and not self._shutdown_started.is_set():
+                            if (
+                                vector_failed
+                                and identity_ready
+                                and not self._shutdown_started.is_set()
+                            ):
                                 self._set_health_locked(
                                     "degraded",
                                     "vector_unavailable",
@@ -2818,6 +2927,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             # set _db_path / _config to None.
             if (
                 not self._write_enabled
+                or not self._embedding_identity_ready
                 or self._db_path is None
                 or self._config is None
                 or self._initializing

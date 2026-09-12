@@ -40,14 +40,6 @@ def _find_hermes_home() -> Path:
     )
 
 
-def _read_config(hermes_home: Path) -> dict:
-    """Read cashew.json, returning {} if absent."""
-    cfg_path = hermes_home / "cashew.json"
-    if cfg_path.exists():
-        return json.loads(cfg_path.read_text())
-    return {}
-
-
 def _load_profile_modules(hermes_home: Path):
     """Load cron dependencies from the installation that registered this script."""
     marker = _INSTALLATION_MARKER
@@ -106,42 +98,37 @@ def _load_profile_modules(hermes_home: Path):
     return config_module, sleep_module
 
 
-def _resolve_db_path(hermes_home: Path, config: dict, config_module=None) -> str:
+def _resolve_db_path(hermes_home: Path, db_path_value: str, config_module=None) -> str:
     """Resolve the DB path through the provider's profile-isolation guard."""
-    raw = config.get("cashew_db_path") or "cashew/brain.db"
     if config_module is None:
         # Retain the direct helper contract used by in-process callers. The
         # generated cron entry point always supplies the profile-pinned module.
         from plugins.memory.cashew.config import resolve_db_path
 
-        return str(resolve_db_path(hermes_home, raw))
-    return str(config_module.resolve_db_path(hermes_home, raw))
+        return str(resolve_db_path(hermes_home, db_path_value))
+    return str(config_module.resolve_db_path(hermes_home, db_path_value))
 
 
 def main() -> None:
     """Discover config, import sleep_refactor, run one cycle, print JSON."""
     hermes_home = _find_hermes_home()
-    config = _read_config(hermes_home)
-    limit = config.get("sleep_max_nodes", 2000)
-    embedding_model = config.get("embedding_model", "thenlper/gte-large")
-    embedding_device = config.get("embedding_device", "cpu")
-
     config_module, sleep_module = _load_profile_modules(hermes_home)
-    db_path = _resolve_db_path(hermes_home, config, config_module)
+    config = config_module.load_config(hermes_home)
+    db_path = _resolve_db_path(hermes_home, config.cashew_db_path, config_module)
 
     # Resolve the LLM callable from auxiliary config for dream generation.
-    model_fn = config_module.resolve_model_fn(hermes_home=hermes_home)
+    model_fn = config_module.resolve_model_fn(hermes_home=hermes_home, config=config)
 
     result = sleep_module.run_sleep_cycle(
         db_path=db_path,
-        limit=limit,
+        limit=config.sleep_max_nodes,
         model_fn=model_fn,
         # This process owns the scheduled cycle and exits immediately after
         # printing the result. Keep dream generation and orphan embedding
         # synchronous so they complete before interpreter shutdown.
         background_dream=False,
-        embedding_model=embedding_model,
-        embedding_device=embedding_device,
+        embedding_model=config.embedding_model,
+        embedding_device=config.embedding_device,
     )
     print(json.dumps(result, indent=2))
 

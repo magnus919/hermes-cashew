@@ -306,17 +306,17 @@ def test_initialize_generates_config_file_on_first_load(tmp_path):
 
 def test_initialize_does_not_overwrite_existing_config(tmp_path):
     """First-load bootstrap: existing cashew.json is never overwritten."""
-    existing = {"recall_k": 42, "user_domain": "custom"}
+    existing = {"recall_k": 12, "user_domain": "custom"}
     (tmp_path / CONFIG_FILENAME).write_text(json.dumps(existing))
     p = CashewMemoryProvider()
     p.initialize("s", hermes_home=str(tmp_path))
     try:
         # Verify our custom values survived
-        assert p._config.recall_k == 42
+        assert p._config.recall_k == 12
         assert p._config.user_domain == "custom"
         # Verify the file wasn't replaced wholesale
         on_disk = json.loads((tmp_path / CONFIG_FILENAME).read_text())
-        assert on_disk["recall_k"] == 42
+        assert on_disk["recall_k"] == 12
     finally:
         p.shutdown()
 

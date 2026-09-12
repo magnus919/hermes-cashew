@@ -51,9 +51,10 @@ def _write_installation(implementation: Path, identity: str) -> None:
         "        self.sleep_max_nodes = values.get('sleep_max_nodes', 2000)\n"
         "        self.embedding_model = values.get('embedding_model', 'thenlper/gte-large')\n"
         "        self.embedding_device = values.get('embedding_device', 'cpu')\n"
-        "def load_config(home):\n"
-        "    path = Path(home) / 'cashew.json'\n"
-        "    config = Config(json.loads(path.read_text()) if path.exists() else {})\n"
+        "        self.sleep_cycles = values.get('sleep_cycles', True)\n"
+        "        self.sleep_schedule = values.get('sleep_schedule', 'every 1h')\n"
+        "def load_effective_config_snapshot(home, values):\n"
+        "    config = Config(values)\n"
         "    db = Path(home) / config.cashew_db_path\n"
         "    db.parent.mkdir(parents=True, exist_ok=True)\n"
         "    with sqlite3.connect(db) as conn:\n"
@@ -122,7 +123,10 @@ def _write_installation(implementation: Path, identity: str) -> None:
 
 
 def _generate_script(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    **config_changes: object,
 ) -> tuple[Path, Path, Path]:
     """Drive registration itself so tests execute the emitted script."""
     _install_fake_cron(monkeypatch)
@@ -144,7 +148,9 @@ def _generate_script(
     )
     provider = CashewMemoryProvider()
     provider._hermes_home = hermes_home
-    provider._config = replace(CashewConfig(), sleep_schedule="every 1h")
+    provider._config = replace(
+        CashewConfig(), sleep_schedule="every 1h", **config_changes
+    )
     provider._embedding_identity_ready = True
     provider._register_sleep_cron()
 
@@ -159,17 +165,27 @@ def _generate_script(
 def test_generated_cron_script_runs_from_registered_installation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
-    hermes_home, script, _implementation = _generate_script(tmp_path, monkeypatch, kind)
+    custom_db = "owned/custom-cashew.db"
+    hermes_home, script, _implementation = _generate_script(
+        tmp_path,
+        monkeypatch,
+        kind,
+        cashew_db_path=custom_db,
+        sleep_max_nodes=7,
+        embedding_model="test/embedding-model",
+        embedding_device="mps",
+    )
     marker = tmp_path / "phase-complete"
     events = tmp_path / "cron-events"
-    custom_db = "owned/custom-cashew.db"
+    # This JSON deliberately disagrees with registration. The generated
+    # process must retain the provider's validated effective snapshot.
     (hermes_home / "cashew.json").write_text(
         json.dumps(
             {
-                "cashew_db_path": custom_db,
-                "sleep_max_nodes": 7,
-                "embedding_model": "test/embedding-model",
-                "embedding_device": "mps",
+                "cashew_db_path": "ignored/by/snapshot.db",
+                "sleep_max_nodes": 1,
+                "embedding_model": "ignored/model",
+                "embedding_device": "ignored-device",
             }
         )
     )
@@ -315,7 +331,7 @@ def test_copied_generated_script_rejects_different_hermes_profile(
     )
 
     assert completed.returncode == 1
-    assert "no longer matches this cron registration" in completed.stderr
+    assert "reinitialize Cashew" in completed.stderr
 
 
 @pytest.mark.parametrize("missing_file", ["config.py", "sleep_refactor.py"])
@@ -385,13 +401,12 @@ def test_generated_script_rejects_malformed_installation_marker(
     assert "installation marker is malformed" in completed.stderr
 
 
-def test_main_uses_pinned_module_to_reject_invalid_profile_config(
+def test_main_rejects_invalid_embedded_effective_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The cron entry point validates config through its registered source."""
+    """The cron entry point validates its registered effective snapshot."""
     hermes_home = tmp_path / "profile"
     hermes_home.mkdir()
-    (hermes_home / "cashew.json").write_text(json.dumps({"sleep_max_nodes": -1}))
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
     import plugins.memory.cashew.config as profile_config
@@ -402,9 +417,10 @@ def test_main_uses_pinned_module_to_reject_invalid_profile_config(
         lambda _home: (
             profile_config,
             types.SimpleNamespace(__package__="plugins.memory.cashew"),
+            {"config": {"sleep_max_nodes": -1}},
         ),
     )
-    with pytest.raises(ValueError, match="sleep_max_nodes must be an integer"):
+    with pytest.raises(ValueError, match="configuration snapshot is malformed"):
         sleep_cron_script.main()
 
 

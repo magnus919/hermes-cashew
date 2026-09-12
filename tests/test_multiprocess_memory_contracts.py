@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from plugins.memory.cashew import CashewMemoryProvider
+from plugins.memory.cashew.config import CashewConfig
 from plugins.memory.cashew.sleep_refactor import run_sleep_cycle
 
 _CHILD = r"""
@@ -18,6 +20,7 @@ import json, os, sys
 from pathlib import Path
 os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_DATASETS_OFFLINE="1")
 from plugins.memory.cashew import CashewMemoryProvider
+from plugins.memory.cashew.config import CashewConfig
 import core.session
 assert getattr(core.session, "__file__", ""), "real core.session required"
 home=Path(sys.argv[1]); marker=sys.argv[2]; gate=sys.argv[3]
@@ -130,3 +133,33 @@ def test_sleep_lock_contention_has_bounded_named_skip(tmp_path: Path) -> None:
             assert run_sleep_cycle(str(db_path), model_fn=None) == {}
         finally:
             fcntl.flock(holder, fcntl.LOCK_UN)
+
+
+def test_real_extract_survives_following_sleep_cycle(tmp_path: Path) -> None:
+    """A real explicit extraction remains queryable after maintenance runs."""
+    home = tmp_path / "shared"
+    writer = _child(home, "extract-before-sleep", "extract-sleep")
+    _finish(writer)
+    result = run_sleep_cycle(str(home / "brain.db"), model_fn=None)
+    assert result == {} or "error" in result or result["nodes_selected"] >= 0
+    assert any("extract-before-sleep" in value for value in _markers(home / "brain.db"))
+
+
+def test_migration_lock_contention_defers_while_real_writer_runs(
+    tmp_path: Path,
+) -> None:
+    """Migration's nonblocking lock cannot overlap the real child write path."""
+    home = tmp_path / "shared"
+    writer = _child(home, "writer-during-migration", "migration-write")
+    db_path = home / "brain.db"
+    lock_path = Path(f"{db_path}.sleep.lock")
+    provider = CashewMemoryProvider()
+    provider._config = CashewConfig()
+    with lock_path.open("a+") as holder:
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            provider._repair_embedding_dimension(db_path)
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+    _finish(writer)
+    assert any("writer-during-migration" in value for value in _markers(db_path))

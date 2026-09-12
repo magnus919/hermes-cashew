@@ -127,6 +127,19 @@ def test_audit_privacy_canary_is_absent_from_report_and_logs(
     assert "SECRET-CANARY" not in caplog.text
 
 
+def test_permanent_core_memory_is_informational(tmp_path: Path) -> None:
+    path = tmp_path / "core.db"
+    _create_profile(path)
+    conn = sqlite3.connect(path)
+    _add_node(conn, "core", permanent=1)
+    conn.execute("UPDATE thought_nodes SET node_type='core_memory' WHERE id='core'")
+    conn.commit()
+    conn.close()
+    report = audit_integrity(path)
+    assert report["informational"]["permanent_core_nodes"] == 1
+    assert "permanent_core_node" not in report["reasons"]
+
+
 def test_audit_reports_fixed_row_and_byte_budgets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

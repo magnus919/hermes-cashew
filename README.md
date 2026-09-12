@@ -351,9 +351,21 @@ when **all** of the following are true:
 | ``create_job()`` succeeds | — | — | Exception caught, WARNING logged |
 | No job already registered for this provider instance | — | — | No-op dedup guard |
 
-The cron job is **removed** on plugin shutdown (``shutdown()``). A dedup
-helper scans for existing ``cashew-sleep-cycle`` jobs by name on each
-registration to prevent N jobs accumulating across N restarts.
+The cron job is persistent: provider ``shutdown()`` clears only this instance's
+tracking and leaves the profile-owned job scheduled across restarts. Before
+uninstalling, list the active profile's jobs and remove the exact
+``cashew-sleep-cycle`` entry, then remove the plugin:
+
+```bash
+hermes cron list
+hermes cron remove <cashew-sleep-cycle-job-id>
+hermes plugins remove cashew
+```
+
+A dedup helper scans for existing ``cashew-sleep-cycle`` jobs by name on each
+registration to prevent N jobs accumulating across N restarts. The lifecycle
+reconciliation improvements in draft [PR #232](https://github.com/magnus919/hermes-cashew/pull/232)
+remain pending and are not part of current `main`.
 
 ### When the cron job runs
 
@@ -398,7 +410,9 @@ original process still holds the lock.
 
 When an API caller enables ``background_dream=True``, the returned cycle
 summary records ``dream_pending`` and the daemon uses its own connection; it is
-not guarded by the synchronous maintenance lock. This advisory lock is not a complete
+not guarded by the synchronous maintenance lock. The cron integration uses
+``background_dream=False`` so its LLM and orphan-embedding work finish before
+the script exits. This advisory lock is not a complete
 shared-brain writer-coordination policy; broader coordination is tracked in
 [#191](https://github.com/magnus919/hermes-cashew/issues/191).
 
@@ -489,9 +503,15 @@ initialization. A mismatch is repaired before background workers start:
 3. the provider validates the new dimensions before enabling retrieval.
 
 If backup, migration, or validation fails, the provider logs a warning and
-restores the backup. Thought nodes are not discarded. Stop other Hermes or
-Cashew processes before deliberately changing `embedding_model`, then restart
-Hermes and allow the one-time migration to finish before issuing queries.
+attempts to restore the backup. Preserve the backup and inspect the warning
+before retrying. Stop other Hermes or Cashew processes before deliberately
+changing `embedding_model`, then restart Hermes and allow the one-time
+migration to finish before issuing queries. Bounded consolidation and shorter
+embedding write transactions tracked by
+[#205](https://github.com/magnus919/hermes-cashew/issues/205), plus integrity
+repair tracked by [#206](https://github.com/magnus919/hermes-cashew/issues/206),
+are pending;
+the current adapter migration and audit safeguards remain in force.
 
 ## Development
 

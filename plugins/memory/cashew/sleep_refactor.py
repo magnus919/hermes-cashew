@@ -2,27 +2,25 @@
 """Refactored Cashew sleep cycle — batch-scalable memory consolidation.
 
 |Replaces the upstream O(N²) sleep cycle with vectorized numpy similarity
-|search, batched DB writes, and a bounded work cap.  Designed to run at
-|session end via lifecycle hooks (under 5 seconds for 7K nodes) rather
-|than as a standalone cron-scheduled heavyweight.
+|search, batched DB writes, and a bounded work cap. The provider currently
+|invokes this local implementation from the standalone Hermes cron script;
+|the earlier session-end hook description is historical.
 |
 |The ``background_dream`` parameter (added in v0.10.0) moves the LLM-powered
 |dream generation (Phase 8) and orphan embedding (Phase 9) into a daemon
-|thread so the lifecycle hook returns promptly — the cross-linking, dedup, GC,
-|and core memory phases still run synchronously in ~20s, but the ~60s LLM
-|call no longer blocks the session boundary.
+|thread so an API caller can return promptly — the cross-linking, dedup, GC,
+|and core memory phases still run synchronously, while the optional LLM call
+|and orphan embedding continue in the daemon thread.
 
-|Usage (from CashewMemoryProvider):
+|Usage (from the cron integration):
 |    from .sleep_refactor import run_sleep_cycle
 
-    def on_session_end(self, messages):
-        ...
-        result = run_sleep_cycle(
-            db_path=str(self._db_path),
-            limit=2000,
-            model_fn=self._model_fn,
-            background_dream=True,   # ← LLM call in daemon thread
-        )
+    result = run_sleep_cycle(
+        db_path=str(db_path),
+        limit=2000,
+        model_fn=model_fn,
+        background_dream=False,
+    )
 """
 
 from __future__ import annotations

@@ -10,7 +10,9 @@ Thin adapter around upstream [cashew-brain](https://github.com/rajkripal/cashew)
 
 - **LLM integration**: `llm_aux_role` config key references `auxiliary.<role>` in Hermes `config.yaml`. Plugin reads Hermes config, resolves credentials, wires `model_fn` callable to upstream. No API keys in plugin config.
 - **Retrieval**: Three-tier (sqlite-vec → BFS → keyword), delegated to upstream `retrieve_recursive_bfs()`.
-- **Schema**: Upstream `core.db.ensure_schema()` — no custom migration layer.
+- **Schema**: Upstream `core.db.ensure_schema()` owns the Cashew schema; the
+  adapter adds a compatibility guard for legacy `vec_embeddings` tables and a
+  profile-scoped embedding-dimension migration with backup/rollback.
 - **Threading**: Bounded `queue.Queue(maxsize=16)` + single daemon worker. Shutdown rejects new producers, drains accepted turns ahead of `_SHUTDOWN = object()`, and defers cleanup if the bounded join times out.
 
 ## Project Conventions
@@ -122,6 +124,27 @@ done
 - **`CASHEW_*` env vars stripped** in `conftest.py` to prevent Hermes session leak into tests.
 - **Silent degrade** on all Cashew failures — log WARNING, return empty, never raise into Hermes.
 
+### Pending replacement work
+
+These are current adapter responsibilities until the tracked replacement is
+merged and verified:
+
+- [#193](https://github.com/magnus919/hermes-cashew/issues/193): upstream
+  sleep-engine replacement; the local `sleep_refactor.py` remains active.
+- [#203](https://github.com/magnus919/hermes-cashew/issues/203): safe cron
+  reconciliation; draft [PR #232](https://github.com/magnus919/hermes-cashew/pull/232)
+  is not part of `main`.
+- [#205](https://github.com/magnus919/hermes-cashew/issues/205): bounded
+  consolidation and shorter embedding write transactions.
+- [#206](https://github.com/magnus919/hermes-cashew/issues/206): integrity
+  audit and targeted repair; draft [PR #231](https://github.com/magnus919/hermes-cashew/pull/231)
+  currently supplies audit-only behavior.
+- [#208](https://github.com/magnus919/hermes-cashew/issues/208): structural
+  cleanup and loader consolidation.
+
+Do not describe these replacements as shipped until they are merged to `main`
+and validated at the runtime boundary.
+
 ## Developer Commands
 
 ```bash
@@ -148,7 +171,8 @@ CI runs the complete suite with `pytest -vs` and `HF_HUB_OFFLINE=1 TRANSFORMERS_
 
 The plugin supports optional LLM-powered extraction via Hermes' auxiliary model infrastructure:
 
-- Config key: `llm_aux_role` in `cashew.json` (default: `None` → heuristic-only)
+- Config key: `llm_aux_role` in `cashew.json` (default: `memory`, a role name
+  only; an explicit `auxiliary.memory` mapping is still required)
 - User config: `auxiliary.memory` section in Hermes `config.yaml`
 - Plugin reads Hermes config, resolves API key from config or well-known env var, constructs OpenAI-compatible callable
 - Both `_drain_once` (sync worker) and `cashew_extract` (tool) pass the callable to upstream

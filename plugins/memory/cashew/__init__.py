@@ -84,6 +84,11 @@ legitimate test-code payloads and with Python 3.13's queue.Queue.shutdown()
 signal path.
 """
 
+
+class _InitializationCancelledError(RuntimeError):
+    """Private control flow for shutdown cancelling a slow initialize()."""
+
+
 # Probe for the Hermes cron module. In a full Hermes Agent environment the
 # cron.jobs package is importable (the agent root is on sys.path). In CI and
 # standalone test environments it is not — the sleep cycle cron job cannot be
@@ -395,6 +400,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         # Unknown future contexts fail closed.
         self._write_enabled: bool = True
         self._sync_worker: "threading.Thread | None" = None
+        # Serializes initialization ownership decisions. The lock is held only
+        # while claiming/releasing a generation; sync_turn never waits on it.
+        self._lifecycle_lock = threading.Lock()
+        self._initializing = False
+        self._initialization_cancelled = False
         # Serializes producer admission with sentinel insertion so no turn can
         # race behind the shutdown sentinel and remain unprocessed.
         self._sync_state_lock = threading.Lock()
@@ -486,20 +496,34 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 "Hermes Agent passes it as a keyword. Got: "
                 + repr(sorted(kwargs.keys()))
             )
-        self._session_id = session_id
-        self._hermes_home = pathlib.Path(kwargs["hermes_home"])
-        self._write_enabled = kwargs.get("agent_context", "primary") == "primary"
-        # Queue is created here so config-driven sizing/timeout values are wired in.
-        # The daemon worker thread drains it and receives a bounded flush during
-        # provider shutdown.
-        self._sync_queue = queue.Queue(maxsize=16)
-        # Reset lifecycle flags — a provider instance may be initialized again
-        # after a prior shutdown.
-        self._shutdown_started.clear()
-        self._shutdown_flag.clear()
-        with trace_operation("cashew.initialize") as span:
-            span.set_attribute("session_id", session_id)
-            try:
+        with self._lifecycle_lock:
+            if self._initializing:
+                logger.warning(
+                    "cashew initialize deferred: another initialization is in progress"
+                )
+                return
+            with self._sync_state_lock:
+                if self._sync_queue is not None or self._shutdown_started.is_set():
+                    logger.warning(
+                        "cashew initialize deferred: previous worker generation still owns runtime state"
+                    )
+                    return
+                self._initializing = True
+                self._initialization_cancelled = False
+        try:
+            self._session_id = session_id
+            self._hermes_home = pathlib.Path(kwargs["hermes_home"])
+            self._write_enabled = kwargs.get("agent_context", "primary") == "primary"
+            # Queue is created here so config-driven sizing/timeout values are wired in.
+            # The daemon worker drains it and receives a bounded flush during
+            # provider shutdown.
+            self._sync_queue = queue.Queue(maxsize=16)
+            # Reset lifecycle flags — a provider instance may be initialized again
+            # after a prior shutdown.
+            self._shutdown_started.clear()
+            self._shutdown_flag.clear()
+            with trace_operation("cashew.initialize") as span:
+                span.set_attribute("session_id", session_id)
                 self._config = load_config(self._hermes_home)
                 # Configure upstream model and device before any embedding work.
                 # The singleton is reset so the next use observes both values.
@@ -529,13 +553,17 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._repair_embedding_dimension(self._db_path)
                 self._retriever = ContextRetriever(db_path=str(self._db_path))
                 self._model_fn = self._build_model_fn()
-                # Start the sync worker AFTER all worker-read state
-                # is populated (db_path, session_id, sync_queue).
-                self._start_sync_worker()
-                # Register the sleep cycle cron job if configured.
-                # Runs AFTER the sync worker so the provider is fully initialized
-                # before any background work begins. Silently skips when the
-                # Hermes cron module is not available (e.g. CI, standalone tests).
+                # Finish all synchronous setup before publishing the worker.
+                # Shutdown can cancel a slow initialize while this work runs;
+                # the final lifecycle-locked handoff below is the only place
+                # where a worker may become visible.
+                # Reject cancellation before cron registration when possible.
+                # A shutdown racing after this check can still leave an
+                # already-started external registration; the final publication
+                # check below prevents that generation from starting a worker.
+                with self._lifecycle_lock:
+                    if self._initialization_cancelled:
+                        raise _InitializationCancelledError()
                 if self._write_enabled and _HAS_HERMES_CRON:
                     self._register_sleep_cron()
                 set_plugin_context(
@@ -549,21 +577,45 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         "sleep_cycles": self._config.sleep_cycles,
                     },
                 )
-            except Exception as _exc:
-                capture_exception(
-                    _exc,
-                    operation="cashew.initialize",
-                    session_id=session_id,
-                )
-                logger.warning(
-                    "cashew initialize failed at %s; provider will report unavailable until fixed",
-                    resolve_config_path(self._hermes_home),
-                    exc_info=True,
-                )
+                with self._lifecycle_lock:
+                    if self._initialization_cancelled:
+                        raise _InitializationCancelledError()
+                    # Start only after the complete runtime snapshot is ready.
+                    self._start_sync_worker()
+        except _InitializationCancelledError:
+            with self._sync_state_lock:
                 self._config = None
                 self._db_path = None
                 self._retriever = None
-                self._sync_worker = None
+                self._model_fn = None
+                self._sync_queue = None
+                self._shutdown_started.clear()
+        except Exception as _exc:
+            capture_exception(
+                _exc,
+                operation="cashew.initialize",
+                session_id=session_id,
+            )
+            config_path = (
+                resolve_config_path(self._hermes_home)
+                if self._hermes_home is not None
+                else "<unknown>"
+            )
+            logger.warning(
+                "cashew initialize failed at %s; provider will report unavailable until fixed",
+                config_path,
+                exc_info=True,
+            )
+            self._config = None
+            self._db_path = None
+            self._retriever = None
+            self._sync_worker = None
+            self._sync_queue = None
+            self._shutdown_started.clear()
+        finally:
+            with self._lifecycle_lock:
+                self._initializing = False
+                self._initialization_cancelled = False
 
     def _start_sync_worker(self) -> None:
         """Launch the daemon worker. Called from initialize() only on happy path.
@@ -706,6 +758,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         if (
             not self._write_enabled
             or self._config is None
+            or self._initializing
             or not self._config.auto_extraction
         ):
             return
@@ -717,7 +770,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             if assistant_content:
                 self._last_assistant = assistant_content
             q = self._sync_queue
-            turn = (user_content, assistant_content, session_id)
+            effective_session = str(session_id or self._session_id)
+            turn = (user_content, assistant_content, effective_session)
             try:
                 q.put_nowait(turn)
             except queue.Full:
@@ -765,7 +819,12 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         assert q is not None  # invariant: worker only starts when queue exists
         _BATCH_SIZE = 8
         while True:
-            item = q.get()
+            try:
+                item = q.get(timeout=0.05)
+            except queue.Empty:
+                if self._shutdown_started.is_set():
+                    return
+                continue
             if item is _SHUTDOWN:
                 q.task_done()
                 return
@@ -1286,7 +1345,13 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         Silent-degrades to "" when no LLM is wired, insufficient exchanges,
         or any failure (never raises).
         """
-        if not self._write_enabled or self._model_fn is None or self._db_path is None:
+        if (
+            not self._write_enabled
+            or self._model_fn is None
+            or self._db_path is None
+            or self._initializing
+            or self._shutdown_started.is_set()
+        ):
             return ""
 
         import json as _json
@@ -1456,6 +1521,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         """Rebind session identity and discard ephemeral context from the old session."""
         del parent_session_id, reset, rewound, kwargs
         with self._sync_state_lock:
+            if self._initializing or self._shutdown_started.is_set():
+                return
             self._session_id = str(new_session_id)
             self._prefetch_generation += 1
             self._warm_cache.clear()
@@ -1478,33 +1545,58 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         _hermes_home is intentionally NOT reset — is_available() must keep
         reflecting on-disk reality.
         """
-        if self._sync_queue is None:
-            return  # safe no-op: initialize() was never called
+        # Serialize the ownership decision only. The bounded joins happen
+        # outside both locks so sync_turn remains a non-blocking hot path.
+        with self._lifecycle_lock:
+            if self._initializing:
+                if self._sync_worker is None:
+                    # Do not tear down fields while initialize() is still
+                    # constructing them. The initializer will observe this
+                    # flag at its publication handoff and discard its partial
+                    # state.
+                    self._initialization_cancelled = True
+                    self._shutdown_started.set()
+                    return
+                # A worker has already been published. Continue with normal
+                # shutdown; initialize() retains ownership until its trace
+                # context exits and its unconditional finalizer runs.
+            with self._sync_state_lock:
+                if self._sync_queue is None or self._shutdown_started.is_set():
+                    return  # safe no-op or shutdown already in progress
+                timeout = (
+                    self._config.sync_queue_timeout
+                    if self._config is not None
+                    else 30.0
+                )
+                deadline = time.monotonic() + max(0.0, timeout)
+                self._shutdown_started.set()
+                self._prefetch_generation += 1
+                self._prefetch_pending = None
+                q = self._sync_queue
+                assert q is not None
+                prefetch_threads = tuple(self._prefetch_threads)
         _METRICS.emit()
-        timeout = self._config.sync_queue_timeout if self._config is not None else 30.0
-        # Atomically stop new producers and capture the queue. Release the lock
-        # before the potentially blocking sentinel fallback: producers will see
-        # _shutdown_started and return without waiting on a full queue.
-        with self._sync_state_lock:
-            self._shutdown_started.set()
-            self._prefetch_generation += 1
-            self._prefetch_pending = None
-            q = self._sync_queue
-            assert q is not None
-            prefetch_threads = tuple(self._prefetch_threads)
         # Items already in the queue remain ahead of the sentinel and receive a
         # bounded opportunity to persist before the worker exits.
         try:
             q.put_nowait(_SHUTDOWN)
         except queue.Full:
             try:
-                q.put(_SHUTDOWN, block=True, timeout=1.0)
+                q.put(
+                    _SHUTDOWN,
+                    block=True,
+                    # Keep the historical one-second sentinel wait cap while
+                    # still charging it against the single shutdown deadline.
+                    timeout=min(1.0, max(0.0, deadline - time.monotonic())),
+                )
             except queue.Full:
                 logger.warning(
                     "cashew shutdown: could not post sentinel; worker may leak"
                 )
-        # One shared deadline bounds all joins. Never raise.
-        deadline = time.monotonic() + timeout
+        # The signal and all joins share the deadline captured before
+        # shutdown admission. A wedged/full queue must not get a fresh join
+        # budget after the sentinel fallback has consumed the timeout.
+        # Never raise.
         worker = self._sync_worker
         if worker is not None:
             worker.join(timeout=max(0.0, deadline - time.monotonic()))
@@ -1574,6 +1666,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._prefetch_pending = None
             self._prefetch_threads.clear()
             self._last_assistant = ""
+            self._shutdown_started.clear()
         logger.debug("cashew provider shutdown complete")
 
     def _parallel_retrieve(
@@ -1649,7 +1742,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         - Empty result is valid (returns `""` without logging).
         - Failure path: `except Exception` logs ONE WARNING and returns `""`.
         """
-        if self._config is None:
+        if (
+            self._config is None
+            or self._initializing
+            or self._shutdown_started.is_set()
+        ):
             return ""
         requested_session = str(kwargs.get("session_id") or self._session_id)
         self._warm_cache.update(self._consume_prefetch_pending(requested_session))
@@ -1751,7 +1848,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         - Never raises into Hermes (caught in background thread).
         """
         with self._sync_state_lock:
-            if self._config is None or self._shutdown_started.is_set():
+            if (
+                self._config is None
+                or self._initializing
+                or self._shutdown_started.is_set()
+            ):
                 return
             effective_session = str(session_id or self._session_id)
             self._prefetch_generation += 1
@@ -1981,7 +2082,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             JSON string — NEVER None, NEVER raises into Hermes.
         """
         if name == "cashew_query":
-            if self._config is None:
+            if (
+                self._config is None
+                or self._initializing
+                or self._shutdown_started.is_set()
+            ):
                 return build_error_envelope(
                     query=args.get("query"),
                     error_message="cashew recall failed",
@@ -2056,7 +2161,13 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         elif name == "cashew_extract":
             # Half-state guard. No log — initialize() already warned when it
             # set _db_path / _config to None.
-            if not self._write_enabled or self._db_path is None or self._config is None:
+            if (
+                not self._write_enabled
+                or self._db_path is None
+                or self._config is None
+                or self._initializing
+                or self._shutdown_started.is_set()
+            ):
                 return build_extract_error_envelope()
             try:
                 user = args["user_content"]  # KeyError caught below — tool-call failure
@@ -2110,7 +2221,12 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         When unavailable or empty: clearly signals the LLM should not expect recall.
         Never raises. Returns a plain str, not a dict or JSON.
         """
-        if self._config is None or self._hermes_home is None:
+        if (
+            self._config is None
+            or self._hermes_home is None
+            or self._initializing
+            or self._shutdown_started.is_set()
+        ):
             return "[cashew] memory provider: not configured\n"
 
         try:

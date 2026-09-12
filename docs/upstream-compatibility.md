@@ -184,3 +184,25 @@ This document does not claim that a local source build, a static import, or a
 passing component test proves production compatibility. A future baseline must
 record the exact dependency artifact, Hermes revision, CI result, and boundary
 test at the same head.
+
+## Deterministic consolidation measurements
+
+Issue [#205](https://github.com/magnus919/hermes-cashew/issues/205) has an
+opt-in benchmark for comparing the current local sleep adapter with a future
+upstream replacement. It creates a temporary SQLite database, seeds
+deterministic vectors and orphan rows, delays a fake embedding client, and
+records per-phase wall time, selected work, edge rows committed, orphan rows
+repaired, a competing SQLite commit, and whether a participating shared-lock
+writer was admitted during the maintenance lease:
+
+```bash
+python3 scripts/benchmark-sleep-contention.py --nodes 32 128 --orphans 4 --delay-ms 50
+```
+
+The default orthogonal fixture isolates phase cost. To exercise the edge cap,
+use `--pair-similarity 0.8 --max-edges 1`; the current pinned local adapter is
+expected to report `bounded_integrity: false` because its known pending batch
+is not flushed when the cap is reached. That is measurement evidence for
+[#193](https://github.com/magnus919/hermes-cashew/issues/193), not a production
+claim. The harness never opens `~/.hermes` and does not alter the production
+sleep implementation.

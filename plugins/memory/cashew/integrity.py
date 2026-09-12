@@ -10,6 +10,8 @@ contract; it never mutates a profile as a side effect of inspection.
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import hashlib
 import json
 import logging
 import math
@@ -19,6 +21,7 @@ import shutil
 import sqlite3
 import struct
 import tempfile
+import time
 from collections import Counter
 from contextlib import contextmanager
 from typing import Any, Iterable, Iterator, cast
@@ -54,6 +57,47 @@ _REQUIRED_NODE_COLUMNS = {
 _REQUIRED_EMBEDDING_COLUMNS = {"node_id", "vector", "model", "updated_at"}
 _REQUIRED_EDGE_COLUMNS = {"parent_id", "child_id", "weight", "reasoning", "timestamp"}
 _REQUIRED_META = {"embedding_model", "embedding_dim", "vec_dim", "maintenance_epoch"}
+_AUDIT_DEADLINE_SECONDS = 5.0
+_MAX_AUDIT_ROWS = 100_000
+_MAX_AUDIT_BYTES = 64 * 1024 * 1024
+_MAX_VECTOR_BYTES = 4 * 1024 * 1024
+_AUDIT_BATCH_SIZE = 256
+
+
+@dataclasses.dataclass
+class _AuditBudget:
+    """Small, explicit work budget shared by every potentially large scan."""
+
+    deadline: float
+    rows: int = 0
+    bytes: int = 0
+    incomplete_reasons: set[str] = dataclasses.field(default_factory=set)
+
+    @property
+    def incomplete(self) -> bool:
+        return bool(self.incomplete_reasons)
+
+    def check(self) -> bool:
+        if time.monotonic() >= self.deadline:
+            self.incomplete_reasons.add("audit_deadline")
+            return False
+        return True
+
+    def consume(self, byte_count: int = 0) -> bool:
+        if not self.check():
+            return False
+        if self.rows >= _MAX_AUDIT_ROWS:
+            self.incomplete_reasons.add("audit_row_cap")
+            return False
+        if byte_count < 0 or self.bytes + byte_count > _MAX_AUDIT_BYTES:
+            self.incomplete_reasons.add("audit_byte_cap")
+            return False
+        self.rows += 1
+        self.bytes += byte_count
+        return True
+
+    def progress(self) -> int:
+        return 1 if time.monotonic() >= self.deadline else 0
 
 
 def _tables(conn: sqlite3.Connection) -> set[str]:
@@ -139,6 +183,32 @@ def _provenance(conn: sqlite3.Connection, journal_mode: str) -> dict[str, Any]:
     return result
 
 
+def _fingerprint(value: object) -> str | None:
+    if value is None:
+        return None
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+
+
+def _safe_provenance(provenance: dict[str, Any]) -> dict[str, Any]:
+    """Project internal identity values into a payload-safe public report."""
+    model = provenance.pop("provider_model", None)
+    epoch = provenance.pop("provider_epoch", None)
+    source_id = provenance.pop("sqlite_source_id", None)
+    provenance["provider_model_fingerprint"] = _fingerprint(model)
+    provenance["provider_epoch_present"] = epoch is not None
+    provenance["provider_epoch_valid"] = _positive_int(epoch) is not None
+    provenance["sqlite_source_id_fingerprint"] = _fingerprint(source_id)
+    return provenance
+
+
+def _positive_int(value: object) -> int | None:
+    try:
+        parsed = int(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
 def _add_reason(reasons: Counter[str], reason: str, count: int = 1) -> None:
     if reason and count > 0:
         reasons[reason] += count
@@ -194,6 +264,7 @@ def _inspect_vec(
     ordinary_ids: set[str],
     expected_dim: int | None,
     reasons: Counter[str],
+    budget: _AuditBudget,
 ) -> dict[str, Any]:
     vec = conn.execute(
         "SELECT name, sql FROM sqlite_master WHERE type='table' AND name='vec_embeddings'"
@@ -206,6 +277,7 @@ def _inspect_vec(
             "missing_entries": len(ordinary_ids),
             "stale_entries": 0,
             "declared_dimension": None,
+            "scan_complete": True,
         }
     if not _load_vec_readonly(conn):
         _add_reason(reasons, "vec_index_unverifiable")
@@ -215,6 +287,7 @@ def _inspect_vec(
             "missing_entries": None,
             "stale_entries": None,
             "declared_dimension": None,
+            "scan_complete": False,
         }
     sql = str(vec[1] or "")
     match = re.search(r"(?:float|int8)\s*\[\s*(\d+)\s*\]", sql, re.IGNORECASE)
@@ -224,10 +297,23 @@ def _inspect_vec(
     elif expected_dim is not None and declared_dim != expected_dim:
         _add_reason(reasons, "vec_dimension_mismatch")
     try:
-        rows = conn.execute(
-            "SELECT node_id, LENGTH(embedding) FROM vec_embeddings"
-        ).fetchall()
-    except sqlite3.Error:
+        rows: list[tuple[object, object]] = []
+        cursor = conn.execute(
+            "SELECT node_id, LENGTH(embedding) FROM vec_embeddings "
+            f"LIMIT {_MAX_AUDIT_ROWS + 1}"
+        )
+        while budget.check():
+            batch = cursor.fetchmany(_AUDIT_BATCH_SIZE)
+            if not batch:
+                break
+            for row in batch:
+                length = 0 if row[1] is None else int(row[1])
+                if not budget.consume(length):
+                    break
+                rows.append((row[0], row[1]))
+            if budget.incomplete:
+                break
+    except (sqlite3.Error, TypeError, ValueError):
         _add_reason(reasons, "vec_index_unverifiable")
         return {
             "available": False,
@@ -235,19 +321,20 @@ def _inspect_vec(
             "missing_entries": None,
             "stale_entries": None,
             "declared_dimension": declared_dim,
+            "scan_complete": False,
         }
     vec_ids = {str(row[0]) for row in rows if row[0] is not None}
     missing = ordinary_ids - vec_ids
     stale = vec_ids - ordinary_ids
     _add_reason(reasons, "vec_entry_missing", len(missing))
     _add_reason(reasons, "vec_entry_stale", len(stale))
-    invalid_lengths = sum(
-        1
-        for _, length in rows
-        if length is None
-        or expected_dim is not None
-        and int(length) != expected_dim * 4
-    )
+    invalid_lengths = 0
+    for vec_row in rows:
+        vec_length = vec_row[1]
+        if vec_length is None or (
+            expected_dim is not None and int(str(vec_length)) != expected_dim * 4
+        ):
+            invalid_lengths += 1
     _add_reason(reasons, "vec_blob_dimension_mismatch", invalid_lengths)
     return {
         "available": True,
@@ -255,11 +342,16 @@ def _inspect_vec(
         "missing_entries": len(missing),
         "stale_entries": len(stale),
         "declared_dimension": declared_dim,
+        "scan_complete": not budget.incomplete,
     }
 
 
-def _graph_findings(conn: sqlite3.Connection, reasons: Counter[str]) -> dict[str, int]:
+def _graph_findings(
+    conn: sqlite3.Connection, reasons: Counter[str], budget: _AuditBudget
+) -> dict[str, int]:
     """Report referential graph defects without invoking upstream mutators."""
+    if not budget.check():
+        return {"orphan_edges": 0, "self_edges": 0}
     try:
         orphan_edges = int(
             conn.execute(
@@ -282,7 +374,9 @@ def _graph_findings(conn: sqlite3.Connection, reasons: Counter[str]) -> dict[str
     return {"orphan_edges": orphan_edges, "self_edges": self_edges}
 
 
-def _inspect_profile(conn: sqlite3.Connection, journal_mode: str) -> dict[str, Any]:
+def _inspect_profile(  # noqa: C901
+    conn: sqlite3.Connection, journal_mode: str, budget: _AuditBudget
+) -> dict[str, Any]:
     reasons: Counter[str] = Counter()
     provenance = _provenance(conn, journal_mode)
     tables = _tables(conn)
@@ -326,7 +420,7 @@ def _inspect_profile(conn: sqlite3.Connection, journal_mode: str) -> dict[str, A
         "declared_dimension": None,
     }
     graph_report = {"orphan_edges": 0, "self_edges": 0}
-    if not missing_tables and not missing_columns:
+    if not missing_tables and not missing_columns and budget.check():
         try:
             integrity = str(
                 conn.execute("PRAGMA integrity_check").fetchone()[0]
@@ -338,30 +432,55 @@ def _inspect_profile(conn: sqlite3.Connection, journal_mode: str) -> dict[str, A
 
         expected_dim = provenance["provider_embedding_dim"]
         expected_model = provenance["provider_model"]
-        rows = conn.execute(
-            "SELECT e.node_id, e.vector, e.model FROM embeddings e"
-        ).fetchall()
-        ordinary_ids = {str(row[0]) for row in rows if row[0] is not None}
-        counts["embeddings"] = len(rows)
-        for node_id, blob, model in rows:
-            reason, _ = _finite_vector(blob, expected_dim)
-            _add_reason(reasons, reason or "", 1)
-            if expected_model is None or model != expected_model:
-                _add_reason(reasons, "embedding_model_mismatch")
-            if node_id is None:
-                _add_reason(reasons, "embedding_node_id_invalid")
-        counts["orphan_embeddings"] = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM embeddings e "
-                "LEFT JOIN thought_nodes n ON n.id=e.node_id WHERE n.id IS NULL"
-            ).fetchone()[0]
+        ordinary_ids: set[str] = set()
+        counts["embeddings"] = 0
+        cursor = conn.execute(
+            "SELECT e.node_id, e.vector, e.model FROM embeddings e "
+            f"LIMIT {_MAX_AUDIT_ROWS + 1}"
         )
-        counts["nodes_without_embeddings"] = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM thought_nodes n "
-                "LEFT JOIN embeddings e ON e.node_id=n.id WHERE e.node_id IS NULL"
-            ).fetchone()[0]
-        )
+        while budget.check():
+            batch = cursor.fetchmany(_AUDIT_BATCH_SIZE)
+            if not batch:
+                break
+            for node_id, blob, model in batch:
+                byte_count = (
+                    len(blob) if isinstance(blob, (bytes, bytearray, memoryview)) else 0
+                )
+                if byte_count > _MAX_VECTOR_BYTES:
+                    budget.incomplete_reasons.add("audit_byte_cap")
+                    break
+                if not budget.consume(byte_count):
+                    break
+                counts["embeddings"] += 1
+                if node_id is not None:
+                    ordinary_ids.add(str(node_id))
+                reason, _ = _finite_vector(blob, expected_dim)
+                _add_reason(reasons, reason or "", 1)
+                if expected_model is None or model != expected_model:
+                    _add_reason(reasons, "embedding_model_mismatch")
+                if node_id is None:
+                    _add_reason(reasons, "embedding_node_id_invalid")
+            if budget.incomplete:
+                break
+        if budget.incomplete:
+            for incomplete_reason in budget.incomplete_reasons:
+                _add_reason(reasons, incomplete_reason)
+        if budget.check():
+            counts["orphan_embeddings"] = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM embeddings e "
+                    "LEFT JOIN thought_nodes n ON n.id=e.node_id WHERE n.id IS NULL"
+                ).fetchone()[0]
+            )
+            counts["nodes_without_embeddings"] = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM thought_nodes n "
+                    "LEFT JOIN embeddings e ON e.node_id=n.id WHERE e.node_id IS NULL"
+                ).fetchone()[0]
+            )
+        else:
+            counts["orphan_embeddings"] = 0
+            counts["nodes_without_embeddings"] = 0
         _add_reason(reasons, "orphan_embedding", counts["orphan_embeddings"])
         _add_reason(
             reasons, "node_embedding_missing", counts["nodes_without_embeddings"]
@@ -384,9 +503,12 @@ def _inspect_profile(conn: sqlite3.Connection, journal_mode: str) -> dict[str, A
             counts["permanent_core_nodes"] = 0
             _add_reason(reasons, "permanence_unverifiable")
         _add_reason(reasons, "permanent_and_decayed", counts["permanent_and_decayed"])
-        _add_reason(reasons, "permanent_core_node", counts["permanent_core_nodes"])
-        vec_report = _inspect_vec(conn, ordinary_ids, expected_dim, reasons)
-        graph_report = _graph_findings(conn, reasons)
+        # A permanent core_memory node is expected state.  Contradictory
+        # permanent+decayed state is still reported above.
+        if budget.check():
+            vec_report = _inspect_vec(conn, ordinary_ids, expected_dim, reasons, budget)
+        if budget.check():
+            graph_report = _graph_findings(conn, reasons, budget)
     else:
         counts["embeddings"] = 0
         counts["orphan_embeddings"] = 0
@@ -394,8 +516,10 @@ def _inspect_profile(conn: sqlite3.Connection, journal_mode: str) -> dict[str, A
 
     # Historical merge intent cannot be reconstructed from the current schema.
     uncertainty = ["historical_consolidation"]
+    for incomplete_reason in budget.incomplete_reasons:
+        _add_reason(reasons, incomplete_reason)
     return {
-        "provenance": provenance,
+        "provenance": _safe_provenance(provenance),
         "schema": {
             "tables": sorted(tables),
             "missing_tables": missing_tables,
@@ -407,6 +531,15 @@ def _inspect_profile(conn: sqlite3.Connection, journal_mode: str) -> dict[str, A
         "graph": graph_report,
         "uncertainty": uncertainty,
         "reasons": dict(sorted(reasons.items())),
+        "informational": {
+            "permanent_core_nodes": counts.get("permanent_core_nodes", 0)
+        },
+        "limits": {
+            "rows_scanned": budget.rows,
+            "bytes_scanned": budget.bytes,
+            "row_cap": _MAX_AUDIT_ROWS,
+            "byte_cap": _MAX_AUDIT_BYTES,
+        },
     }
 
 
@@ -416,7 +549,7 @@ def _unavailable(path: pathlib.Path, reason: str) -> dict[str, Any]:
         "status": "unavailable",
         "read_only": True,
         "mutated": False,
-        "path": str(path),
+        "profile_fingerprint": _fingerprint(path),
         "provenance": {},
         "counts": {},
         "vector_index": {},
@@ -430,11 +563,13 @@ def _unavailable(path: pathlib.Path, reason: str) -> dict[str, Any]:
     }
 
 
-def audit_integrity(db_path: str | pathlib.Path) -> dict[str, Any]:
+def audit_integrity(
+    db_path: str | pathlib.Path, *, deadline_seconds: float = _AUDIT_DEADLINE_SECONDS
+) -> dict[str, Any]:
     """Return a bounded, query-only integrity report for an existing profile."""
     path = pathlib.Path(db_path).resolve(strict=False)
     try:
-        with admit_operation(graph_path=path, deadline=5.0):
+        with admit_operation(graph_path=path, deadline=deadline_seconds):
             try:
                 with _source_snapshot(path) as snapshot:
                     try:
@@ -443,24 +578,34 @@ def audit_integrity(db_path: str | pathlib.Path) -> dict[str, Any]:
                         del exc
                         return _unavailable(path, "readonly_open_failed")
                     try:
+                        budget = _AuditBudget(
+                            deadline=time.monotonic() + max(0.0, deadline_seconds)
+                        )
+                        conn.set_progress_handler(budget.progress, 1000)
                         profile_error: str | None = None
                         try:
                             verify_readonly_profile(conn)
                         except Exception as exc:
-                            profile_error = type(exc).__name__
-                        report = _inspect_profile(conn, journal_mode)
+                            del exc
+                            profile_error = "profile_verification_failed"
+                            if not budget.check():
+                                profile_error = "audit_deadline"
+                        report = _inspect_profile(conn, journal_mode, budget)
                         if profile_error is not None:
                             reasons = cast(dict[str, Any], report["reasons"])
-                            reasons["profile_verification_failed"] = 1
+                            reasons[profile_error] = 1
                             report["reasons"] = dict(reasons)
                     except Exception as exc:
                         logger.warning(
-                            "Cashew integrity audit could not inspect profile",
-                            exc_info=True,
+                            "Cashew integrity audit could not inspect profile"
                         )
                         del exc
                         return _unavailable(path, "audit_failed")
                     finally:
+                        try:
+                            conn.set_progress_handler(None, 0)
+                        except Exception:
+                            pass
                         conn.close()
             except Exception as exc:
                 del exc
@@ -470,10 +615,19 @@ def audit_integrity(db_path: str | pathlib.Path) -> dict[str, Any]:
         return _unavailable(path, "readonly_admission_failed")
 
     report["schema_version"] = 1
-    report["status"] = "ok" if not report["reasons"] else "findings"
+    incomplete_reasons = {
+        reason
+        for reason in report.get("reasons", {})
+        if str(reason).startswith("audit_")
+    }
+    report["status"] = (
+        "audit_incomplete"
+        if incomplete_reasons
+        else ("ok" if not report["reasons"] else "findings")
+    )
     report["read_only"] = True
     report["mutated"] = False
-    report["path"] = str(path)
+    report["profile_fingerprint"] = _fingerprint(path)
     report["repair"] = {
         "status": "unavailable",
         "reason": "stable_targeted_repair_api_unavailable",
@@ -533,7 +687,11 @@ def _main(argv: Iterable[str] | None = None) -> int:
         else audit_integrity(args.db_path)
     )
     print(json.dumps(report, sort_keys=True, indent=2))
-    return 0 if report.get("status") in {"ok", "findings", "unavailable"} else 1
+    return (
+        0
+        if report.get("status") in {"ok", "findings", "audit_incomplete", "unavailable"}
+        else 1
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

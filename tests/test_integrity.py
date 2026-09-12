@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import struct
 from pathlib import Path
 
+import pytest
+
+import plugins.memory.cashew.integrity as integrity
 from plugins.memory.cashew.integrity import (
     apply_integrity_repairs,
     audit_integrity,
@@ -78,6 +82,12 @@ def test_audit_reports_findings_and_preserves_profile_files(tmp_path: Path) -> N
         "INSERT INTO embeddings VALUES (?, ?, ?, '2026-09-12')",
         ("orphan", struct.pack("<4f", 0.0, 0.0, 0.0, 0.0), "wrong-model"),
     )
+    conn.execute(
+        "INSERT INTO derivation_edges VALUES ('valid', 'valid', 1.0, 'self', 'now')"
+    )
+    conn.execute(
+        "INSERT INTO derivation_edges VALUES ('absent', 'valid', 1.0, 'orphan', 'now')"
+    )
     conn.commit()
     before = _snapshot(path)
 
@@ -86,7 +96,9 @@ def test_audit_reports_findings_and_preserves_profile_files(tmp_path: Path) -> N
     assert report["read_only"] is True
     assert report["mutated"] is False
     assert report["status"] == "findings"
-    assert report["provenance"]["provider_model"] == "model-a"
+    assert report["provenance"]["provider_model_fingerprint"]
+    assert "model-a" not in json.dumps(report)
+    assert report["provenance"]["provider_epoch_present"] is True
     assert report["provenance"]["provider_embedding_dim"] == 4
     assert report["counts"]["orphan_embeddings"] == 1
     assert report["counts"]["nodes_without_embeddings"] == 2
@@ -94,7 +106,119 @@ def test_audit_reports_findings_and_preserves_profile_files(tmp_path: Path) -> N
     assert report["reasons"]["embedding_model_mismatch"] == 1
     assert report["reasons"]["permanent_and_decayed"] == 1
     assert report["reasons"]["vec_index_missing"] == 2
+    assert report["reasons"]["orphan_edge"] == 1
+    assert report["reasons"]["self_edge"] == 1
     assert report["uncertainty"] == ["historical_consolidation"]
+    assert _snapshot(path) == before
+
+
+def test_audit_privacy_canary_is_absent_from_report_and_logs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "SECRET-CANARY-profile.db"
+    _create_profile(path)
+    monkeypatch.setattr(
+        integrity,
+        "_inspect_profile",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("SECRET-CANARY-model")),
+    )
+    report = audit_integrity(path)
+    assert "SECRET-CANARY" not in json.dumps(report, sort_keys=True)
+    assert "SECRET-CANARY" not in caplog.text
+
+
+def test_audit_reports_fixed_row_and_byte_budgets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "budget.db"
+    _create_profile(path)
+    conn = sqlite3.connect(path)
+    for index in range(3):
+        _add_node(conn, f"node-{index}")
+        conn.execute(
+            "INSERT INTO embeddings VALUES (?, ?, ?, '2026-09-12')",
+            (f"node-{index}", struct.pack("<4f", 1.0, 0.0, 0.0, 0.0), "model-a"),
+        )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(integrity, "_MAX_AUDIT_ROWS", 1)
+    report = audit_integrity(path)
+    assert report["status"] == "audit_incomplete"
+    assert report["reasons"]["audit_row_cap"] >= 1
+    assert report["limits"]["rows_scanned"] == 1
+
+
+def test_audit_reports_aggregate_byte_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "byte-budget.db"
+    _create_profile(path)
+    conn = sqlite3.connect(path)
+    _add_node(conn, "node")
+    conn.execute(
+        "INSERT INTO embeddings VALUES (?, ?, ?, '2026-09-12')",
+        ("node", struct.pack("<4f", 1.0, 0.0, 0.0, 0.0), "model-a"),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(integrity, "_MAX_AUDIT_BYTES", 8)
+    report = audit_integrity(path)
+    assert report["status"] == "audit_incomplete"
+    assert report["reasons"]["audit_byte_cap"] >= 1
+    assert report["limits"]["bytes_scanned"] == 0
+
+
+def test_audit_deadline_is_explicitly_incomplete(tmp_path: Path) -> None:
+    path = tmp_path / "deadline.db"
+    _create_profile(path)
+    report = audit_integrity(path, deadline_seconds=0)
+    assert report["status"] == "audit_incomplete"
+    assert report["reasons"]["audit_deadline"] >= 1
+
+
+def test_audit_loaded_vec_parity_is_read_only(tmp_path: Path) -> None:
+    path = tmp_path / "vec.db"
+    _create_profile(path)
+    conn = sqlite3.connect(path)
+    conn.enable_load_extension(True)
+    import sqlite_vec
+
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+    conn.execute(
+        "CREATE VIRTUAL TABLE vec_embeddings USING vec0(node_id TEXT PRIMARY KEY, embedding float[4])"
+    )
+    _add_node(conn, "vec-node")
+    blob = struct.pack("<4f", 1.0, 0.0, 0.0, 0.0)
+    conn.execute(
+        "INSERT INTO embeddings VALUES (?, ?, ?, '2026-09-12')",
+        ("vec-node", blob, "model-a"),
+    )
+    conn.execute("INSERT INTO vec_embeddings VALUES (?, ?)", ("vec-node", blob))
+    conn.commit()
+    conn.close()
+    before = _snapshot(path)
+    report = audit_integrity(path)
+    assert report["vector_index"]["available"] is True
+    assert report["vector_index"]["entries"] == 1
+    assert "vec_entry_missing" not in report["reasons"]
+    assert _snapshot(path) == before
+
+
+def test_audit_vec_unavailable_fallback_preserves_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "vec-unavailable.db"
+    _create_profile(path)
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE vec_embeddings (node_id TEXT, embedding BLOB)")
+    conn.commit()
+    conn.close()
+    before = _snapshot(path)
+    monkeypatch.setattr(integrity, "_load_vec_readonly", lambda conn: False)
+    report = audit_integrity(path)
+    assert report["vector_index"]["available"] is False
+    assert report["reasons"]["vec_index_unverifiable"] == 1
     assert _snapshot(path) == before
 
 

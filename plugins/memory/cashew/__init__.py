@@ -2,7 +2,9 @@
 # Source: Pattern mirrored from plugins/memory/hindsight/__init__.py (NousResearch/hermes-agent@main)
 from __future__ import annotations
 
-import fcntl
+import copy
+import dataclasses
+import json
 import logging
 import os
 import pathlib
@@ -20,6 +22,11 @@ from .embedding import (
     normalize_embedding_device,
 )
 from .error_tracking import capture_exception, set_plugin_context
+from .locking import (
+    MaintenanceLockAcquisitionError,
+    lock_path_for_db,
+    try_maintenance_lock,
+)
 from .log_filter import add_scrub_filter
 from .metrics import _METRICS
 from .tracing import trace_operation
@@ -83,6 +90,34 @@ Compared with `is` (identity), never `==`. Never None — None collides with
 legitimate test-code payloads and with Python 3.13's queue.Queue.shutdown()
 signal path.
 """
+
+
+@dataclasses.dataclass(frozen=True)
+class _PrefetchRequestIdentity:
+    """The retrieval inputs a warm result must match before it can be reused."""
+
+    generation: int
+    session_id: str
+    db_path: str
+    config_fingerprint: str
+    recall_limit: int
+    domain: str | None
+    tag: str | None
+    exclude_tags: tuple[str, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class _PrefetchResult:
+    """An ephemeral warmup result with the request context that produced it."""
+
+    identity: _PrefetchRequestIdentity
+    cues: tuple[str, ...]
+    nodes: tuple[dict[str, Any], ...]
+
+
+class _InitializationCancelledError(RuntimeError):
+    """Private control flow for shutdown cancelling a slow initialize()."""
+
 
 # Probe for the Hermes cron module. In a full Hermes Agent environment the
 # cron.jobs package is importable (the agent root is on sys.path). In CI and
@@ -395,6 +430,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         # Unknown future contexts fail closed.
         self._write_enabled: bool = True
         self._sync_worker: "threading.Thread | None" = None
+        # Serializes initialization ownership decisions. The lock is held only
+        # while claiming/releasing a generation; sync_turn never waits on it.
+        self._lifecycle_lock = threading.Lock()
+        self._initializing = False
+        self._initialization_cancelled = False
         # Serializes producer admission with sentinel insertion so no turn can
         # race behind the shutdown sentinel and remain unprocessed.
         self._sync_state_lock = threading.Lock()
@@ -405,15 +445,15 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         # Incremented inside sync_turn's overflow branch each time a queued
         # turn is evicted to make room for a new one.
         self._model_fn: Callable[[str], str] | None = None
-        # Prefetch warm cache: cue → formatted context string.
+        # Prefetch warm cache: cue → structured result with its request identity.
         # Populated by queue_prefetch(), consumed by prefetch(), cleared in
         # shutdown(). Ephemeral per-turn state — never persisted.
-        self._warm_cache: dict[str, str] = {}
+        self._warm_cache: dict[str, _PrefetchResult] = {}
         # Staging slot for background prefetch results. The queue_prefetch
         # background thread writes here; prefetch() atomically swaps it into
         # _warm_cache at the start of its call. This avoids concurrent access
         # between the daemon thread and the main agent loop.
-        self._prefetch_pending: tuple[int, str, list[str], str] | None = None
+        self._prefetch_pending: _PrefetchResult | None = None
         self._prefetch_generation: int = 0
         # Background warmups accepted by queue_prefetch(). Shutdown joins
         # these before clearing DB/config state so a worker cannot observe a
@@ -486,20 +526,34 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 "Hermes Agent passes it as a keyword. Got: "
                 + repr(sorted(kwargs.keys()))
             )
-        self._session_id = session_id
-        self._hermes_home = pathlib.Path(kwargs["hermes_home"])
-        self._write_enabled = kwargs.get("agent_context", "primary") == "primary"
-        # Queue is created here so config-driven sizing/timeout values are wired in.
-        # The daemon worker thread drains it and receives a bounded flush during
-        # provider shutdown.
-        self._sync_queue = queue.Queue(maxsize=16)
-        # Reset lifecycle flags — a provider instance may be initialized again
-        # after a prior shutdown.
-        self._shutdown_started.clear()
-        self._shutdown_flag.clear()
-        with trace_operation("cashew.initialize") as span:
-            span.set_attribute("session_id", session_id)
-            try:
+        with self._lifecycle_lock:
+            if self._initializing:
+                logger.warning(
+                    "cashew initialize deferred: another initialization is in progress"
+                )
+                return
+            with self._sync_state_lock:
+                if self._sync_queue is not None or self._shutdown_started.is_set():
+                    logger.warning(
+                        "cashew initialize deferred: previous worker generation still owns runtime state"
+                    )
+                    return
+                self._initializing = True
+                self._initialization_cancelled = False
+        try:
+            self._session_id = session_id
+            self._hermes_home = pathlib.Path(kwargs["hermes_home"])
+            self._write_enabled = kwargs.get("agent_context", "primary") == "primary"
+            # Queue is created here so config-driven sizing/timeout values are wired in.
+            # The daemon worker drains it and receives a bounded flush during
+            # provider shutdown.
+            self._sync_queue = queue.Queue(maxsize=16)
+            # Reset lifecycle flags — a provider instance may be initialized again
+            # after a prior shutdown.
+            self._shutdown_started.clear()
+            self._shutdown_flag.clear()
+            with trace_operation("cashew.initialize") as span:
+                span.set_attribute("session_id", session_id)
                 self._config = load_config(self._hermes_home)
                 # Configure upstream model and device before any embedding work.
                 # The singleton is reset so the next use observes both values.
@@ -523,19 +577,21 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         "cashew-brain dependency missing"
                     )
                 self._db_path.parent.mkdir(parents=True, exist_ok=True)
-                # Self-healing — clean up stale state from prior crashes.
-                self._heal_stale_lock()
                 self._ensure_db_schema(self._db_path)
                 self._repair_embedding_dimension(self._db_path)
                 self._retriever = ContextRetriever(db_path=str(self._db_path))
                 self._model_fn = self._build_model_fn()
-                # Start the sync worker AFTER all worker-read state
-                # is populated (db_path, session_id, sync_queue).
-                self._start_sync_worker()
-                # Register the sleep cycle cron job if configured.
-                # Runs AFTER the sync worker so the provider is fully initialized
-                # before any background work begins. Silently skips when the
-                # Hermes cron module is not available (e.g. CI, standalone tests).
+                # Finish all synchronous setup before publishing the worker.
+                # Shutdown can cancel a slow initialize while this work runs;
+                # the final lifecycle-locked handoff below is the only place
+                # where a worker may become visible.
+                # Reject cancellation before cron registration when possible.
+                # A shutdown racing after this check can still leave an
+                # already-started external registration; the final publication
+                # check below prevents that generation from starting a worker.
+                with self._lifecycle_lock:
+                    if self._initialization_cancelled:
+                        raise _InitializationCancelledError()
                 if self._write_enabled and _HAS_HERMES_CRON:
                     self._register_sleep_cron()
                 set_plugin_context(
@@ -549,21 +605,45 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         "sleep_cycles": self._config.sleep_cycles,
                     },
                 )
-            except Exception as _exc:
-                capture_exception(
-                    _exc,
-                    operation="cashew.initialize",
-                    session_id=session_id,
-                )
-                logger.warning(
-                    "cashew initialize failed at %s; provider will report unavailable until fixed",
-                    resolve_config_path(self._hermes_home),
-                    exc_info=True,
-                )
+                with self._lifecycle_lock:
+                    if self._initialization_cancelled:
+                        raise _InitializationCancelledError()
+                    # Start only after the complete runtime snapshot is ready.
+                    self._start_sync_worker()
+        except _InitializationCancelledError:
+            with self._sync_state_lock:
                 self._config = None
                 self._db_path = None
                 self._retriever = None
-                self._sync_worker = None
+                self._model_fn = None
+                self._sync_queue = None
+                self._shutdown_started.clear()
+        except Exception as _exc:
+            capture_exception(
+                _exc,
+                operation="cashew.initialize",
+                session_id=session_id,
+            )
+            config_path = (
+                resolve_config_path(self._hermes_home)
+                if self._hermes_home is not None
+                else "<unknown>"
+            )
+            logger.warning(
+                "cashew initialize failed at %s; provider will report unavailable until fixed",
+                config_path,
+                exc_info=True,
+            )
+            self._config = None
+            self._db_path = None
+            self._retriever = None
+            self._sync_worker = None
+            self._sync_queue = None
+            self._shutdown_started.clear()
+        finally:
+            with self._lifecycle_lock:
+                self._initializing = False
+                self._initialization_cancelled = False
 
     def _start_sync_worker(self) -> None:
         """Launch the daemon worker. Called from initialize() only on happy path.
@@ -602,6 +682,41 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             script_source = (
                 pathlib.Path(__file__).parent / "sleep_cron_script.py"
             ).read_text()
+            implementation = pathlib.Path(__file__).parent.resolve()
+            flat_anchor = self._hermes_home / "plugins" / "cashew"
+            dev_anchor = (
+                self._hermes_home / "hermes-agent" / "plugins" / "memory" / "cashew"
+            )
+            if (
+                flat_anchor / "plugins" / "memory" / "cashew"
+            ).resolve() == implementation:
+                marker = {
+                    "kind": "flat",
+                    "anchor": "plugins/cashew",
+                    "implementation": str(implementation),
+                }
+            elif dev_anchor.resolve() == implementation:
+                marker = {
+                    "kind": "development",
+                    "anchor": "hermes-agent/plugins/memory/cashew",
+                    "implementation": str(implementation),
+                }
+            else:
+                raise RuntimeError(
+                    "Cashew must be installed at the selected HERMES_HOME flat or "
+                    "development anchor before its cron job can be registered"
+                )
+            marker_sentinel = "_INSTALLATION_MARKER = None"
+            if script_source.count(marker_sentinel) != 1:
+                raise RuntimeError(
+                    "Cashew cron script template is invalid; reinstall or "
+                    "reinitialize Cashew before registering its cron job"
+                )
+            script_source = script_source.replace(
+                marker_sentinel,
+                f"_INSTALLATION_MARKER = {marker!r}",
+                1,
+            )
             script_dest = self._hermes_home / "scripts" / "cashew-sleep-cycle.py"
             script_dest.parent.mkdir(parents=True, exist_ok=True)
             if not script_dest.exists() or script_dest.read_text() != script_source:
@@ -703,21 +818,24 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         Half-state (_sync_queue is None) is a silent no-op.
         """
-        if (
-            not self._write_enabled
-            or self._config is None
-            or not self._config.auto_extraction
-        ):
-            return
         with self._sync_state_lock:
-            if self._shutdown_started.is_set() or self._sync_queue is None:
+            config = self._config
+            if (
+                not self._write_enabled
+                or config is None
+                or self._initializing
+                or self._shutdown_started.is_set()
+                or not config.auto_extraction
+                or self._sync_queue is None
+            ):
                 return
             # Buffer assistant content for queue_prefetch cue extraction only
             # after the turn has been admitted.
             if assistant_content:
                 self._last_assistant = assistant_content
             q = self._sync_queue
-            turn = (user_content, assistant_content, session_id)
+            effective_session = str(session_id or self._session_id)
+            turn = (user_content, assistant_content, effective_session)
             try:
                 q.put_nowait(turn)
             except queue.Full:
@@ -765,7 +883,12 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         assert q is not None  # invariant: worker only starts when queue exists
         _BATCH_SIZE = 8
         while True:
-            item = q.get()
+            try:
+                item = q.get(timeout=0.05)
+            except queue.Empty:
+                if self._shutdown_started.is_set():
+                    return
+                continue
             if item is _SHUTDOWN:
                 q.task_done()
                 return
@@ -803,36 +926,6 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 finally:
                     q.task_done()
                     _METRICS.set_queue_depth(q.qsize())
-
-    def _heal_stale_lock(self) -> None:
-        """Remove stale sleep-cycle lock files left by prior crashes.
-
-        The sleep cycle creates ``brain.db.sleep.lock`` while running. If the
-        process is killed (SIGKILL, power loss, OOM) before the lock is
-        released, the file persists and blocks future sleep cycles.
-
-        Rule: any lock file older than 60 minutes is considered stale and
-        removed silently.  Newer locks are left alone (the sleep cycle may
-        still be running in another process).
-        """
-        import time
-
-        stale_threshold = 3600  # 60 minutes in seconds
-        if self._db_path is None:
-            return
-        lock_path = self._db_path.parent / "brain.db.sleep.lock"
-        if lock_path.exists():
-            age = time.time() - lock_path.stat().st_mtime
-            if age > stale_threshold:
-                lock_path.unlink(missing_ok=True)
-                logger.info(
-                    "cashew self-heal: removed stale sleep lock (age=%.0fs)", age
-                )
-            elif age > 0:
-                logger.debug(
-                    "cashew self-heal: sleep lock is fresh (age=%.0fs) — leaving in place",
-                    age,
-                )
 
     def _ensure_db_schema(self, db_path: pathlib.Path) -> None:
         """Create or migrate Cashew schema tables.
@@ -918,26 +1011,48 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         worker or exposes a retriever. cashew-brain owns the destructive
         re-embedding operation; this adapter adds detection, a mandatory
         profile-scoped backup, postcondition validation, and rollback. It uses
-        the same advisory lock as the sleep cycle so separate Hermes processes
-        cannot mutate the graph during migration.
+        the same advisory lock as the synchronous sleep cycle so participating
+        maintenance operations do not overlap. Broader writer coordination is
+        deliberately outside this helper's scope.
         """
-        lock_path = pathlib.Path(f"{db_path}.sleep.lock")
-        lock_fd = lock_path.open("a+")
+        lock_path = lock_path_for_db(db_path)
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            lock_fd.close()
+            with try_maintenance_lock(db_path) as lock_fd:
+                if lock_fd is None:
+                    logger.warning(
+                        "embedding dimension migration deferred; another Cashew process holds %s",
+                        lock_path,
+                    )
+                    return
+                self._repair_embedding_dimension_locked(db_path)
+        except MaintenanceLockAcquisitionError:
+            if self._embedding_migration_required(db_path):
+                raise
             logger.warning(
-                "embedding dimension migration deferred; another Cashew process "
-                "holds %s",
+                "embedding dimension migration not needed; unable to acquire %s",
                 lock_path,
+                exc_info=True,
             )
-            return
+
+    def _embedding_migration_required(self, db_path: pathlib.Path) -> bool:
+        """Fail closed unless a read-only inspection proves migration is unnecessary."""
+        if self._config is None:
+            return True
         try:
-            self._repair_embedding_dimension_locked(db_path)
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            lock_fd.close()
+            from core.embedding_service import resolve_embedding_dim
+
+            expected_dim = resolve_embedding_dim(self._config.embedding_model)
+            stored_dims, vec_dim = self._embedding_dimensions(db_path)
+        except Exception:
+            logger.warning(
+                "could not inspect embedding dimensions after lock acquisition failure",
+                exc_info=True,
+            )
+            return True
+
+        stored_mismatch = bool(stored_dims) and stored_dims != {expected_dim}
+        vec_mismatch = vec_dim is not None and vec_dim != expected_dim
+        return stored_mismatch or vec_mismatch
 
     def _repair_embedding_dimension_locked(self, db_path: pathlib.Path) -> None:
         """Repair dimensions while the cross-process Cashew lock is held."""
@@ -1132,13 +1247,18 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 lines.append(content)
         return "\n".join(lines)
 
-    def _update_access_metrics(self, node_ids: list[str]) -> None:
+    def _update_access_metrics(
+        self, node_ids: list[str], db_path: pathlib.Path | str | None = None
+    ) -> None:
         if not self._write_enabled or not node_ids:
+            return
+        target_db = db_path if db_path is not None else self._db_path
+        if target_db is None:
             return
         try:
             import sqlite3
 
-            conn = sqlite3.connect(str(self._db_path))
+            conn = sqlite3.connect(str(target_db))
             try:
                 placeholders = ",".join("?" * len(node_ids))
                 conn.execute(
@@ -1286,7 +1406,13 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         Silent-degrades to "" when no LLM is wired, insufficient exchanges,
         or any failure (never raises).
         """
-        if not self._write_enabled or self._model_fn is None or self._db_path is None:
+        if (
+            not self._write_enabled
+            or self._model_fn is None
+            or self._db_path is None
+            or self._initializing
+            or self._shutdown_started.is_set()
+        ):
             return ""
 
         import json as _json
@@ -1456,6 +1582,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         """Rebind session identity and discard ephemeral context from the old session."""
         del parent_session_id, reset, rewound, kwargs
         with self._sync_state_lock:
+            if self._initializing or self._shutdown_started.is_set():
+                return
             self._session_id = str(new_session_id)
             self._prefetch_generation += 1
             self._warm_cache.clear()
@@ -1478,33 +1606,58 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         _hermes_home is intentionally NOT reset — is_available() must keep
         reflecting on-disk reality.
         """
-        if self._sync_queue is None:
-            return  # safe no-op: initialize() was never called
+        # Serialize the ownership decision only. The bounded joins happen
+        # outside both locks so sync_turn remains a non-blocking hot path.
+        with self._lifecycle_lock:
+            if self._initializing:
+                if self._sync_worker is None:
+                    # Do not tear down fields while initialize() is still
+                    # constructing them. The initializer will observe this
+                    # flag at its publication handoff and discard its partial
+                    # state.
+                    self._initialization_cancelled = True
+                    self._shutdown_started.set()
+                    return
+                # A worker has already been published. Continue with normal
+                # shutdown; initialize() retains ownership until its trace
+                # context exits and its unconditional finalizer runs.
+            with self._sync_state_lock:
+                if self._sync_queue is None or self._shutdown_started.is_set():
+                    return  # safe no-op or shutdown already in progress
+                timeout = (
+                    self._config.sync_queue_timeout
+                    if self._config is not None
+                    else 30.0
+                )
+                deadline = time.monotonic() + max(0.0, timeout)
+                self._shutdown_started.set()
+                self._prefetch_generation += 1
+                self._prefetch_pending = None
+                q = self._sync_queue
+                assert q is not None
+                prefetch_threads = tuple(self._prefetch_threads)
         _METRICS.emit()
-        timeout = self._config.sync_queue_timeout if self._config is not None else 30.0
-        # Atomically stop new producers and capture the queue. Release the lock
-        # before the potentially blocking sentinel fallback: producers will see
-        # _shutdown_started and return without waiting on a full queue.
-        with self._sync_state_lock:
-            self._shutdown_started.set()
-            self._prefetch_generation += 1
-            self._prefetch_pending = None
-            q = self._sync_queue
-            assert q is not None
-            prefetch_threads = tuple(self._prefetch_threads)
         # Items already in the queue remain ahead of the sentinel and receive a
         # bounded opportunity to persist before the worker exits.
         try:
             q.put_nowait(_SHUTDOWN)
         except queue.Full:
             try:
-                q.put(_SHUTDOWN, block=True, timeout=1.0)
+                q.put(
+                    _SHUTDOWN,
+                    block=True,
+                    # Keep the historical one-second sentinel wait cap while
+                    # still charging it against the single shutdown deadline.
+                    timeout=min(1.0, max(0.0, deadline - time.monotonic())),
+                )
             except queue.Full:
                 logger.warning(
                     "cashew shutdown: could not post sentinel; worker may leak"
                 )
-        # One shared deadline bounds all joins. Never raise.
-        deadline = time.monotonic() + timeout
+        # The signal and all joins share the deadline captured before
+        # shutdown admission. A wedged/full queue must not get a fresh join
+        # budget after the sentinel fallback has consumed the timeout.
+        # Never raise.
         worker = self._sync_worker
         if worker is not None:
             worker.join(timeout=max(0.0, deadline - time.monotonic()))
@@ -1574,6 +1727,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._prefetch_pending = None
             self._prefetch_threads.clear()
             self._last_assistant = ""
+            self._shutdown_started.clear()
         logger.debug("cashew provider shutdown complete")
 
     def _parallel_retrieve(
@@ -1583,15 +1737,20 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         domain: str | None,
         tag: str | None,
         exclude_tags: list[str] | None,
+        db_path: pathlib.Path | str | None = None,
     ) -> list[dict] | None:
         """Parallel retrieval: run upstream + keyword search concurrently."""
         from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        target_db = db_path if db_path is not None else self._db_path
+        if target_db is None:
+            return None
 
         def _upstream() -> list[dict] | None:
             from core.retrieval import retrieve_recursive_bfs
 
             results = retrieve_recursive_bfs(
-                db_path=str(self._db_path),
+                db_path=str(target_db),
                 query=query,
                 top_k=max_nodes,
                 domain=domain,
@@ -1600,12 +1759,14 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             )
             if results:
                 node_ids = [r.node_id for r in results]
-                self._update_access_metrics(node_ids)
-                return self._enrich_results(node_ids)
+                self._update_access_metrics(node_ids, db_path=target_db)
+                return self._enrich_results(node_ids, db_path=str(target_db))
             return None
 
         def _keyword() -> list[dict] | None:
-            return self._keyword_search(query, max_nodes, domain, tag, exclude_tags)
+            return self._keyword_search(
+                query, max_nodes, domain, tag, exclude_tags, db_path=target_db
+            )
 
         with ThreadPoolExecutor(max_workers=2) as _pool:
             futures = [
@@ -1629,35 +1790,44 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         exclude_tags: list[str] | None = None,
         **kwargs: Any,
     ) -> str:
-        """Return recalled-context string from Cashew (RECALL-01).
-
-        Checks the warm cache (populated by queue_prefetch) first. On a cache
-        hit, returns the cached context immediately without hitting storage.
-        On a cache miss, delegates to upstream cashew-brain's
-        retrieve_recursive_bfs for full three-tier retrieval.
-
-        Delegates to upstream cashew-brain's retrieve_recursive_bfs which handles
-        the full three-tier retrieval (sqlite-vec semantic search → graph BFS →
-        keyword fallback) with hybrid scoring. Hermes-specific fields (permanent
-        flag, tags) are enriched from the DB before formatting.
-
-        Falls back to SQL LIKE keyword search when upstream retrieval fails
-        (e.g. sqlite-vec or sentence-transformers unavailable in test environment).
-
-        Contract:
-        - Half-state guard: if `_config is None`, return `""` without logging.
-        - Empty result is valid (returns `""` without logging).
-        - Failure path: `except Exception` logs ONE WARNING and returns `""`.
-        """
-        if self._config is None:
-            return ""
-        requested_session = str(kwargs.get("session_id") or self._session_id)
-        self._warm_cache.update(self._consume_prefetch_pending(requested_session))
-        # Warm cache fast path: check if a cached cue matches the query.
-        if self._warm_cache:
+        """Return recalled-context string from Cashew (RECALL-01)."""
+        with self._sync_state_lock:
+            config = self._config
+            db_path = self._db_path
+            if (
+                config is None
+                or db_path is None
+                or self._initializing
+                or self._shutdown_started.is_set()
+            ):
+                return ""
+            requested_session = str(kwargs.get("session_id") or self._session_id)
+            identity = self._prefetch_request_identity(
+                session_id=requested_session,
+                generation=self._prefetch_generation,
+                domain=domain,
+                tag=tag,
+                exclude_tags=exclude_tags,
+            )
+            max_nodes = config.recall_k
+            parallel_retrieval = is_feature_enabled(
+                config, "experimental_parallel_retrieval"
+            )
+            # Consume the pending result and snapshot the warm cache while
+            # the same runtime identity is admitted. Releasing the lock
+            # between these steps could let a reinitialized profile publish a
+            # same-session cache that belongs to a newer generation.
+            pending = self._consume_prefetch_pending_locked(identity)
+            self._warm_cache.update(pending)
+            warm_cache = tuple(self._warm_cache.items())
+            # Consume the snapshot before doing any potentially slow retrieval.
+            # Shutdown may clear the live cache while this call continues.
+            self._warm_cache.clear()
+        # A blank query is never allowed to match every cached cue.
+        if query.strip() and warm_cache:
             query_lower = query.lower()
-            for cue, ctx in self._warm_cache.items():
-                if not cue:
+            for cue, warm_result in warm_cache:
+                if not cue or warm_result.identity != identity:
                     continue
                 cue_lower = cue.lower()
                 if cue_lower in query_lower or query_lower in cue_lower:
@@ -1666,8 +1836,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         len(cue),
                         len(query),
                     )
-                    self._warm_cache.clear()
-                    return ctx
+                    return self._format_context(
+                        copy.deepcopy(list(warm_result.nodes[: identity.recall_limit]))
+                    )
                 cue_words = set(w for w in cue_lower.split() if len(w) > 3)
                 query_words = set(w for w in query_lower.split() if len(w) > 3)
                 if len(cue_words & query_words) >= 2:
@@ -1676,24 +1847,25 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         len(cue),
                         len(query),
                     )
-                    self._warm_cache.clear()
-                    return ctx
-            # No match — clear stale cache and fall through to cold retrieval.
+                    return self._format_context(
+                        copy.deepcopy(list(warm_result.nodes[: identity.recall_limit]))
+                    )
             logger.info(
                 "prefetch warm cache MISS (%d cue(s) in cache) — falling through to cold retrieval",
-                len(self._warm_cache),
+                len(warm_cache),
             )
-            self._warm_cache.clear()
-        max_nodes = self._config.recall_k
         with trace_operation(
             "cashew.prefetch",
             {"query.length": len(query)},
         ) as _span:
-            if self._config is not None and is_feature_enabled(
-                self._config, "experimental_parallel_retrieval"
-            ):
+            if parallel_retrieval:
                 nodes = self._parallel_retrieve(
-                    query, max_nodes, domain, tag, exclude_tags
+                    query,
+                    max_nodes,
+                    domain,
+                    tag,
+                    exclude_tags,
+                    db_path=db_path,
                 )
                 if nodes:
                     return self._format_context(nodes)
@@ -1703,7 +1875,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 from core.retrieval import retrieve_recursive_bfs
 
                 results = retrieve_recursive_bfs(
-                    db_path=str(self._db_path),
+                    db_path=str(db_path),
                     query=query,
                     top_k=max_nodes,
                     domain=domain,
@@ -1712,8 +1884,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 )
                 if results:
                     node_ids = [r.node_id for r in results]
-                    self._update_access_metrics(node_ids)
-                    nodes = self._enrich_results(node_ids)
+                    self._update_access_metrics(node_ids, db_path=db_path)
+                    nodes = self._enrich_results(node_ids, db_path=str(db_path))
                     return self._format_context(nodes)
             except Exception:
                 logger.debug(
@@ -1721,10 +1893,17 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 )
             try:
                 nodes = self._keyword_search(
-                    query, max_nodes, domain, tag, exclude_tags
+                    query,
+                    max_nodes,
+                    domain,
+                    tag,
+                    exclude_tags,
+                    db_path=db_path,
                 )
                 if nodes:
-                    self._update_access_metrics([n["id"] for n in nodes])
+                    self._update_access_metrics(
+                        [n["id"] for n in nodes], db_path=db_path
+                    )
                     return self._format_context(nodes)
             except Exception:
                 logger.warning(
@@ -1751,7 +1930,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         - Never raises into Hermes (caught in background thread).
         """
         with self._sync_state_lock:
-            if self._config is None or self._shutdown_started.is_set():
+            if (
+                self._config is None
+                or self._initializing
+                or self._shutdown_started.is_set()
+            ):
                 return
             effective_session = str(session_id or self._session_id)
             self._prefetch_generation += 1
@@ -1760,6 +1943,13 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             db_path = str(self._db_path)
             top_k = self._config.prefetch_k
             use_llm = self._model_fn is not None and self._config.prefetch_cues > 0
+            identity = self._prefetch_request_identity(
+                session_id=effective_session,
+                generation=generation,
+                domain=None,
+                tag=None,
+                exclude_tags=None,
+            )
         if not query:
             logger.debug("queue_prefetch: empty query, no warmup")
             return
@@ -1806,10 +1996,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                                 all_nodes.append(n)
 
                 if all_nodes:
-                    ctx = self._format_context(all_nodes)
-                    self._stage_prefetch_result(
-                        generation, effective_session, cues, ctx
-                    )
+                    self._stage_prefetch_result(identity, cues, all_nodes)
                     logger.info(
                         "queue_prefetch: cached %d result(s) from %d cue(s) for next turn",
                         len(all_nodes),
@@ -1839,29 +2026,76 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 logger.debug("queue_prefetch: failed to start warmup", exc_info=True)
 
     def _stage_prefetch_result(
-        self, generation: int, session_id: str, cues: list[str], context: str
+        self,
+        identity: _PrefetchRequestIdentity,
+        cues: list[str],
+        nodes: list[dict],
     ) -> None:
         """Publish a warmup result only if its request is still current."""
         with self._sync_state_lock:
-            if (
-                generation != self._prefetch_generation
-                or session_id != self._session_id
-            ):
+            current_identity = self._prefetch_request_identity(
+                session_id=self._session_id,
+                generation=self._prefetch_generation,
+                domain=identity.domain,
+                tag=identity.tag,
+                exclude_tags=list(identity.exclude_tags),
+            )
+            if identity != current_identity:
                 return
-            self._prefetch_pending = (generation, session_id, list(cues), context)
+            self._prefetch_pending = _PrefetchResult(
+                identity=identity,
+                cues=tuple(cue for cue in cues if cue.strip()),
+                nodes=tuple(copy.deepcopy(nodes)),
+            )
 
-    def _consume_prefetch_pending(self, session_id: str) -> dict[str, str]:
+    def _consume_prefetch_pending(
+        self, identity: _PrefetchRequestIdentity
+    ) -> dict[str, _PrefetchResult]:
         """Atomically consume a current result, retaining its source cues."""
         with self._sync_state_lock:
-            pending = self._prefetch_pending
-            self._prefetch_pending = None
-            current_generation = self._prefetch_generation
-        if pending is None:
+            return self._consume_prefetch_pending_locked(identity)
+
+    def _consume_prefetch_pending_locked(
+        self, identity: _PrefetchRequestIdentity
+    ) -> dict[str, _PrefetchResult]:
+        """Consume a pending result while ``_sync_state_lock`` is held."""
+        pending = self._prefetch_pending
+        self._prefetch_pending = None
+        if pending is None or pending.identity != identity:
             return {}
-        generation, result_session, cues, context = pending
-        if generation != current_generation or result_session != session_id:
-            return {}
-        return {cue: context for cue in cues}
+        return {cue: pending for cue in pending.cues}
+
+    def _prefetch_request_identity(
+        self,
+        *,
+        session_id: str,
+        generation: int,
+        domain: str | None,
+        tag: str | None,
+        exclude_tags: list[str] | None,
+    ) -> _PrefetchRequestIdentity:
+        """Snapshot every retrieval input that makes a warm result reusable."""
+        config = self._config
+        assert config is not None
+        config_values = (
+            dataclasses.asdict(config)
+            if dataclasses.is_dataclass(config)
+            else repr(config)
+        )
+        return _PrefetchRequestIdentity(
+            generation=generation,
+            session_id=session_id,
+            db_path=str(self._db_path),
+            config_fingerprint=json.dumps(
+                config_values, sort_keys=True, separators=(",", ":"), default=repr
+            ),
+            recall_limit=config.recall_k,
+            domain=domain or None,
+            tag=tag or None,
+            exclude_tags=tuple(
+                sorted({value for value in exclude_tags or [] if value})
+            ),
+        )
 
     def _extract_prefetch_cues(self, query: str) -> list[str]:
         """Use the auxiliary LLM to extract concrete search cues from the turn.
@@ -1904,10 +2138,14 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         domain: str | None = None,
         tag: str | None = None,
         exclude_tags: list[str] | None = None,
+        db_path: pathlib.Path | str | None = None,
     ) -> list[dict]:
         import sqlite3
 
-        conn = sqlite3.connect(str(self._db_path))
+        target_db = db_path if db_path is not None else self._db_path
+        if target_db is None:
+            return []
+        conn = sqlite3.connect(str(target_db))
         try:
             where_clauses: list[str] = ["(decayed IS NULL OR decayed = 0)"]
             params: list = []
@@ -1981,7 +2219,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             JSON string — NEVER None, NEVER raises into Hermes.
         """
         if name == "cashew_query":
-            if self._config is None:
+            if (
+                self._config is None
+                or self._initializing
+                or self._shutdown_started.is_set()
+            ):
                 return build_error_envelope(
                     query=args.get("query"),
                     error_message="cashew recall failed",
@@ -2056,7 +2298,13 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         elif name == "cashew_extract":
             # Half-state guard. No log — initialize() already warned when it
             # set _db_path / _config to None.
-            if not self._write_enabled or self._db_path is None or self._config is None:
+            if (
+                not self._write_enabled
+                or self._db_path is None
+                or self._config is None
+                or self._initializing
+                or self._shutdown_started.is_set()
+            ):
                 return build_extract_error_envelope()
             try:
                 user = args["user_content"]  # KeyError caught below — tool-call failure
@@ -2110,7 +2358,12 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         When unavailable or empty: clearly signals the LLM should not expect recall.
         Never raises. Returns a plain str, not a dict or JSON.
         """
-        if self._config is None or self._hermes_home is None:
+        if (
+            self._config is None
+            or self._hermes_home is None
+            or self._initializing
+            or self._shutdown_started.is_set()
+        ):
             return "[cashew] memory provider: not configured\n"
 
         try:

@@ -105,6 +105,13 @@ EOF
 | `think_cycles` | `true` | Enable periodic insight generation (think cycle) |
 | `think_interval` | `10` | Turns between think cycle runs (0 = disable) |
 
+Cashew validates the effective JSON and `CASHEW_*` configuration before use.
+`recall_k` and `prefetch_k` allow 1–20; `prefetch_cues` allows 0–20;
+`think_interval` allows 0–10,000; `sleep_max_nodes` allows 1–2,000; and
+`sync_queue_timeout` must be finite and between 0 and 300 seconds. Invalid
+JSON or values are left in place so they can be corrected instead of being
+silently overwritten. These numeric ceilings are a new validation policy.
+
 `embedding_device` defaults to `cpu` because native MPS failures can terminate
 the Python process before the plugin can recover. Set it to `auto` to restore
 SentenceTransformer's automatic hardware selection, or to an explicit device
@@ -271,6 +278,13 @@ it is a ``no_agent`` script, meaning zero LLM overhead per tick. The script
 reads ``cashew.json`` at runtime to discover its database path and
 ``sleep_max_nodes`` setting.
 
+The generated script is pinned to the Cashew installation that registered the
+job. This keeps one Hermes profile from loading another profile's provider.
+After moving, reinstalling, or changing the plugin layout, reinitialize
+Cashew to refresh the script and cron registration. Development installs may
+use the documented ``$HERMES_HOME/hermes-agent/plugins/memory/cashew`` symlink
+to an external checkout.
+
 ### What happens during a cron tick
 
 1. Reads ``cashew.json`` to get ``cashew_db_path`` and ``sleep_max_nodes``
@@ -285,6 +299,22 @@ reads ``cashew.json`` at runtime to discover its database path and
 **No LLM-powered dream generation** occurs in cron mode — the script passes
 ``model_fn=None``. Cross-linking, dedup, and GC are the 80% benefit without
 the API key dependency in a subprocess.
+
+### Maintenance lock scope
+
+Embedding-dimension migration and the synchronous portion of a sleep cycle use
+the same nonblocking advisory lock derived from the configured
+``cashew_db_path``. A contended migration defers and a contended cycle skips;
+the lock file is retained because a process exit releases its ``flock``
+descriptor automatically. Do not delete an old lock file to recover a cycle:
+unlinking it can let a second pathname refer to a different inode while the
+original process still holds the lock.
+
+When an API caller enables ``background_dream=True``, the returned cycle
+summary records ``dream_pending`` and the daemon uses its own connection; it is
+not guarded by the synchronous maintenance lock. This advisory lock is not a complete
+shared-brain writer-coordination policy; broader coordination is tracked in
+[#191](https://github.com/magnus919/hermes-cashew/issues/191).
 
 ### Config reference
 

@@ -120,7 +120,10 @@ class _AuditBudget:
         return True
 
     def progress(self) -> int:
-        return 1 if time.monotonic() >= self.deadline else 0
+        if time.monotonic() >= self.deadline:
+            self.incomplete_reasons.add("audit_deadline")
+            return 1
+        return 0
 
 
 def _table_exists(
@@ -738,9 +741,11 @@ def _unavailable(path: pathlib.Path, reason: str) -> dict[str, Any]:
         "mutated": False,
         "profile_fingerprint": _fingerprint(path),
         "provenance": {},
+        "schema": {},
         "counts": {},
         "vector_index": {},
         "graph": {},
+        "completeness": {},
         "uncertainty": [],
         "reasons": {reason: 1},
         "repair": {
@@ -761,9 +766,11 @@ def _incomplete(
         "mutated": False,
         "profile_fingerprint": _fingerprint(path),
         "provenance": {},
+        "schema": {},
         "counts": {},
         "vector_index": {},
         "graph": {},
+        "completeness": {},
         "uncertainty": [],
         "reasons": {item: 1 for item in sorted(budget.incomplete_reasons)},
         "limits": {
@@ -808,9 +815,8 @@ def audit_integrity(
                             return _incomplete(path, budget, exc.reason)
                         except Exception as exc:
                             del exc
-                            profile_error = "profile_verification_failed"
                             if budget.incomplete_reasons:
-                                profile_error = next(
+                                reason = next(
                                     (
                                         reason
                                         for reason in (
@@ -822,6 +828,8 @@ def audit_integrity(
                                     ),
                                     sorted(budget.incomplete_reasons)[0],
                                 )
+                                return _incomplete(path, budget, reason)
+                            profile_error = "profile_verification_failed"
                         report = _inspect_profile(conn, journal_mode, budget)
                         if profile_error is not None:
                             reasons = cast(dict[str, Any], report["reasons"])

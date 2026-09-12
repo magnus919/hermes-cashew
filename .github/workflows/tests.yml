@@ -25,7 +25,13 @@ jobs:
         # pyproject.toml declares Python 3.10 as the floor. Exercise that floor
         # and the current locked CI runtime; intermediate minors are covered by
         # normal dependency resolution but are not a release support promise.
-        python: ["3.10.19", "3.12.11"]
+        include:
+          # setup-python bootstraps a compatible minor on Ubuntu 20.04; uv then
+          # installs the exact locked patch release used for tests.
+          - setup: "3.10"
+            python: "3.10.19"
+          - setup: "3.12"
+            python: "3.12.11"
     env:
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
@@ -35,7 +41,7 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          python-version: ${{ matrix.python }}
+          python-version: ${{ matrix.setup }}
 
       - name: Install
         env:

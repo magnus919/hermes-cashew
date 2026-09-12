@@ -98,7 +98,7 @@ def test_ci_and_contributor_docs_use_frozen_uv_lock() -> None:
         assert "uv pip install --system" not in workflow
         assert "scripts/verify-cashew-baseline.py" in workflow
         assert 'python-version: "3.11"' not in workflow
-    assert "python-version: ${{ matrix.python }}" in tests_workflow
+    assert "python-version: ${{ matrix.setup }}" in tests_workflow
     assert 'python-version: "3.12"' in release_workflow
     assert "uv sync --frozen --extra dev" in readme
     assert "uv sync --frozen --extra dev" in contributing
@@ -170,7 +170,10 @@ def test_ci_uses_scoped_managed_python_for_sqlite_baseline() -> None:
 def test_ci_covers_declared_minimum_and_current_python() -> None:
     workflow = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
     matrix = workflow["jobs"]["test-python"]["strategy"]["matrix"]
-    assert matrix["python"] == ["3.10.19", "3.12.11"]
+    assert matrix["include"] == [
+        {"setup": "3.10", "python": "3.10.19"},
+        {"setup": "3.12", "python": "3.12.11"},
+    ]
     assert workflow["jobs"]["test-python"]["strategy"]["fail-fast"] is False
     assert (
         workflow["jobs"]["test-python"]["name"] == "Test (Python ${{ matrix.python }})"

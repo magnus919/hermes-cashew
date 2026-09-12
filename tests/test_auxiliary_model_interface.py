@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+import importlib.util
 import logging
 import sqlite3
 import sys
@@ -81,6 +82,7 @@ def fake_host(monkeypatch):
         resolved_homes=resolved_homes,
         resets=resets,
         client_holder=client_holder,
+        host_config=host_config,
     )
 
 
@@ -133,6 +135,58 @@ def test_role_changed_to_null_after_closure_never_auto_routes(fake_host, tmp_pat
     assert client.calls == []
 
 
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        {},
+        {"model": None},
+        {"provider": ""},
+        {"provider": 42},
+        {"provider": "auto", "model": None},
+        {"provider": "fake", "api_key": 1},
+    ],
+)
+def test_malformed_role_mapping_never_reaches_host_resolver(
+    fake_host, tmp_path, mapping
+):
+    fake_host.profiles[str(tmp_path)] = {"auxiliary": {"memory": mapping}}
+    fake_host.client_holder["client"] = _FakeClient(lambda _: _response("[]"))
+
+    assert resolve_model_fn(tmp_path, CashewConfig(llm_aux_role="memory")) is None
+    assert fake_host.resolved_homes == []
+
+
+def test_explicit_auto_role_is_an_allowed_host_opt_in(fake_host, tmp_path):
+    client = _FakeClient(lambda _: _response("[]"))
+    fake_host.profiles[str(tmp_path)] = {"auxiliary": {"memory": {"provider": "auto"}}}
+    fake_host.client_holder["client"] = client
+
+    model_fn = resolve_model_fn(tmp_path, CashewConfig(llm_aux_role="memory"))
+
+    assert model_fn is not None
+    assert model_fn("explicit auto") == "[]"
+    assert fake_host.resolved_homes == [str(tmp_path)]
+
+
+def test_raw_config_and_request_exceptions_do_not_log_payloads(
+    fake_host, tmp_path, caplog
+):
+    raw_secret = "profile=/private/secret api-key=do-not-log"
+    request_secret = "prompt=do-not-log-this-content api-key=also-secret"
+    client = _FakeClient(lambda _: (_ for _ in ()).throw(RuntimeError(request_secret)))
+    model_fn = _enabled_model(fake_host, tmp_path, client)
+
+    assert model_fn("do-not-log-this-content") == ""
+    fake_host.host_config.read_raw_config_readonly = lambda: (_ for _ in ()).throw(
+        RuntimeError(raw_secret)
+    )
+    assert model_fn("another private prompt") == ""
+
+    assert raw_secret not in caplog.text
+    assert request_secret not in caplog.text
+    assert "another private prompt" not in caplog.text
+
+
 def test_failed_request_resets_profile_context_and_does_not_log_prompt(
     fake_host, tmp_path, caplog
 ):
@@ -158,6 +212,58 @@ def test_closing_callable_rejects_new_calls(fake_host, tmp_path):
 
     assert model_fn("after shutdown") == ""
     assert client.calls == []
+
+
+@pytest.mark.parametrize("failure", ["constructor", "start"])
+def test_thread_admission_failure_releases_gate_and_allows_recovery(
+    fake_host, tmp_path, monkeypatch, caplog, failure
+):
+    client = _FakeClient(lambda _: _response("[]"))
+    model_fn = _enabled_model(fake_host, tmp_path, client)
+    monkeypatch.setattr(config_module._AUXILIARY_CALL_GATE, "outstanding", 0)
+    original_thread = config_module.threading.Thread
+
+    if failure == "constructor":
+        monkeypatch.setattr(
+            config_module.threading,
+            "Thread",
+            lambda **_: (_ for _ in ()).throw(RuntimeError("secret start failure")),
+        )
+    else:
+
+        class StartFails:
+            def __init__(self, **_):
+                pass
+
+            def start(self):
+                raise RuntimeError("secret start failure")
+
+        monkeypatch.setattr(config_module.threading, "Thread", StartFails)
+
+    assert model_fn("private request") == ""
+    assert config_module._AUXILIARY_CALL_GATE.outstanding == 0
+    assert "secret start failure" not in caplog.text
+
+    monkeypatch.setattr(config_module.threading, "Thread", original_thread)
+    assert model_fn("recovery") == "[]"
+    assert config_module._AUXILIARY_CALL_GATE.outstanding == 0
+
+
+def test_loader_aliases_share_the_process_wide_gate(monkeypatch):
+    alias_name = "_cashew_config_loader_alias"
+    spec = importlib.util.spec_from_file_location(alias_name, config_module.__file__)
+    assert spec is not None and spec.loader is not None
+    alias = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, alias_name, alias)
+    spec.loader.exec_module(alias)
+
+    assert alias._AUXILIARY_CALL_GATE is config_module._AUXILIARY_CALL_GATE
+    monkeypatch.setattr(config_module._AUXILIARY_CALL_GATE, "outstanding", 0)
+    for _ in range(config_module._MAX_OUTSTANDING_AUXILIARY_CALLS):
+        assert alias._claim_auxiliary_call()
+    assert not config_module._claim_auxiliary_call()
+    for _ in range(config_module._MAX_OUTSTANDING_AUXILIARY_CALLS):
+        config_module._release_auxiliary_call()
 
 
 @pytest.mark.parametrize(
@@ -199,7 +305,7 @@ def test_process_wide_gate_caps_hung_calls_across_new_closures(
     fake_host, tmp_path, monkeypatch
 ):
     monkeypatch.setattr(config_module, "_AUXILIARY_DEADLINE_SECONDS", 0.02)
-    monkeypatch.setattr(config_module, "_OUTSTANDING_AUXILIARY_CALLS", 0)
+    monkeypatch.setattr(config_module._AUXILIARY_CALL_GATE, "outstanding", 0)
     started = threading.Event()
     release = threading.Event()
     calls = 0
@@ -223,17 +329,18 @@ def test_process_wide_gate_caps_hung_calls_across_new_closures(
         assert started.wait(timeout=1)
         assert calls == config_module._MAX_OUTSTANDING_AUXILIARY_CALLS
         assert (
-            config_module._OUTSTANDING_AUXILIARY_CALLS
+            config_module._AUXILIARY_CALL_GATE.outstanding
             == config_module._MAX_OUTSTANDING_AUXILIARY_CALLS
         )
 
         release.set()
         deadline = time.monotonic() + 1
         while (
-            config_module._OUTSTANDING_AUXILIARY_CALLS and time.monotonic() < deadline
+            config_module._AUXILIARY_CALL_GATE.outstanding
+            and time.monotonic() < deadline
         ):
             time.sleep(0.01)
-        assert config_module._OUTSTANDING_AUXILIARY_CALLS == 0
+        assert config_module._AUXILIARY_CALL_GATE.outstanding == 0
 
         assert functions[0]("recovered") == "[]"
         assert calls == config_module._MAX_OUTSTANDING_AUXILIARY_CALLS + 1
@@ -241,7 +348,8 @@ def test_process_wide_gate_caps_hung_calls_across_new_closures(
         release.set()
         deadline = time.monotonic() + 1
         while (
-            config_module._OUTSTANDING_AUXILIARY_CALLS and time.monotonic() < deadline
+            config_module._AUXILIARY_CALL_GATE.outstanding
+            and time.monotonic() < deadline
         ):
             time.sleep(0.01)
 

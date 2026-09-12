@@ -522,6 +522,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     # Start only after the complete runtime snapshot is ready.
                     self._start_sync_worker()
         except _InitializationCancelledError:
+            model_fn = self._model_fn
             with self._sync_state_lock:
                 self._config = None
                 self._db_path = None
@@ -529,6 +530,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._model_fn = None
                 self._sync_queue = None
                 self._shutdown_started.clear()
+            close_model = getattr(model_fn, "_cashew_close", None)
+            if callable(close_model):
+                close_model()
         except Exception as _exc:
             capture_exception(
                 _exc,
@@ -545,12 +549,16 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 config_path,
                 exc_info=True,
             )
+            model_fn = self._model_fn
             self._config = None
             self._db_path = None
             self._retriever = None
             self._sync_worker = None
             self._sync_queue = None
             self._shutdown_started.clear()
+            close_model = getattr(model_fn, "_cashew_close", None)
+            if callable(close_model):
+                close_model()
         finally:
             with self._lifecycle_lock:
                 self._initializing = False
@@ -1554,9 +1562,6 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 assert q is not None
                 prefetch_threads = tuple(self._prefetch_threads)
                 self._prefetch_condition.notify_all()
-        close_model = getattr(model_fn, "_cashew_close", None)
-        if callable(close_model):
-            close_model()
         _METRICS.emit()
         # Items already in the queue remain ahead of the sentinel and receive a
         # bounded opportunity to persist before the worker exits.
@@ -1600,6 +1605,12 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             for t in ((worker,) if worker is not None else ()) + alive_prefetch
             if t.is_alive()
         )
+        # Accepted turns retain their LLM callable until the worker drains or
+        # its existing shutdown deadline expires. Closing earlier would turn
+        # already-admitted LLM extraction into heuristic extraction.
+        close_model = getattr(model_fn, "_cashew_close", None)
+        if callable(close_model):
+            close_model()
         if alive_workers:
             cleanup = threading.Thread(
                 target=self._clear_state_after_workers_exit,

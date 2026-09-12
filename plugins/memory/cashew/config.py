@@ -12,6 +12,7 @@ helpers; tests in tests/test_config_roundtrip.py exercise them directly.
 
 from __future__ import annotations
 
+import builtins
 import contextlib
 import dataclasses
 import errno
@@ -34,8 +35,26 @@ _AUXILIARY_MAX_TOKENS = 1_024
 _AUXILIARY_DEADLINE_SECONDS = 30.0
 _MAX_OUTSTANDING_AUXILIARY_CALLS = 4
 
-_AUXILIARY_CALL_LOCK = threading.Lock()
-_OUTSTANDING_AUXILIARY_CALLS = 0
+
+@dataclasses.dataclass
+class _AuxiliaryCallGate:
+    """Shared admission state for every loader alias in this interpreter."""
+
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    outstanding: int = 0
+
+
+# Flat and bundled Hermes loaders can import this source under different package
+# names. Keep the process-wide budget on builtins so those aliases cannot each
+# admit their own set of late backend threads.
+_AUXILIARY_GATE_KEY = "_hermes_cashew_auxiliary_call_gate_v1"
+_AUXILIARY_CALL_GATE = getattr(builtins, _AUXILIARY_GATE_KEY, None)
+if not (
+    hasattr(_AUXILIARY_CALL_GATE, "lock")
+    and hasattr(_AUXILIARY_CALL_GATE, "outstanding")
+):
+    _AUXILIARY_CALL_GATE = _AuxiliaryCallGate()
+    setattr(builtins, _AUXILIARY_GATE_KEY, _AUXILIARY_CALL_GATE)
 
 _CONFIG_SAVE_LOCK = threading.RLock()
 """Serialize in-process config writes before taking the profile lock."""
@@ -559,10 +578,8 @@ def _raw_role_mapping(role: str) -> bool:
         raw = read_raw_config_readonly()
     except Exception:
         logger.debug(
-            "llm_aux_role=%r: unable to read the active Hermes profile; "
-            "using heuristic extraction",
-            role,
-            exc_info=True,
+            "Cashew auxiliary role check could not read the active Hermes profile; "
+            "using heuristic extraction"
         )
         return False
     if not isinstance(raw, dict):
@@ -570,7 +587,29 @@ def _raw_role_mapping(role: str) -> bool:
     auxiliary = raw.get("auxiliary")
     if not isinstance(auxiliary, dict):
         return False
-    return isinstance(auxiliary.get(role), dict)
+    mapping = auxiliary.get(role)
+    if not isinstance(mapping, dict):
+        return False
+    # A mapping with no explicit provider is an implicit host ``auto`` route.
+    # Cashew permits ``provider: auto`` as an intentional opt-in, but rejects
+    # missing/empty selectors and malformed scalar route fields before Hermes
+    # has any opportunity to auto-route them.
+    provider = mapping.get("provider")
+    if not isinstance(provider, str) or not provider.strip():
+        return False
+    for field in (
+        "model",
+        "base_url",
+        "api_key",
+        "key_env",
+        "api_key_env",
+        "api_mode",
+    ):
+        if field in mapping and (
+            not isinstance(mapping[field], str) or not mapping[field].strip()
+        ):
+            return False
+    return True
 
 
 def _trim_auxiliary_prompt(prompt: str) -> str:
@@ -585,19 +624,17 @@ def _trim_auxiliary_prompt(prompt: str) -> str:
 
 def _claim_auxiliary_call() -> bool:
     """Claim one process-wide late-call slot without queueing."""
-    global _OUTSTANDING_AUXILIARY_CALLS
-    with _AUXILIARY_CALL_LOCK:
-        if _OUTSTANDING_AUXILIARY_CALLS >= _MAX_OUTSTANDING_AUXILIARY_CALLS:
+    with _AUXILIARY_CALL_GATE.lock:
+        if _AUXILIARY_CALL_GATE.outstanding >= _MAX_OUTSTANDING_AUXILIARY_CALLS:
             return False
-        _OUTSTANDING_AUXILIARY_CALLS += 1
+        _AUXILIARY_CALL_GATE.outstanding += 1
         return True
 
 
 def _release_auxiliary_call() -> None:
     """Release one process-wide late-call slot after its backend actually exits."""
-    global _OUTSTANDING_AUXILIARY_CALLS
-    with _AUXILIARY_CALL_LOCK:
-        _OUTSTANDING_AUXILIARY_CALLS -= 1
+    with _AUXILIARY_CALL_GATE.lock:
+        _AUXILIARY_CALL_GATE.outstanding -= 1
 
 
 def _message_content(response: Any, role: str) -> str:
@@ -640,6 +677,7 @@ class _BoundedAuxiliaryModel:
         bounded_prompt = _trim_auxiliary_prompt(prompt)
         done = threading.Event()
         result: dict[str, str] = {"text": ""}
+        finished = False
         with self._lock:
             if self._closed or self._active:
                 logger.info(
@@ -653,6 +691,17 @@ class _BoundedAuxiliaryModel:
                 )
                 return ""
             self._active = True
+
+        def _finish() -> None:
+            """Release this callable and its global permit exactly once."""
+            nonlocal finished
+            with self._lock:
+                if finished:
+                    return
+                finished = True
+                self._active = False
+            _release_auxiliary_call()
+            done.set()
 
         def _run() -> None:
             try:
@@ -691,22 +740,24 @@ class _BoundedAuxiliaryModel:
                     reset_hermes_home_override(token)
             except Exception:
                 logger.warning(
-                    "llm_aux_role=%r: Hermes auxiliary request failed; "
-                    "using heuristic extraction",
-                    self.role,
-                    exc_info=True,
+                    "Cashew auxiliary request failed; using heuristic extraction"
                 )
             finally:
-                with self._lock:
-                    self._active = False
-                _release_auxiliary_call()
-                done.set()
+                _finish()
 
-        threading.Thread(
-            target=_run,
-            name="cashew-auxiliary-call",
-            daemon=True,
-        ).start()
+        try:
+            worker = threading.Thread(
+                target=_run,
+                name="cashew-auxiliary-call",
+                daemon=True,
+            )
+            worker.start()
+        except Exception:
+            _finish()
+            logger.warning(
+                "Cashew auxiliary worker could not start; using heuristic extraction"
+            )
+            return ""
         if not done.wait(_AUXILIARY_DEADLINE_SECONDS):
             logger.warning(
                 "llm_aux_role=%r: request exceeded %.0fs; future calls wait for "
@@ -752,9 +803,7 @@ def resolve_model_fn(
             reset_hermes_home_override(token)
     except Exception:
         logger.debug(
-            "llm_aux_role=%r: Hermes profile scope is unavailable; using heuristic extraction",
-            role,
-            exc_info=True,
+            "Cashew auxiliary profile scope is unavailable; using heuristic extraction"
         )
         return None
     if not enabled:

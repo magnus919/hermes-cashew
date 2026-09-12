@@ -6,7 +6,6 @@ state explicit and serializes changes that target the same Hermes profile.
 
 from __future__ import annotations
 
-import ast
 import contextlib
 import hashlib
 import json
@@ -116,48 +115,16 @@ def stage_script(destination: pathlib.Path, content: str) -> bool:
     return True
 
 
-def read_script_marker(destination: pathlib.Path) -> dict[str, Any] | None:
-    """Read the literal marker from a managed script without executing it."""
-    try:
-        tree = ast.parse(destination.read_text(encoding="utf-8"))
-    except (OSError, SyntaxError):
-        return None
-    for statement in tree.body:
-        if (
-            isinstance(statement, ast.Assign)
-            and len(statement.targets) == 1
-            and isinstance(statement.targets[0], ast.Name)
-            and statement.targets[0].id == "_INSTALLATION_MARKER"
-        ):
-            try:
-                marker = ast.literal_eval(statement.value)
-            except (ValueError, TypeError):
-                return None
-            return marker if isinstance(marker, dict) else None
-    return None
-
-
 def owns_job(job: dict[str, Any], profile_id: str) -> bool:
     """Whether scheduler metadata proves this job belongs to this profile."""
+    repeat = job.get("repeat")
+    repeats_forever = repeat is None or (
+        isinstance(repeat, dict) and repeat.get("times") is None
+    )
     return (
         job.get("name") == CRON_JOB_NAME
         and job.get("script") == CRON_SCRIPT_NAME
         and job.get("prompt") == cron_prompt(profile_id)
         and job.get("no_agent") is True
-        and job.get("repeat") is None
-    )
-
-
-def compatible_job(
-    job: dict[str, Any],
-    profile_id: str,
-    schedule: str,
-    marker: dict[str, Any],
-    script: pathlib.Path,
-) -> bool:
-    """Whether a persisted job and managed script may be adopted unchanged."""
-    return (
-        owns_job(job, profile_id)
-        and job.get("schedule") == schedule
-        and read_script_marker(script) == marker
+        and repeats_forever
     )

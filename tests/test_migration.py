@@ -9,6 +9,7 @@ import json
 import pathlib
 import sqlite3
 import types
+from contextlib import nullcontext
 
 import numpy as np
 import pytest
@@ -702,6 +703,9 @@ def test_unresolved_identity_is_keyword_only_and_recovers_after_reinitialize(
     cron_jobs.list_jobs = list_jobs
     cron_jobs.remove_job = remove_job
     cron_jobs.create_job = create_job
+    cron_jobs.parse_schedule = lambda schedule: schedule
+    cron_jobs.update_job = lambda _job_id, _updates: None
+    cron_jobs.use_cron_store = lambda _home: nullcontext()
     monkeypatch.setitem(sys.modules, "cron", cron_package)
     monkeypatch.setitem(sys.modules, "cron.jobs", cron_jobs)
     monkeypatch.setattr(cashew_module, "_HAS_HERMES_CRON", True)

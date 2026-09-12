@@ -79,7 +79,6 @@ from .config import (
 from .cron_reconcile import (
     CRON_JOB_NAME,
     CRON_SCRIPT_NAME,
-    compatible_job,
     installation_marker,
     owns_job,
     profile_cron_lock,
@@ -1374,15 +1373,26 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         ):
             return
         try:
-            from cron.jobs import create_job, list_jobs, remove_job
+            from cron.jobs import (
+                create_job,
+                list_jobs,
+                parse_schedule,
+                remove_job,
+                update_job,
+                use_cron_store,
+            )
 
             home = self._hermes_home
             config = self._config
             desired_schedule = config.sleep_schedule
             enabled = config.sleep_cycles and bool(desired_schedule)
+            parsed_schedule = parse_schedule(desired_schedule) if enabled else None
             profile_id = profile_identity(home)
             script_dest = home / "scripts" / CRON_SCRIPT_NAME
-            with profile_cron_lock(home):
+            # The public cron API is profile-contextual.  Keep the whole
+            # read/reconcile/write transaction in this profile's store rather
+            # than relying on the process-wide active Hermes home.
+            with profile_cron_lock(home), use_cron_store(home):
                 existing = [job for job in list_jobs() if isinstance(job, dict)]
                 owned = [job for job in existing if owns_job(job, profile_id)]
                 if not enabled:
@@ -1403,16 +1413,13 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 if stage_script(script_dest, rendered):
                     logger.info("sleep: refreshed cron script at %s", script_dest)
 
-                compatible = [
-                    job
-                    for job in owned
-                    if compatible_job(
-                        job, profile_id, desired_schedule, marker, script_dest
-                    )
-                ]
-                if len(owned) == 1 and len(compatible) == 1:
-                    job_id = compatible[0].get("id")
+                if len(owned) == 1:
+                    job_id = owned[0].get("id")
                     if isinstance(job_id, str):
+                        # Preserve the scheduler-owned identity and next-run
+                        # state when only the desired cadence changed.
+                        if owned[0].get("schedule") != parsed_schedule:
+                            update_job(job_id, {"schedule": desired_schedule})
                         self._sleep_cron_job_id = job_id
                         with self._sync_state_lock:
                             self._health_cron = "registered"
@@ -1461,11 +1468,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         if self._hermes_home is None:
             return
         try:
-            from cron.jobs import list_jobs, remove_job
+            from cron.jobs import list_jobs, remove_job, use_cron_store
 
             home = self._hermes_home
             profile_id = profile_identity(home)
-            with profile_cron_lock(home):
+            with profile_cron_lock(home), use_cron_store(home):
                 for job in list_jobs():
                     if isinstance(job, dict) and owns_job(job, profile_id):
                         job_id = job.get("id")
@@ -1486,12 +1493,16 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         Ordinary shutdown intentionally preserves profile-owned scheduled work;
         this narrow helper is reserved for an explicit owner cleanup path.
         """
-        if self._sleep_cron_job_id is None:
+        if self._sleep_cron_job_id is None or self._hermes_home is None:
             return
         try:
-            from cron.jobs import remove_job
+            from cron.jobs import remove_job, use_cron_store
 
-            remove_job(self._sleep_cron_job_id)
+            with (
+                profile_cron_lock(self._hermes_home),
+                use_cron_store(self._hermes_home),
+            ):
+                remove_job(self._sleep_cron_job_id)
             logger.info("sleep: removed cron job %s", self._sleep_cron_job_id)
         except Exception:
             logger.warning(

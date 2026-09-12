@@ -9,11 +9,13 @@ commit is supported.
 
 ## Baseline and release policy
 
+Audit date: **2026-09-12 UTC**.
+
 The current tested wrapper baseline is:
 
 | Component | Exact reference | Availability and provenance |
 | --- | --- | --- |
-| hermes-cashew | `b14d7b013ac0e95314f78cca6cacfef202a30654` (`0.10.2`) | This repository's `origin/main` at the issue audit baseline. |
+| hermes-cashew | `b14d7b013ac0e95314f78cca6cacfef202a30654` | This repository's `origin/main` at the issue audit baseline. |
 | cashew-brain | `1.2.1`, PyPI | The [PyPI release metadata](https://pypi.org/pypi/cashew-brain/1.2.1/json) lists both a wheel (`e1efff8f7fa679cf86b767718df213e50ed9bffa79bf3ff97153ef4d33c72bba`) and sdist (`77b1231bddc090902e8c5a4f29771ae9681133a8622ff5f9b2bd584a7fc7157e`). The repository lock resolves `1.2.1`; the project range remains `>=1.2.1,<2.0.0`. |
 | Hermes Agent | `990473a79c6b0396b0a648fdd85ee8f7a5c267d3` | The [immutable upstream commit](https://github.com/NousResearch/hermes-agent/commit/990473a79c6b0396b0a648fdd85ee8f7a5c267d3) exists on `main` (2026-09-09). This is a statically observed interface revision for compatibility checks; it is not a published Hermes minimum-version promise and has not yet passed hermes-cashew's real-loader/lifecycle integration gate (#199). |
 

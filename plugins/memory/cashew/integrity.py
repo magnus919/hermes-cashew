@@ -27,7 +27,11 @@ from contextlib import contextmanager
 from typing import Any, Iterable, Iterator, cast
 
 from .admission import admit_operation
-from .locking import open_readonly_verified, verify_readonly_profile
+from .locking import (
+    is_supported_vec_ddl,
+    open_readonly_verified,
+    verify_readonly_profile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -401,7 +405,7 @@ def _inspect_vec(
             "scan_complete": True,
         }
     sql = str(vec[1] or "")
-    if re.search(r"\bUSING\s+vec0\b", sql, re.IGNORECASE) is None:
+    if not is_supported_vec_ddl(sql):
         budget.scans["vec_index"] = False
         _add_reason(reasons, "vec_index_unverifiable")
         return {

@@ -30,6 +30,18 @@ class SQLiteWALUnsupportedError(RuntimeError):
 
 _READONLY_SCAN_ROW_CAP = 100_000
 _READONLY_SCAN_BATCH = 256
+_VEC_DDL_RE = re.compile(
+    r"^\s*CREATE\s+VIRTUAL\s+TABLE\s+"
+    r"(?:(?:IF\s+NOT\s+EXISTS)\s+)?"
+    r"(?:vec_embeddings|\"vec_embeddings\"|`vec_embeddings`|\[vec_embeddings\])\s+"
+    r"USING\s+vec0(?:\s|\()",
+    re.IGNORECASE,
+)
+
+
+def is_supported_vec_ddl(sql: object) -> bool:
+    """Accept only the known sqlite-vec virtual-table declaration."""
+    return isinstance(sql, str) and _VEC_DDL_RE.match(sql) is not None
 
 
 def _bounded_rows(
@@ -262,6 +274,11 @@ def verify_readonly_profile(  # noqa: C901
         "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_embeddings'"
     ).fetchone()
     if vec_table is not None:
+        vec_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='vec_embeddings'"
+        ).fetchone()[0]
+        if not is_supported_vec_ddl(vec_sql):
+            raise SQLiteWALUnsupportedError("read-only vec declaration is invalid")
         # Loading sqlite-vec into a query-only connection only registers the
         # virtual-table module; it does not alter the DB, WAL, or SHM files.
         try:
@@ -287,9 +304,6 @@ def verify_readonly_profile(  # noqa: C901
                 conn.execute("PRAGMA table_info(vec_embeddings)"), budget=budget
             )
         }
-        vec_sql = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE name='vec_embeddings'"
-        ).fetchone()[0]
         declared_dimension_match = re.search(
             r"(?:float|int8)\s*\[\s*(\d+)\s*\]", str(vec_sql), re.IGNORECASE
         )

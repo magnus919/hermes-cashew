@@ -66,6 +66,14 @@ calls still target private upstream functions. The local consolidation defects
 tracked by #193 also remain in the wrapper. None of those algorithms or
 safeguards changes in #188.
 
+The selected source requires SQLite 3.35 or newer for legacy v1 migrations
+because upstream uses `ALTER TABLE ... DROP COLUMN`. The published PyPI
+`1.2.1` artifact contains the same migration and the same undeclared SQLite
+minimum; #188 exposed this compatibility requirement but did not introduce it.
+The provenance verifier prints SQLite's version and source ID and rejects older
+runtimes before migration. This is separate from the WAL-reset safety versions
+tracked by #191: satisfying 3.35 alone does not establish WAL safety.
+
 ## Ownership boundary
 
 Hermes integration belongs here: provider lifecycle, profile-scoped paths,
@@ -102,9 +110,11 @@ replacement is the intended destination, not that this issue implements it.
 ## Platform scope and follow-on ownership
 
 The baseline is intended for Python `>=3.10` on POSIX hosts (Linux and macOS)
-with the standard `sqlite-vec` dependency and a locally available or otherwise
-configured SentenceTransformer model. The current provider imports `fcntl` at
-module load, so Windows is outside the supported scope until a platform-safe
+with SQLite `>=3.35`, the standard `sqlite-vec` dependency, and a locally
+available or otherwise configured SentenceTransformer model. The Python minor
+version does not guarantee its linked SQLite version, so installation
+verification checks the actual runtime. The current provider imports `fcntl`
+at module load, so Windows is outside the supported scope until a platform-safe
 lock implementation is delivered. sqlite-vec failure is intentionally a
 degraded semantic-search mode; it does not authorize dropping keyword/BFS
 fallbacks.

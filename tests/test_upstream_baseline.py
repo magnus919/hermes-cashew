@@ -30,6 +30,7 @@ CASHEW_ARCHIVE_URL = (
 CASHEW_SESSION_SHA256 = (
     "0ce60cc63adf4fb7136581aee722bb10e9a344e556b6fb98f4d46855d53c36cd"
 )
+MINIMUM_SQLITE = (3, 35, 0)
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -47,6 +48,13 @@ def test_installed_cashew_has_selected_source_provenance() -> None:
     session_path = Path(distribution.locate_file("core/session.py"))
     assert hashlib.sha256(session_path.read_bytes()).hexdigest() == (
         CASHEW_SESSION_SHA256
+    )
+
+
+def test_sqlite_supports_selected_upstream_legacy_migrations() -> None:
+    assert sqlite3.sqlite_version_info >= MINIMUM_SQLITE, (
+        f"SQLite {sqlite3.sqlite_version} is unsupported by this baseline; "
+        "upstream legacy v1 migration requires SQLite >= 3.35"
     )
 
 

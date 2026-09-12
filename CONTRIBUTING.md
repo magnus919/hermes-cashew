@@ -38,7 +38,9 @@ This project is governed by the [Apache 2.0 License](./LICENSE) and the followin
 ### Development Install
 
 hermes-cashew depends on an immutable, hash-pinned upstream `cashew-brain`
-source archive and Hermes Agent. For development:
+source archive, SQLite 3.35 or newer, and Hermes Agent. The SQLite minimum is
+required by upstream's legacy v1 migration and applies to the published PyPI
+`1.2.1` code as well as the selected source. For development:
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then:
 

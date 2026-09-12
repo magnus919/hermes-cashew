@@ -6,6 +6,8 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 ARCHIVE_URL = (
@@ -13,6 +15,7 @@ ARCHIVE_URL = (
     "dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz"
 )
 SESSION_SHA256 = "0ce60cc63adf4fb7136581aee722bb10e9a344e556b6fb98f4d46855d53c36cd"
+MINIMUM_SQLITE = (3, 35, 0)
 
 
 def main() -> None:
@@ -36,6 +39,17 @@ def main() -> None:
         )
     print(f"cashew-brain source verified: {actual_url}")
     print(f"core/session.py SHA-256: {actual_hash}")
+
+    with closing(sqlite3.connect(":memory:")) as connection:
+        source_id = connection.execute("SELECT sqlite_source_id()").fetchone()[0]
+    print(f"SQLite version: {sqlite3.sqlite_version}")
+    print(f"SQLite source ID: {source_id}")
+    if sqlite3.sqlite_version_info < MINIMUM_SQLITE:
+        minimum = ".".join(str(part) for part in MINIMUM_SQLITE)
+        raise SystemExit(
+            f"SQLite {sqlite3.sqlite_version} is unsupported by this baseline; "
+            f"SQLite >= {minimum} is required for upstream legacy v1 migrations"
+        )
 
 
 if __name__ == "__main__":

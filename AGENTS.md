@@ -109,6 +109,11 @@ done
   SHA-256 in `pyproject.toml`, both manifests, and `uv.lock`. The upstream
   package still reports version `1.2.1`, so version metadata alone does not
   identify the selected code.
+- **SQLite baseline**: SQLite `>=3.35` is required because the upstream legacy
+  v1 migration uses `ALTER TABLE ... DROP COLUMN`. The PyPI `1.2.1` artifact
+  has the same requirement even though its package metadata does not declare
+  it. This minimum does not establish safety from the separate SQLite WAL-reset
+  issue tracked by #191.
 - **sqlite-vec** enables vector similarity search. It's a standard dependency
   (not optional) — the plugin requires it. If your platform doesn't support
   sqlite-vec's native extension, the plugin degrades gracefully to keyword + BFS

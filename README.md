@@ -14,6 +14,7 @@ consolidation on a persistent Hermes cron schedule.
 
 - [Hermes Agent](https://github.com/nousresearch/hermes-agent) installed
 - `cashew-brain` from the reviewed upstream source commit documented below
+- SQLite 3.35 or newer, required for Cashew's legacy v1 schema migration
 - `sqlite-vec` — enables vector similarity search; included in the manual install below
 
 ## Install
@@ -38,9 +39,13 @@ uv pip install \
 
 The verification step is required because the selected source and the older
 PyPI release both report version `1.2.1`. A version-only check cannot tell them
-apart. `hermes memory setup` may warn that it refused the direct URL; that
-warning is expected and does not replace or downgrade a manually installed
-candidate.
+apart. It also checks the linked SQLite version and source ID. Both the selected
+source and the existing PyPI `1.2.1` code require SQLite 3.35 or newer to
+migrate a legacy v1 database because that migration uses `ALTER TABLE ... DROP
+COLUMN`; this requirement was discovered by the source-pin gate rather than
+introduced by it. `hermes memory setup` may warn that it refused the direct
+URL; that warning is expected and does not replace or downgrade a manually
+installed candidate.
 
 After install, run setup and restart the gateway:
 

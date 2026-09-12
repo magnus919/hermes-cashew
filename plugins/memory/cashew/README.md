@@ -117,6 +117,13 @@ This enables:
 
 Without LLM, Cashew falls back to heuristic extraction.
 
+The local sleep implementation and adapter migration guards remain the shipped
+compatibility boundary. Upstream sleep replacement (#193), cron lifecycle
+reconciliation (#203), bounded consolidation and shorter embedding write
+transactions (#205), integrity repair (#206), and loader cleanup (#208) are
+pending tracked work; draft PRs #231 and #232 are not included in the current
+`main` installation.
+
 ## Logs
 
 Plugin logs go to `~/.hermes/logs/agent.log` (not gateway.log — the gateway has a component filter).
@@ -124,7 +131,6 @@ Plugin logs go to `~/.hermes/logs/agent.log` (not gateway.log — the gateway ha
 Key log lines to watch:
 ```
 INFO plugins.memory.cashew: llm_aux_role='memory': using opencode-go deepseek-v4-flash ...
-INFO plugins.memory.cashew: on_session_end called: ...
 INFO plugins.memory.cashew: think cycle produced 2 insight(s) on cluster: ...
 WARNING plugins.memory.cashew: think cycle failed ...
 WARNING plugins.memory.cashew: on_pre_compress failed ...

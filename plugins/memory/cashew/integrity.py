@@ -463,6 +463,15 @@ def _inspect_vec(
             "scan_complete": False,
         }
     vec_ids = {str(row[0]) for row in rows if row[0] is not None}
+    if budget.incomplete:
+        return {
+            "available": True,
+            "entries": len(rows),
+            "missing_entries": None,
+            "stale_entries": None,
+            "declared_dimension": declared_dim,
+            "scan_complete": False,
+        }
     missing = ordinary_ids - vec_ids
     stale = vec_ids - ordinary_ids
     _add_reason(reasons, "vec_entry_missing", len(missing))
@@ -630,16 +639,13 @@ def _inspect_profile(  # noqa: C901
                     ordinary_ids.add(str(node_id))
                 reason, _ = _finite_vector(blob, expected_dim)
                 _add_reason(reasons, reason or "", 1)
-                if expected_model is None or model != expected_model:
+                if expected_model is not None and model != expected_model:
                     _add_reason(reasons, "embedding_model_mismatch")
                 if node_id is None:
                     _add_reason(reasons, "embedding_node_id_invalid")
             if budget.incomplete:
                 break
         budget.scans["embeddings"] = not budget.incomplete
-        if budget.incomplete:
-            for incomplete_reason in budget.incomplete_reasons:
-                _add_reason(reasons, incomplete_reason)
         if budget.ready():
             counts["orphan_embeddings"] = _bounded_count(
                 conn,
@@ -803,8 +809,19 @@ def audit_integrity(
                         except Exception as exc:
                             del exc
                             profile_error = "profile_verification_failed"
-                            if not budget.ready():
-                                profile_error = "audit_deadline"
+                            if budget.incomplete_reasons:
+                                profile_error = next(
+                                    (
+                                        reason
+                                        for reason in (
+                                            "audit_deadline",
+                                            "audit_row_cap",
+                                            "audit_byte_cap",
+                                        )
+                                        if reason in budget.incomplete_reasons
+                                    ),
+                                    sorted(budget.incomplete_reasons)[0],
+                                )
                         report = _inspect_profile(conn, journal_mode, budget)
                         if profile_error is not None:
                             reasons = cast(dict[str, Any], report["reasons"])

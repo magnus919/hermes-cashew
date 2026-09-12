@@ -661,6 +661,7 @@ def test_unresolved_identity_is_keyword_only_and_recovers_after_reinitialize(
         called_embedding_retrieval = True
         raise AssertionError("identity-unresolved recall must not embed")
 
+    real_embedding_wait = cashew_module._retrieve_with_embedding_wait
     monkeypatch.setattr(cashew_module, "_retrieve_with_embedding_wait", must_not_embed)
     provider = CashewMemoryProvider()
     provider.save_config({"embedding_model": "thenlper/gte-large"}, str(tmp_path))
@@ -701,6 +702,9 @@ def test_unresolved_identity_is_keyword_only_and_recovers_after_reinitialize(
     monkeypatch.setattr(
         "scripts.migrate_embeddings.migrate_embeddings", _fake_migrate_to_1024
     )
+    monkeypatch.setattr(
+        cashew_module, "_retrieve_with_embedding_wait", real_embedding_wait
+    )
     embedded_queries: list[dict] = []
     persisted_extracts: list[dict] = []
 
@@ -721,9 +725,7 @@ def test_unresolved_identity_is_keyword_only_and_recovers_after_reinitialize(
             conn.close()
         return types.SimpleNamespace(new_nodes=["recovered-write"], new_edges=[])
 
-    monkeypatch.setattr(
-        cashew_module, "_retrieve_with_embedding_wait", record_embedding_route
-    )
+    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", record_embedding_route)
     monkeypatch.setattr("core.session.end_session", persist_extract, raising=False)
     provider.initialize("recovered", hermes_home=str(tmp_path))
     try:
@@ -753,7 +755,16 @@ def test_unresolved_identity_is_keyword_only_and_recovers_after_reinitialize(
             conn.close()
 
         provider.prefetch("recovered route")
-        assert embedded_queries
+        assert embedded_queries == [
+            {
+                "db_path": str(db_path),
+                "query": "recovered route",
+                "top_k": provider._config.recall_k,
+                "domain": None,
+                "tags": None,
+                "exclude_tags": None,
+            }
+        ]
         assert created and provider._sleep_cron_job_id == "recovered-cashew"
         assert any(job["id"] == "other" for job in jobs)
     finally:

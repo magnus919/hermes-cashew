@@ -7,7 +7,6 @@ import threading
 import time
 import types
 
-import plugins.memory.cashew as cashew_module
 from plugins.memory.cashew import CashewMemoryProvider
 
 
@@ -100,9 +99,7 @@ def test_init_vector_unavailable_reports_keyword_degradation(tmp_path, monkeypat
         return types.SimpleNamespace(new_nodes=["written"], new_edges=[])
 
     monkeypatch.setattr(CashewMemoryProvider, "_finalize_vec_schema", vec_unavailable)
-    monkeypatch.setattr(
-        cashew_module, "_retrieve_with_embedding_wait", record_embedding_route
-    )
+    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", record_embedding_route)
     monkeypatch.setattr("core.session.end_session", persist_extract, raising=False)
     provider = CashewMemoryProvider()
     provider.initialize("vector-health", hermes_home=str(tmp_path))
@@ -123,7 +120,16 @@ def test_init_vector_unavailable_reports_keyword_degradation(tmp_path, monkeypat
         assert persisted_extracts
 
         provider.prefetch("embedding route")
-        assert embedded_queries
+        assert embedded_queries == [
+            {
+                "db_path": str(provider._db_path),
+                "query": "embedding route",
+                "top_k": provider._config.recall_k,
+                "domain": None,
+                "tags": None,
+                "exclude_tags": None,
+            }
+        ]
     finally:
         provider.shutdown()
 

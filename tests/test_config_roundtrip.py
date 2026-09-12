@@ -508,15 +508,19 @@ def test_save_config_allows_unsupported_directory_fsync_after_replacement(
 
 def test_save_config_reports_real_directory_fsync_failure(tmp_path, monkeypatch):
     path = tmp_path / "cashew.json"
-    monkeypatch.setattr(
-        config_module,
-        "_fsync_directory",
-        lambda _directory: (_ for _ in ()).throw(OSError(errno.EIO, "fsync failed")),
-    )
+    original_fsync = config_module.os.fsync
 
-    with pytest.raises(OSError, match="fsync failed"):
+    def fail_directory_fsync(descriptor):
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError(errno.EIO, "fsync failed")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(config_module.os, "fsync", fail_directory_fsync)
+
+    with pytest.raises(OSError, match="fsync failed") as exc_info:
         save_config({"recall_k": 8}, tmp_path)
 
+    assert exc_info.value.errno == errno.EIO
     assert json.loads(path.read_text())["recall_k"] == 8
     assert not list(tmp_path.glob(".cashew.json.*.tmp"))
 

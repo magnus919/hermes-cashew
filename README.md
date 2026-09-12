@@ -409,11 +409,13 @@ to an external checkout.
 
 ### What happens during a cron tick
 
-1. Reads ``cashew.json`` to get ``cashew_db_path`` and ``sleep_max_nodes``
-2. Selects up to ``sleep_max_nodes`` (default 2,000) oldest-unprocessed nodes
+1. Uses the validated effective configuration embedded when the job was
+   registered; it does not reread ``cashew.json`` or ambient ``CASHEW_*``
+   values during a tick
+2. Selects up to ``sleep_max_nodes`` (default 2,000) eligible nodes
 3. Computes pairwise cosine similarity (vectorized numpy)
-4. Creates cross-links between similar node pairs (threshold: 0.78)
-5. Deduplicates near-identical nodes (threshold: 0.82) via BFS clustering
+4. Creates and repairs cross-links using the configured model-profile thresholds
+5. Deduplicates near-identical nodes through maximal-clique consolidation
 6. Runs garbage collection on low-fitness isolated nodes
 7. Promotes frequently-accessed nodes to permanent / core memory status
 8. Prints a JSON summary (captured by the cron scheduler's output log)
@@ -443,7 +445,7 @@ shared-brain writer-coordination policy; broader coordination is tracked in
 | Key | Default | Description |
 |-----|---------|-------------|
 | ``sleep_schedule`` | ``\"every 12h\"`` | Cron expression or interval string. Set to ``\"\"`` to disable cron-based scheduling entirely. Examples: ``\"every 30m\"``, ``\"0 */2 * * *\"``, ``\"0 3 * * *\"`` (daily at 3am). |
-| ``sleep_max_nodes`` | ``2000`` | Maximum number of nodes to cross-link in a single sleep cycle. Higher values converge faster but take longer per tick. |
+| ``sleep_max_nodes`` | ``2000`` | Maximum number of eligible nodes considered in one sleep cycle. Higher values can increase consolidation work and tick time. |
 
 ## Semantic Search
 
@@ -455,6 +457,12 @@ but less precise.
 sqlite-vec is a standard dependency and will always be loaded at startup.
 
 ## Uninstall
+
+Normal provider shutdown intentionally preserves the profile-owned cron job.
+Before removing the plugin, disable sleep in Cashew setup (set
+``sleep_cycles`` to ``false`` or ``sleep_schedule`` to ``""``) and initialize
+the provider once. Reconciliation then removes only the job whose ownership
+matches that Hermes profile. Afterwards use the host-supported removal flow:
 
 ```bash
 hermes plugins remove cashew

@@ -84,7 +84,10 @@ def _owned_job(home: Path, job_id: str, schedule: str) -> dict:
     }
 
 
-def test_disabled_sleep_removes_persisted_job(tmp_path, monkeypatch):
+def test_disabling_sleep_removes_persisted_job_before_host_uninstall(
+    tmp_path, monkeypatch
+):
+    """Disabling the provider is the supported pre-uninstall cleanup path."""
     removed, created, _updated, stores = _install_fake_cron(
         monkeypatch,
         [

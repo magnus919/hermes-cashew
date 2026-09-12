@@ -1,165 +1,522 @@
-"""Bounded, real-upstream subprocess contracts for shared Cashew brains."""
+"""Bounded real-upstream subprocess contracts for shared Cashew brains.
+
+The child only wraps ``core.session.end_session`` to establish a barrier; every
+write still invokes the original upstream function. This makes overlap
+deterministic without replacing persistence with a success stub.
+"""
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import select
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
+from typing import Any
 
 from plugins.memory.cashew import CashewMemoryProvider
-from plugins.memory.cashew.config import CashewConfig
-from plugins.memory.cashew.sleep_refactor import run_sleep_cycle
+
+_READY_TIMEOUT = 10
+_EXIT_TIMEOUT = 15
 
 _CHILD = r"""
-import json, os, sys
+import fcntl, hashlib, json, os, sys, time
 from pathlib import Path
+import numpy as np
 os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_DATASETS_OFFLINE="1")
 from plugins.memory.cashew import CashewMemoryProvider
 from plugins.memory.cashew.config import CashewConfig
 import core.session
+import core.embedding_service
 assert getattr(core.session, "__file__", ""), "real core.session required"
-home=Path(sys.argv[1]); marker=sys.argv[2]; gate=sys.argv[3]
+
+home = Path(sys.argv[1]); marker = sys.argv[2]; action = sys.argv[3]
+overlap = Path(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4] else None
 home.mkdir(parents=True, exist_ok=True)
-(home / "cashew.json").write_text(json.dumps({"cashew_db_path":"brain.db", "llm_aux_role":None, "think_cycles":False}))
-p=CashewMemoryProvider(); p.initialize("mp-" + marker, hermes_home=str(home))
-print(json.dumps({"ready": p._db_path is not None, "core": core.session.__file__}), flush=True)
-sys.stdin.readline()  # parent barrier: force operation overlap, not launch overlap
-result=p.handle_tool_call("cashew_extract", {"user_content":marker, "assistant_content":"stored marker " + marker})
-print(json.dumps({"result": result}), flush=True)
-p.shutdown()
+(home / "cashew.json").write_text(json.dumps({"cashew_db_path": "brain.db", "llm_aux_role": None, "think_cycles": False}))
+
+class DeterministicEmbeddingService:
+    model = "thenlper/gte-large"
+    dim = 1024
+    def embed_np(self, texts):
+        vectors = []
+        for text in texts:
+            seed = int.from_bytes(hashlib.sha256(text.encode()).digest()[:8], "big")
+            vector = np.random.default_rng(seed).normal(size=self.dim).astype(np.float32)
+            vectors.append(vector / np.linalg.norm(vector))
+        return np.stack(vectors) if vectors else np.zeros((0, self.dim), dtype=np.float32)
+
+    def embed(self, text):
+        vectors = self.embed_np([text] if isinstance(text, str) else text)
+        return vectors[0].tolist() if isinstance(text, str) else vectors.tolist()
+
+_embedding_service = DeterministicEmbeddingService()
+core.embedding_service.get_default_service = lambda: _embedding_service
+
+def emit(event, **payload):
+    print(json.dumps({"event": event, "core": core.session.__file__, **payload}), flush=True)
+
+def command():
+    value = sys.stdin.readline().strip()
+    if not value:
+        raise RuntimeError("parent closed the subprocess control pipe")
+    return value
+
+def wait_for(path):
+    deadline = time.monotonic() + 10
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("overlap marker did not arrive: " + str(path))
+        time.sleep(0.01)
+
+def initialize():
+    provider = CashewMemoryProvider()
+    provider.initialize("mp-" + marker, hermes_home=str(home))
+    if provider._db_path is None:
+        raise RuntimeError("provider failed to initialize")
+    provider._model_fn = lambda _prompt: json.dumps([{
+        "content": "durable marker " + marker,
+        "type": "observation",
+        "domain": "user",
+        "tags": ["multiprocess"],
+        "keep": True,
+    }])
+    return provider
+
+def install_extract_barrier(provider):
+    original = core.session.end_session
+    failure = {}
+
+    def gated_end_session(*args, **kwargs):
+        emit("entered_upstream_write")
+        if command() != "write":
+            raise RuntimeError("expected write command")
+        if overlap is not None:
+            wait_for(overlap / "phase_started")
+            (overlap / "writer_started").write_text(marker)
+        try:
+            return original(*args, **kwargs)
+        except Exception as exc:
+            failure.update(type=type(exc).__name__, message=str(exc))
+            raise
+
+    core.session.end_session = gated_end_session
+    provider._multiprocess_upstream_failure = failure
+
+if action == "initialize":
+    emit("ready_to_initialize")
+    if command() != "initialize":
+        raise RuntimeError("expected initialize command")
+    provider = initialize()
+    emit("initialized", available=provider._db_path is not None)
+    provider.shutdown()
+
+elif action == "extract":
+    provider = initialize()
+    install_extract_barrier(provider)
+    emit("ready")
+    if command() != "start":
+        raise RuntimeError("expected start command")
+    result = provider.handle_tool_call(
+        "cashew_extract",
+        {"user_content": marker, "assistant_content": "stored marker " + marker},
+    )
+    emit(
+        "result",
+        result=json.loads(result),
+        upstream_failure=provider._multiprocess_upstream_failure,
+    )
+    provider.shutdown()
+
+elif action == "sync":
+    provider = initialize()
+    install_extract_barrier(provider)
+    emit("ready")
+    if command() != "start":
+        raise RuntimeError("expected start command")
+    provider.sync_turn(marker, "stored marker " + marker)
+    emit("queued")
+    assert provider._sync_queue is not None
+    provider._sync_queue.join()
+    provider.shutdown()
+    emit("result", result={"drained": True})
+
+elif action == "sleep":
+    import plugins.memory.cashew.sleep_refactor as sleep
+    original_set_wal = sleep._set_wal
+    def paused_set_wal(conn):
+        original_set_wal(conn)
+        emit("maintenance_locked")
+        if command() != "release":
+            raise RuntimeError("expected release command")
+        assert overlap is not None
+        (overlap / "phase_started").write_text("sleep")
+        wait_for(overlap / "writer_started")
+    sleep._set_wal = paused_set_wal
+    emit("ready")
+    if command() != "start":
+        raise RuntimeError("expected start command")
+    result = sleep.run_sleep_cycle(str(home / "brain.db"), model_fn=None)
+    emit("result", result=result)
+
+elif action == "migration":
+    from plugins.memory.cashew import _patch_upstream_embedding
+
+    _patch_upstream_embedding("thenlper/gte-small", "cpu")
+    _embedding_service.model = "thenlper/gte-small"
+    _embedding_service.dim = 384
+    provider = CashewMemoryProvider()
+    provider._config = CashewConfig(embedding_model="thenlper/gte-small")
+    original_repair = provider._repair_embedding_dimension_locked
+    def paused_repair(db_path):
+        emit("maintenance_locked")
+        if command() != "release":
+            raise RuntimeError("expected release command")
+        assert overlap is not None
+        (overlap / "phase_started").write_text("migration")
+        wait_for(overlap / "writer_started")
+        return original_repair(db_path)
+    provider._repair_embedding_dimension_locked = paused_repair
+    emit("ready")
+    if command() != "start":
+        raise RuntimeError("expected start command")
+    dimensions_before = provider._embedding_dimensions(home / "brain.db")
+    provider._repair_embedding_dimension(home / "brain.db")
+    dimensions_after = provider._embedding_dimensions(home / "brain.db")
+    before = [sorted(dimensions_before[0]), dimensions_before[1]]
+    after = [sorted(dimensions_after[0]), dimensions_after[1]]
+    if after == [[384], 384]:
+        outcome = "migrated"
+    elif after == before:
+        outcome = "deferred_by_concurrent_writer"
+    else:
+        raise RuntimeError("unexpected post-migration dimensions: " + repr(after))
+    emit(
+        "result",
+        result={
+            "completed": True,
+            "dimensions_before": before,
+            "dimensions_after": after,
+            "outcome": outcome,
+        },
+    )
+
+elif action == "lock":
+    lock_path = Path(str(home / "brain.db") + ".sleep.lock")
+    emit("ready")
+    if command() != "hold":
+        raise RuntimeError("expected hold command")
+    with lock_path.open("a+") as lock_fd:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        emit("maintenance_locked")
+        if command() != "release":
+            raise RuntimeError("expected release command")
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    emit("result", result={"released": True})
+
+else:
+    raise RuntimeError("unknown action: " + action)
 """
 
 
-def _child(home: Path, marker: str, gate: str) -> subprocess.Popen[str]:
-    proc = subprocess.Popen(
-        [sys.executable, "-c", _CHILD, str(home), marker, gate],
+def _start(
+    home: Path, marker: str, action: str, overlap: Path | None = None
+) -> subprocess.Popen[str]:
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            _CHILD,
+            str(home),
+            marker,
+            action,
+            str(overlap) if overlap else "",
+        ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         env={**os.environ, "HOME": str(home / "user")},
     )
-    assert proc.stdout is not None
-    ready, _, _ = select.select([proc.stdout], [], [], 5)
-    assert ready, "child readiness timed out"
-    payload = json.loads(proc.stdout.readline())
-    assert payload["ready"] and payload["core"]
-    return proc
-
-
-def _finish(proc: subprocess.Popen[str]) -> dict:
     try:
-        assert proc.stdin is not None and proc.stdout is not None
-        proc.stdin.write("go\n")
-        proc.stdin.close()
-        ready, _, _ = select.select([proc.stdout], [], [], 15)
-        assert ready, "child write timed out"
-        payload = json.loads(proc.stdout.readline())
-        assert proc.wait(timeout=5) == 0, proc.stderr.read() if proc.stderr else ""
-        return payload
+        expected = "ready_to_initialize" if action == "initialize" else "ready"
+        event = _event(process, expected)
+        assert event["core"]
+        return process
+    except BaseException:
+        _terminate(process)
+        raise
+
+
+def _event(
+    process: subprocess.Popen[str], expected: str, timeout: float = _READY_TIMEOUT
+) -> dict[str, Any]:
+    assert process.stdout is not None
+    readable, _, _ = select.select([process.stdout], [], [], timeout)
+    assert readable, f"child did not emit {expected!r} within {timeout}s"
+    line = process.stdout.readline()
+    assert line, f"child exited before {expected!r}: {_child_error(process)}"
+    payload = json.loads(line)
+    assert payload["event"] == expected, payload
+    assert payload["core"], "child must import the installed core.session module"
+    return payload
+
+
+def _send(process: subprocess.Popen[str], value: str) -> None:
+    assert process.stdin is not None
+    process.stdin.write(f"{value}\n")
+    process.stdin.flush()
+
+
+def _child_error(process: subprocess.Popen[str]) -> str:
+    if process.poll() is None or process.stderr is None:
+        return "child is still running"
+    return process.stderr.read()
+
+
+def _terminate(process: subprocess.Popen[str]) -> None:
+    try:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5)
-        for stream in (proc.stdin, proc.stdout, proc.stderr):
-            if stream and not stream.closed:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None and not stream.closed:
                 stream.close()
 
 
-def _markers(db: Path) -> set[str]:
-    conn = sqlite3.connect(db)
+def _result(process: subprocess.Popen[str]) -> dict[str, Any]:
     try:
-        return {row[0] for row in conn.execute("SELECT content FROM thought_nodes")}
+        payload = _event(process, "result", timeout=_EXIT_TIMEOUT)
+        assert process.wait(timeout=_EXIT_TIMEOUT) == 0, _child_error(process)
+        result = payload["result"]
+        if payload.get("upstream_failure"):
+            result = {**result, "upstream_failure": payload["upstream_failure"]}
+        return result
     finally:
-        conn.close()
+        _terminate(process)
 
 
-def test_two_processes_persist_identifiable_records_to_one_brain(
-    tmp_path: Path,
-) -> None:
-    """Real upstream extraction persists both barrier-released process markers."""
+def _extract(home: Path, marker: str, overlap: Path | None = None) -> dict[str, Any]:
+    process = _start(home, marker, "extract", overlap)
+    try:
+        _send(process, "start")
+        _event(process, "entered_upstream_write")
+        _send(process, "write")
+        return _result(process)
+    except BaseException:
+        _terminate(process)
+        raise
+
+
+def _markers(db_path: Path) -> set[str]:
+    connection = sqlite3.connect(db_path)
+    try:
+        return {
+            row[0] for row in connection.execute("SELECT content FROM thought_nodes")
+        }
+    finally:
+        connection.close()
+
+
+def _assert_consistent(db_path: Path) -> None:
+    connection = sqlite3.connect(db_path)
+    try:
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert (
+            connection.execute(
+                "SELECT e.node_id FROM embeddings e "
+                "LEFT JOIN thought_nodes n ON n.id = e.node_id WHERE n.id IS NULL"
+            ).fetchall()
+            == []
+        )
+        assert (
+            connection.execute(
+                "SELECT parent_id FROM derivation_edges "
+                "WHERE parent_id NOT IN (SELECT id FROM thought_nodes) "
+                "UNION ALL SELECT child_id FROM derivation_edges "
+                "WHERE child_id NOT IN (SELECT id FROM thought_nodes)"
+            ).fetchall()
+            == []
+        )
+        has_vec_index = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec_embeddings'"
+        ).fetchone()
+        if has_vec_index:
+            import sqlite_vec
+
+            connection.enable_load_extension(True)
+            sqlite_vec.load(connection)
+            assert (
+                connection.execute(
+                    "SELECT v.node_id FROM vec_embeddings v "
+                    "LEFT JOIN thought_nodes n ON n.id = v.node_id WHERE n.id IS NULL"
+                ).fetchall()
+                == []
+            )
+    finally:
+        connection.close()
+
+
+def test_two_processes_initialize_extract_and_recall_one_brain(tmp_path: Path) -> None:
+    """Two real provider initializations and upstream writes overlap by barrier."""
     home = tmp_path / "shared"
-    first = _child(home, "marker-alpha", "shared")
-    second = _child(home, "marker-beta", "shared")
-    _finish(first)
-    _finish(second)
+    first = _start(home, "marker-alpha", "initialize")
+    second = _start(home, "marker-beta", "initialize")
+    try:
+        _send(first, "initialize")
+        _send(second, "initialize")
+        assert _event(first, "initialized")["available"] is True
+        assert _event(second, "initialized")["available"] is True
+        assert first.wait(timeout=_EXIT_TIMEOUT) == 0, _child_error(first)
+        assert second.wait(timeout=_EXIT_TIMEOUT) == 0, _child_error(second)
+    finally:
+        _terminate(first)
+        _terminate(second)
+
+    first = _start(home, "marker-alpha", "extract")
+    second = _start(home, "marker-beta", "extract")
+    try:
+        _send(first, "start")
+        _send(second, "start")
+        _event(first, "entered_upstream_write")
+        _event(second, "entered_upstream_write")
+        _send(first, "write")
+        _send(second, "write")
+        assert _result(first)["ok"] is True
+        assert _result(second)["ok"] is True
+    finally:
+        _terminate(first)
+        _terminate(second)
+
     stored = _markers(home / "brain.db")
     assert any("marker-alpha" in value for value in stored)
     assert any("marker-beta" in value for value in stored)
+    _assert_consistent(home / "brain.db")
+
+    provider = CashewMemoryProvider()
+    try:
+        provider.initialize("recall", hermes_home=str(home))
+        assert "marker-alpha" in provider.prefetch("marker-alpha")
+        assert "marker-beta" in provider.prefetch("marker-beta")
+    finally:
+        provider.shutdown()
 
 
 def test_separate_profiles_do_not_share_persisted_records(tmp_path: Path) -> None:
-    first = _child(tmp_path / "one", "only-one", "one")
-    second = _child(tmp_path / "two", "only-two", "two")
-    _finish(first)
-    _finish(second)
-    assert any("only-one" in value for value in _markers(tmp_path / "one" / "brain.db"))
-    assert not any(
-        "only-two" in value for value in _markers(tmp_path / "one" / "brain.db")
-    )
+    first_home = tmp_path / "one"
+    second_home = tmp_path / "two"
+    assert _extract(first_home, "only-one")["ok"] is True
+    assert _extract(second_home, "only-two")["ok"] is True
+    assert any("only-one" in value for value in _markers(first_home / "brain.db"))
+    assert not any("only-two" in value for value in _markers(first_home / "brain.db"))
+    _assert_consistent(first_home / "brain.db")
+    _assert_consistent(second_home / "brain.db")
 
 
-def test_abrupt_worker_exit_only_requires_post_restart_durability(
+def test_abrupt_sync_worker_exit_only_requires_post_restart_durability(
     tmp_path: Path,
 ) -> None:
-    """A killed pre-write child has no durability promise; restart must persist."""
+    """A killed worker has no durability promise; a restarted explicit write does."""
     home = tmp_path / "shared"
-    killed = _child(home, "pre-kill", "kill")
+    killed = _start(home, "pre-kill", "sync")
     try:
+        _send(killed, "start")
+        _event(killed, "queued")
+        _event(killed, "entered_upstream_write")
         killed.kill()
-        killed.wait(timeout=5)
+        assert killed.wait(timeout=_EXIT_TIMEOUT) != 0
     finally:
-        for stream in (killed.stdin, killed.stdout, killed.stderr):
-            if stream and not stream.closed:
-                stream.close()
-    restarted = _child(home, "after-restart", "restart")
-    _finish(restarted)
-    stored = _markers(home / "brain.db")
-    assert any("after-restart" in value for value in stored)
+        _terminate(killed)
+
+    assert _extract(home, "after-restart")["ok"] is True
+    assert any("after-restart" in value for value in _markers(home / "brain.db"))
+    _assert_consistent(home / "brain.db")
 
 
 def test_sleep_lock_contention_has_bounded_named_skip(tmp_path: Path) -> None:
-    """A held maintenance lock returns the public skip result without waiting."""
-    db_path = tmp_path / "brain.db"
-    lock_path = Path(f"{db_path}.sleep.lock")
-    with lock_path.open("a+") as holder:
-        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        try:
-            assert run_sleep_cycle(str(db_path), model_fn=None) == {}
-        finally:
-            fcntl.flock(holder, fcntl.LOCK_UN)
-
-
-def test_real_extract_survives_following_sleep_cycle(tmp_path: Path) -> None:
-    """A real explicit extraction remains queryable after maintenance runs."""
+    """A different process holding maintenance lock produces a bounded skip."""
     home = tmp_path / "shared"
-    writer = _child(home, "extract-before-sleep", "extract-sleep")
-    _finish(writer)
-    result = run_sleep_cycle(str(home / "brain.db"), model_fn=None)
-    assert result == {} or "error" in result or result["nodes_selected"] >= 0
-    assert any("extract-before-sleep" in value for value in _markers(home / "brain.db"))
+    holder = _start(home, "lock-holder", "lock")
+    try:
+        _send(holder, "hold")
+        _event(holder, "maintenance_locked")
+        started = time.monotonic()
+        from plugins.memory.cashew.sleep_refactor import run_sleep_cycle
+
+        assert run_sleep_cycle(str(home / "brain.db"), model_fn=None) == {}
+        assert time.monotonic() - started < 3
+        _send(holder, "release")
+        assert _result(holder) == {"released": True}
+    finally:
+        _terminate(holder)
 
 
-def test_migration_lock_contention_defers_while_real_writer_runs(
+def test_real_extract_overlaps_sleep_and_preserves_its_marker(tmp_path: Path) -> None:
+    """Extraction enters upstream persistence while sleep holds its maintenance lock."""
+    home = tmp_path / "shared"
+    assert _extract(home, "sleep-seed-one")["ok"] is True
+    assert _extract(home, "sleep-seed-two")["ok"] is True
+    overlap = tmp_path / "extract-sleep"
+    overlap.mkdir()
+    sleeper = _start(home, "sleep", "sleep", overlap)
+    writer = _start(home, "extract-during-sleep", "extract", overlap)
+    try:
+        _send(sleeper, "start")
+        _event(sleeper, "maintenance_locked")
+        _send(writer, "start")
+        _event(writer, "entered_upstream_write")
+        _send(sleeper, "release")
+        _send(writer, "write")
+        assert _result(sleeper) is not None
+        assert _result(writer)["ok"] is True
+    finally:
+        _terminate(sleeper)
+        _terminate(writer)
+
+    assert any("extract-during-sleep" in value for value in _markers(home / "brain.db"))
+    _assert_consistent(home / "brain.db")
+
+
+def test_migration_maintenance_overlaps_real_writer_and_keeps_database_sound(
     tmp_path: Path,
 ) -> None:
-    """Migration's nonblocking lock cannot overlap the real child write path."""
+    """Migration inspection and real upstream persistence start from one barrier."""
     home = tmp_path / "shared"
-    writer = _child(home, "writer-during-migration", "migration-write")
-    db_path = home / "brain.db"
-    lock_path = Path(f"{db_path}.sleep.lock")
-    provider = CashewMemoryProvider()
-    provider._config = CashewConfig()
-    with lock_path.open("a+") as holder:
-        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        try:
-            provider._repair_embedding_dimension(db_path)
-        finally:
-            fcntl.flock(holder, fcntl.LOCK_UN)
-    _finish(writer)
-    assert any("writer-during-migration" in value for value in _markers(db_path))
+    assert _extract(home, "migration-seed")["ok"] is True
+    overlap = tmp_path / "migration-write"
+    overlap.mkdir()
+    migration = _start(home, "migration", "migration", overlap)
+    writer = _start(home, "writer-during-migration", "extract", overlap)
+    try:
+        _send(migration, "start")
+        _event(migration, "maintenance_locked")
+        _send(writer, "start")
+        _event(writer, "entered_upstream_write")
+        _send(migration, "release")
+        _send(writer, "write")
+        migration_result = _result(migration)
+        assert migration_result["completed"] is True
+        assert migration_result["dimensions_before"] == [[1024], 1024]
+        # Issue #191 owns ordinary writer coordination. This test keeps the
+        # concurrent outcome visible without expecting that unrelated fix.
+        assert migration_result["outcome"] in {
+            "migrated",
+            "deferred_by_concurrent_writer",
+        }
+        assert _result(writer)["ok"] is True
+    finally:
+        _terminate(migration)
+        _terminate(writer)
+
+    assert any(
+        "writer-during-migration" in value for value in _markers(home / "brain.db")
+    )
+    _assert_consistent(home / "brain.db")

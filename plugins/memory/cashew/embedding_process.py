@@ -31,9 +31,7 @@ logger = logging.getLogger(__name__)
 _LENGTH = struct.Struct("!I")
 _MAX_FRAME = 16 * 1024 * 1024
 _MAX_DIMENSION = 65536
-# ``json.dumps`` may expand one UTF-8 byte to a six-byte ``\\uXXXX`` escape.
-# Reserve one KiB for the fixed request envelope before allocating that JSON.
-_MAX_ENCODE_TEXT_BYTES = (_MAX_FRAME - 1024) // 6
+_ENCODE_ENVELOPE_BYTES = 1024
 _OWNER_LOCK = threading.Lock()
 _OWNER: EmbeddingSupervisor | None = None
 _CALLER_WAIT: contextvars.ContextVar[float | None] = contextvars.ContextVar(
@@ -490,15 +488,19 @@ class EmbeddingSupervisor:
             return np.zeros((0, self.dimension), dtype=np.float32)
         if len(texts) > 100:
             raise EmbeddingUnavailable(EmbeddingFailure.PROTOCOL)
-        total_text_bytes = 0
-        for text in texts:
+        estimated_frame_bytes = _ENCODE_ENVELOPE_BYTES
+        for index, text in enumerate(texts):
             if not isinstance(text, str):
                 raise EmbeddingUnavailable(EmbeddingFailure.PROTOCOL)
             text_bytes = len(text.encode("utf-8"))
             if text_bytes > 1048576:
                 raise EmbeddingUnavailable(EmbeddingFailure.PROTOCOL)
-            total_text_bytes += text_bytes
-            if total_text_bytes > _MAX_ENCODE_TEXT_BYTES:
+            # Bound the temporary allocation to one already-limited string,
+            # while accounting exactly for the whole request's JSON escaping.
+            estimated_frame_bytes += len(
+                json.dumps(text, ensure_ascii=True, separators=(",", ":"))
+            ) + (1 if index else 0)
+            if estimated_frame_bytes > _MAX_FRAME:
                 raise EmbeddingUnavailable(EmbeddingFailure.PROTOCOL)
         request_id = uuid.uuid4().hex
         request_payload = json.dumps(
@@ -510,6 +512,7 @@ class EmbeddingSupervisor:
                 "texts": texts,
             },
             separators=(",", ":"),
+            ensure_ascii=True,
         ).encode()
         if len(request_payload) > _MAX_FRAME:
             raise EmbeddingUnavailable(EmbeddingFailure.PROTOCOL)

@@ -133,6 +133,26 @@ def test_oversize_batch_does_not_poison_healthy_worker(
         supervisor.close()
 
 
+def test_near_frame_ascii_batch_reaches_healthy_worker(
+    tmp_path: Path, child_python: Path
+) -> None:
+    supervisor = _supervisor(
+        tmp_path, wait_timeout=5.0, active_timeout=5.0, backoff_base=1.0
+    )
+    try:
+        one_mebibyte = "x" * 1048576
+        texts = [one_mebibyte] * 15 + ["x" * (1048576 - 2048)]
+        vectors = supervisor.encode(texts)
+        assert vectors.shape == (16, 4)
+        assert vectors[:, 0].tolist() == [1048576.0] * 15 + [1046528.0]
+        assert supervisor._process is not None
+        assert supervisor._process.poll() is None
+        assert supervisor._failure_count == 0
+        assert supervisor._next_start == 0.0
+    finally:
+        supervisor.close()
+
+
 def test_control_text_aggregate_rejected_before_json_lock_or_worker_mutation(
     tmp_path: Path,
     child_python: Path,
@@ -152,8 +172,13 @@ def test_control_text_aggregate_rejected_before_json_lock_or_worker_mutation(
             supervisor.effective_device,
         )
 
-        def unexpected_json(*_args: object, **_kwargs: object) -> str:
-            pytest.fail("oversize control text reached json.dumps")
+        sized_texts: list[int] = []
+
+        def sizing_only_json(value: object, *args: object, **kwargs: object) -> str:
+            if not isinstance(value, str):
+                pytest.fail("oversize control text reached whole-payload json.dumps")
+            sized_texts.append(len(value))
+            return real_json_dumps(value, *args, **kwargs)
 
         class UnexpectedLock:
             def acquire(self, *args: object, **kwargs: object) -> bool:
@@ -162,13 +187,14 @@ def test_control_text_aggregate_rejected_before_json_lock_or_worker_mutation(
             def release(self) -> None:
                 pytest.fail("oversize control text released request lock")
 
-        monkeypatch.setattr(embedding_process.json, "dumps", unexpected_json)
+        monkeypatch.setattr(embedding_process.json, "dumps", sizing_only_json)
         supervisor._request_lock = UnexpectedLock()  # type: ignore[assignment]
         maximum_control_text = "\0" * 1048576
         with pytest.raises(EmbeddingUnavailable) as raised:
             supervisor.encode([maximum_control_text] * 3)
 
         assert raised.value.reason is EmbeddingFailure.PROTOCOL
+        assert sized_texts == [1048576, 1048576, 1048576]
         assert supervisor._process is process
         assert process.poll() is None
         assert (

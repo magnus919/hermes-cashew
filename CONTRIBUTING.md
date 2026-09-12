@@ -71,9 +71,15 @@ Without the symlink, the entry-point loader fails with `ModuleNotFoundError`. En
 ```bash
 uv run --frozen --extra dev pytest                          # full suite
 uv run --frozen --extra dev pytest tests/test_name.py -xvs  # single file
+python scripts/check-recursive-symlinks.py plugins/memory/cashew/  # before directory tools
 ```
 
 Tests require **no network access**. The embedding model is mocked automatically — `conftest.py` sets `HF_HUB_OFFLINE=1` before any Cashew import. CI enforces this with a log-scan step that fails if `Downloading.*MiniLM` appears.
+
+CI exercises the declared Python 3.10 minimum and the current 3.12 runtime from
+the frozen lockfile. If a local development symlink points back into
+`plugins/memory/cashew/`, the recursive-link checker reports the link and a
+remediation; it never deletes a user file.
 
 ### Understanding the Architecture
 

@@ -96,9 +96,10 @@ def test_ci_and_contributor_docs_use_frozen_uv_lock() -> None:
         assert ".venv/bin/pytest" in workflow
         assert ".venv/bin/pytest -xvs" not in workflow
         assert "uv pip install --system" not in workflow
-        assert 'python-version: "3.12"' in workflow
         assert "scripts/verify-cashew-baseline.py" in workflow
         assert 'python-version: "3.11"' not in workflow
+    assert "python-version: ${{ matrix.python }}" in tests_workflow
+    assert 'python-version: "3.12"' in release_workflow
     assert "uv sync --frozen --extra dev" in readme
     assert "uv sync --frozen --extra dev" in contributing
     assert "--cov-fail-under=75" in tests_workflow
@@ -107,6 +108,10 @@ def test_ci_and_contributor_docs_use_frozen_uv_lock() -> None:
         assert "${{ runner.temp }}" not in " ".join(job.get("env", {}).values())
     assert 'WHEEL_SMOKE_VENV="$RUNNER_TEMP/' in tests_workflow
     assert 'FLAT_SMOKE_VENV="$RUNNER_TEMP/' in tests_workflow
+    assert 'SDIST_SMOKE_VENV="$RUNNER_TEMP/' in tests_workflow
+    assert "scripts/check-recursive-symlinks.py" in tests_workflow
+    assert "scripts/verify-distributions.py dist/*" in tests_workflow
+    assert "scripts/smoke-flat-install.py" in tests_workflow
 
 
 def test_ci_uses_scoped_managed_python_for_sqlite_baseline() -> None:
@@ -119,12 +124,20 @@ def test_ci_uses_scoped_managed_python_for_sqlite_baseline() -> None:
 
     tests = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
     release = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
+    test_install = next(
+        step for step in tests["jobs"]["test"]["steps"] if step.get("name") == "Install"
+    )
+    assert test_install["env"] == expected_env
+    assert (
+        'uv python install --managed-python "${{ matrix.python }}"'
+        in test_install["run"]
+    )
+    assert (
+        'uv sync --frozen --extra dev --managed-python --python "${{ matrix.python }}"'
+        in test_install["run"]
+    )
+
     managed_steps = (
-        next(
-            step
-            for step in tests["jobs"]["test"]["steps"]
-            if step.get("name") == "Install"
-        ),
         next(
             step
             for step in tests["jobs"]["wheel-smoke"]["steps"]
@@ -149,3 +162,24 @@ def test_ci_uses_scoped_managed_python_for_sqlite_baseline() -> None:
     tests_text = (ROOT / ".github/workflows/tests.yml").read_text()
     assert '.venv/bin/python -m venv --clear "$WHEEL_SMOKE_VENV"' in tests_text
     assert '.venv/bin/python -m venv --clear "$FLAT_SMOKE_VENV"' in tests_text
+    assert '.venv/bin/python -m venv --clear "$SDIST_SMOKE_VENV"' in tests_text
+
+
+def test_ci_covers_declared_minimum_and_current_python() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
+    matrix = workflow["jobs"]["test"]["strategy"]["matrix"]
+    assert matrix["python"] == ["3.10.19", "3.12.11"]
+    assert workflow["jobs"]["test"]["strategy"]["fail-fast"] is False
+
+
+def test_droid_tag_uses_the_minimum_oidc_permission_for_its_pinned_action() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/droid.yml").read_text())
+    job = workflow["jobs"]["droid"]
+    assert job["permissions"] == {
+        "contents": "read",
+        "pull-requests": "write",
+        "issues": "write",
+        "actions": "read",
+        "id-token": "write",
+    }
+    assert "github.actor == github.repository_owner" in job["if"]

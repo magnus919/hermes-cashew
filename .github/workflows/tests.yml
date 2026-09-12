@@ -18,6 +18,13 @@ jobs:
     # Use self-hosted runner for same-repo PRs and pushes; GitHub-hosted for fork PRs
     # (fork PRs on self-hosted runners are a security risk — arbitrary code execution)
     runs-on: ${{ fromJSON(github.event.pull_request.head.repo.fork && '["ubuntu-latest"]' || '["self-hosted","linux","x64","hermes-cashew","docker"]') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # pyproject.toml declares Python 3.10 as the floor. Exercise that floor
+        # and the current locked CI runtime; intermediate minors are covered by
+        # normal dependency resolution but are not a release support promise.
+        python: ["3.10.19", "3.12.11"]
     env:
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
@@ -27,7 +34,7 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
 
       - name: Install
         env:
@@ -35,8 +42,8 @@ jobs:
           UV_PYTHON_BIN_DIR: ${{ runner.temp }}/uv-python-bin
         run: |
           python -m pip install "uv==0.11.18"
-          uv python install --managed-python "3.12.11"
-          uv sync --frozen --extra dev --managed-python --python "3.12.11"
+          uv python install --managed-python "${{ matrix.python }}"
+          uv sync --frozen --extra dev --managed-python --python "${{ matrix.python }}"
         timeout-minutes: 5
 
       - name: Verify Cashew source and SQLite migration capability
@@ -55,7 +62,9 @@ jobs:
         run: .venv/bin/ruff check plugins/memory/cashew/ tests/ --output-format=github
 
       - name: Type check with mypy
-        run: .venv/bin/mypy --explicit-package-bases plugins/memory/cashew/
+        run: |
+          .venv/bin/python scripts/check-recursive-symlinks.py plugins/memory/cashew/
+          .venv/bin/mypy --explicit-package-bases plugins/memory/cashew/
 
       - name: Dead code detection with vulture
         run: .venv/bin/vulture plugins/memory/cashew/ --min-confidence 80
@@ -129,6 +138,7 @@ jobs:
           uv python install --managed-python "3.12.11"
           uv sync --frozen --extra dev --managed-python --python "3.12.11"
           .venv/bin/python -m build
+          .venv/bin/python scripts/verify-distributions.py dist/*
 
       - name: CI-02 — install wheel into clean venv and verify discovery
         run: |
@@ -137,8 +147,17 @@ jobs:
           .venv/bin/python -m venv --clear "$WHEEL_SMOKE_VENV"
           {
             "$WHEEL_SMOKE_VENV/bin/pip" install dist/*.whl
-            "$WHEEL_SMOKE_VENV/bin/python" -c "import plugins.memory.cashew; print(plugins.memory.cashew.__file__)"
-            "$WHEEL_SMOKE_VENV/bin/python" scripts/verify-cashew-baseline.py
+            (
+              cd "$RUNNER_TEMP"
+              "$WHEEL_SMOKE_VENV/bin/python" -c "
+          from pathlib import Path
+          import plugins.memory.cashew
+          loaded = Path(plugins.memory.cashew.__file__).resolve()
+          assert '$GITHUB_WORKSPACE' not in str(loaded), loaded
+          print(f'wheel import: {loaded}')
+          "
+              "$WHEEL_SMOKE_VENV/bin/python" "$GITHUB_WORKSPACE/scripts/verify-cashew-baseline.py"
+            )
             "$WHEEL_SMOKE_VENV/bin/python" -c "
           import importlib.metadata as im
           eps = list(im.entry_points(group='hermes_agent.plugins'))
@@ -147,6 +166,36 @@ jobs:
           print('OK — entry point discoverable')
           "
           } 2>&1 | tee wheel-smoke.log
+
+      - name: CI-02 — install sdist and exercise flat cron registration outside checkout
+        run: |
+          set -o pipefail
+          SDIST_SMOKE_VENV="$RUNNER_TEMP/hermes-cashew-sdist-smoke"
+          FLAT_SMOKE_HOME="$RUNNER_TEMP/hermes-cashew-flat-profile"
+          FLAT_UNPACKED="$RUNNER_TEMP/hermes-cashew-flat-source"
+          .venv/bin/python -m venv --clear "$SDIST_SMOKE_VENV"
+          {
+            "$SDIST_SMOKE_VENV/bin/pip" install dist/*.tar.gz
+            (
+              cd "$RUNNER_TEMP"
+              "$SDIST_SMOKE_VENV/bin/python" -c "
+          from pathlib import Path
+          import plugins.memory.cashew
+          loaded = Path(plugins.memory.cashew.__file__).resolve()
+          assert '$GITHUB_WORKSPACE' not in str(loaded), loaded
+          print(f'sdist import: {loaded}')
+          "
+              "$SDIST_SMOKE_VENV/bin/python" "$GITHUB_WORKSPACE/scripts/verify-cashew-baseline.py"
+            )
+            mkdir -p "$FLAT_UNPACKED" "$FLAT_SMOKE_HOME/plugins"
+            tar -xzf dist/*.tar.gz -C "$FLAT_UNPACKED" --strip-components=1
+            mv "$FLAT_UNPACKED" "$FLAT_SMOKE_HOME/plugins/cashew"
+            (
+              cd "$RUNNER_TEMP"
+              "$SDIST_SMOKE_VENV/bin/python" "$GITHUB_WORKSPACE/scripts/smoke-flat-install.py" \
+                "$FLAT_SMOKE_HOME/plugins/cashew" "$FLAT_SMOKE_HOME"
+            )
+          } 2>&1 | tee sdist-smoke.log
 
       - name: Install flat-manifest dependency and verify update and rollback
         run: |
@@ -186,7 +235,7 @@ jobs:
 
       - name: CI-03 (wheel-smoke) — fail if embedding model was downloaded during wheel install/import
         run: |
-          if grep -E 'Downloading.*MiniLM' wheel-smoke.log flat-smoke.log; then
+          if grep -E 'Downloading.*MiniLM' wheel-smoke.log flat-smoke.log sdist-smoke.log; then
             echo "::error::Embedding model download detected during wheel smoke — offline env bypassed"
             exit 1
           fi

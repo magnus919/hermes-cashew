@@ -24,6 +24,7 @@ import pathlib
 import shutil
 import sys
 import tempfile
+from typing import Any
 
 _os.environ.setdefault("HF_HUB_OFFLINE", "1")
 _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -39,7 +40,49 @@ def _error(msg: str) -> None:
     sys.exit(1)
 
 
-def main() -> int:
+def _check_health_status(
+    provider: Any, hermes_home: pathlib.Path, tmp_dir: str
+) -> None:
+    """Validate the diagnostic snapshot without exposing profile details."""
+    status = provider.health_status()
+    if status.get("state") not in {"ready", "degraded"}:
+        _error(
+            "health_status() did not report an operational state: "
+            f"{status.get('state')}"
+        )
+    if status.get("generation") != 1:
+        _error(
+            "health_status() reported unexpected generation: "
+            f"{status.get('generation')}"
+        )
+    runtime = status.get("runtime", {})
+    if not runtime.get("config_loaded") or not runtime.get("retriever_ready"):
+        _error("health_status() did not report initialized runtime")
+    if not status.get("work", {}).get("reconciled"):
+        _error("health_status() reported unreconciled work")
+    encoded_status = json.dumps(status, sort_keys=True, allow_nan=False)
+    if str(hermes_home) in encoded_status or tmp_dir in encoded_status:
+        _error("health_status() leaked a temporary profile path")
+
+
+def _check_tool_health(provider: Any) -> None:
+    """Confirm synchronous tool work appears in diagnostics."""
+    status = provider.health_status()
+    if status.get("tools", {}).get("extract_completed") != 1:
+        _error("health_status() did not account for cashew_extract")
+
+
+def _check_stopped_health(provider: Any) -> None:
+    """Confirm shutdown publishes the terminal diagnostic state."""
+    status = provider.health_status()
+    if status.get("state") != "stopped":
+        _error(
+            "health_status() did not report stopped state: "
+            f"{status.get('state')}"
+        )
+
+
+def main() -> int:  # noqa: C901 - verifier keeps its user-facing failure prefixes together
     """Run the smoke test.
 
     Creates a temp hermes_home, initializes the provider, runs through
@@ -81,6 +124,13 @@ def main() -> int:
             _error("is_available() returned False after successful initialize")
 
         try:
+            _check_health_status(provider, hermes_home, tmp_dir)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            _error(f"health_status raised {type(exc).__name__}: {exc}")
+
+        try:
             result = provider.prefetch("test query")
             if not isinstance(result, str):
                 _error(f"prefetch returned {type(result).__name__}, expected str")
@@ -107,9 +157,23 @@ def main() -> int:
             _error(f"get_tool_schemas raised {type(exc).__name__}: {exc}")
 
         try:
+            _check_tool_health(provider)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            _error(f"health_status after tools raised {type(exc).__name__}: {exc}")
+
+        try:
             provider.shutdown()
         except Exception as exc:
             _error(f"shutdown raised {type(exc).__name__}: {exc}")
+
+        try:
+            _check_stopped_health(provider)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            _error(f"health_status after shutdown raised {type(exc).__name__}: {exc}")
 
         print("[cashew] verify: all checks passed")
         return 0

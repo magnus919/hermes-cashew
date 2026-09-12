@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 _LENGTH = struct.Struct("!I")
 _MAX_FRAME = 16 * 1024 * 1024
 _MAX_DIMENSION = 65536
+# ``json.dumps`` may expand one UTF-8 byte to a six-byte ``\\uXXXX`` escape.
+# Reserve one KiB for the fixed request envelope before allocating that JSON.
+_MAX_ENCODE_TEXT_BYTES = (_MAX_FRAME - 1024) // 6
 _OWNER_LOCK = threading.Lock()
 _OWNER: EmbeddingSupervisor | None = None
 _CALLER_WAIT: contextvars.ContextVar[float | None] = contextvars.ContextVar(
@@ -485,11 +488,18 @@ class EmbeddingSupervisor:
             import numpy as np
 
             return np.zeros((0, self.dimension), dtype=np.float32)
-        if len(texts) > 100 or any(
-            not isinstance(text, str) or len(text.encode("utf-8")) > 1048576
-            for text in texts
-        ):
+        if len(texts) > 100:
             raise EmbeddingUnavailable(EmbeddingFailure.PROTOCOL)
+        total_text_bytes = 0
+        for text in texts:
+            if not isinstance(text, str):
+                raise EmbeddingUnavailable(EmbeddingFailure.PROTOCOL)
+            text_bytes = len(text.encode("utf-8"))
+            if text_bytes > 1048576:
+                raise EmbeddingUnavailable(EmbeddingFailure.PROTOCOL)
+            total_text_bytes += text_bytes
+            if total_text_bytes > _MAX_ENCODE_TEXT_BYTES:
+                raise EmbeddingUnavailable(EmbeddingFailure.PROTOCOL)
         request_id = uuid.uuid4().hex
         request_payload = json.dumps(
             {

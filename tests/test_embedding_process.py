@@ -133,6 +133,56 @@ def test_oversize_batch_does_not_poison_healthy_worker(
         supervisor.close()
 
 
+def test_control_text_aggregate_rejected_before_json_lock_or_worker_mutation(
+    tmp_path: Path,
+    child_python: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = _supervisor(tmp_path, device="auto", backoff_base=1.0)
+    request_lock = supervisor._request_lock
+    real_json_dumps = embedding_process.json.dumps
+    try:
+        assert supervisor.encode(["ready"]).shape == (1, 4)
+        process = supervisor._process
+        assert process is not None
+        initial_state = (
+            supervisor._failure_count,
+            supervisor._next_start,
+            supervisor._launch_device,
+            supervisor.effective_device,
+        )
+
+        def unexpected_json(*_args: object, **_kwargs: object) -> str:
+            pytest.fail("oversize control text reached json.dumps")
+
+        class UnexpectedLock:
+            def acquire(self, *args: object, **kwargs: object) -> bool:
+                pytest.fail("oversize control text reached request lock")
+
+            def release(self) -> None:
+                pytest.fail("oversize control text released request lock")
+
+        monkeypatch.setattr(embedding_process.json, "dumps", unexpected_json)
+        supervisor._request_lock = UnexpectedLock()  # type: ignore[assignment]
+        maximum_control_text = "\0" * 1048576
+        with pytest.raises(EmbeddingUnavailable) as raised:
+            supervisor.encode([maximum_control_text] * 3)
+
+        assert raised.value.reason is EmbeddingFailure.PROTOCOL
+        assert supervisor._process is process
+        assert process.poll() is None
+        assert (
+            supervisor._failure_count,
+            supervisor._next_start,
+            supervisor._launch_device,
+            supervisor.effective_device,
+        ) == initial_state
+    finally:
+        supervisor._request_lock = request_lock
+        monkeypatch.setattr(embedding_process.json, "dumps", real_json_dumps)
+        supervisor.close()
+
+
 def test_unknown_dimension_comes_only_from_worker_handshake(
     tmp_path: Path, child_python: Path
 ) -> None:

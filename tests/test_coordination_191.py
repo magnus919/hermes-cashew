@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import multiprocessing
 import sqlite3
 import threading
+import time
 import types
 from hashlib import sha256
+from pathlib import Path
 
 import pytest
 
@@ -30,6 +33,83 @@ from plugins.memory.cashew.locking import (
     try_maintenance_lock,
     verify_readonly_profile,
 )
+
+
+def _hold_transferred_admission(graph: str, cache: str, ready) -> None:
+    """Child helper used to prove kernel release after abrupt process death."""
+    with admit_operation(
+        graph_path=graph,
+        cache_path=cache,
+        exclusive=True,
+        cache_exclusive=True,
+        deadline=2.0,
+    ):
+        ready.set()
+        time.sleep(30)
+
+
+def _run_think_process(
+    db_path: str,
+    control,
+    calls_path: str,
+    entered_path: str,
+    crash: bool = False,
+    recover: bool = False,
+) -> None:
+    """Exercise the production think caller with only the opaque model mocked."""
+    import core.session
+
+    from plugins.memory.cashew import CashewMemoryProvider
+    from plugins.memory.cashew.config import CashewConfig
+
+    provider = CashewMemoryProvider()
+    provider._db_path = Path(db_path)
+    provider._config = CashewConfig(
+        embedding_model="model-a", think_cycles=True, think_interval=1
+    )
+    provider._cache_writes_disabled = True
+    provider._embedding_identity_ready = True
+    provider._embedding_generation = "g1"
+    provider._runtime_epoch = 1
+    provider._embedding_supervisor = types.SimpleNamespace(
+        dimension=384, generation="g1"
+    )
+    provider._model_fn = lambda _prompt: ""
+    if recover:
+        provider._recover_think_claim(Path(db_path))
+
+    def opaque_think(**_kwargs):
+        with open(calls_path, "a", encoding="utf-8") as stream:
+            stream.write("call\n")
+        Path(entered_path).write_text("entered", encoding="utf-8")
+        control.send("entered")
+        if crash:
+            import os
+
+            os._exit(23)
+        assert control.poll(15)
+        assert control.recv() == "release"
+        return types.SimpleNamespace(new_nodes=[], new_edges=[])
+
+    core.session.think_cycle = opaque_think
+    provider._run_think_cycle_if_due()
+    control.send("done")
+
+
+def _prepare_think_db(db: Path) -> None:
+    with sqlite3.connect(db) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE thought_nodes (id TEXT PRIMARY KEY, content TEXT);
+            CREATE TABLE hermes_provider_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO hermes_provider_meta VALUES ('embedding_model', 'model-a');
+            INSERT INTO hermes_provider_meta VALUES ('embedding_dim', '384');
+            INSERT INTO hermes_provider_meta VALUES ('vec_dim', '384');
+            INSERT INTO hermes_provider_meta VALUES ('maintenance_epoch', '1');
+            INSERT INTO hermes_provider_meta VALUES ('think_counter', '0');
+            INSERT INTO hermes_provider_meta VALUES ('think_claim_state', 'none');
+            """
+        )
 
 
 @pytest.mark.parametrize(
@@ -77,10 +157,18 @@ def test_affected_existing_wal_is_write_refused(tmp_path, monkeypatch):
     db = tmp_path / "existing-wal.db"
     with sqlite3.connect(db) as conn:
         assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    tracked = {
+        path: sha256(path.read_bytes()).hexdigest()
+        for path in (db, Path(f"{db}-wal"), Path(f"{db}-shm"))
+        if path.exists()
+    }
     monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 50, 4))
     with sqlite3.connect(db) as conn:
         with pytest.raises(SQLiteWALUnsupportedError, match="existing WAL"):
             guard_sqlite_journal(conn)
+    assert {
+        path: sha256(path.read_bytes()).hexdigest() for path in tracked if path.exists()
+    } == tracked
 
 
 def test_cache_only_admission_does_not_require_graph_lock(tmp_path):
@@ -251,6 +339,175 @@ def test_transferred_admission_holds_and_releases_both_leases(tmp_path):
         assert cache_lease is not None
 
 
+def test_admission_leases_are_released_by_kernel_after_process_death(tmp_path):
+    """A killed async owner cannot strand either ordered lease."""
+    graph = tmp_path / "brain.db"
+    cache = tmp_path / "cache.db"
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    child = context.Process(
+        target=_hold_transferred_admission,
+        args=(str(graph), str(cache), ready),
+    )
+    child.start()
+    try:
+        assert ready.wait(timeout=5)
+        child.terminate()
+        child.join(timeout=5)
+        assert child.exitcode is not None
+        with try_maintenance_lock(graph) as graph_lease:
+            assert graph_lease is not None
+        with try_maintenance_lock(cache) as cache_lease:
+            assert cache_lease is not None
+    finally:
+        if child.is_alive():
+            child.kill()
+            child.join(timeout=5)
+
+
+def test_async_admission_start_failure_releases_transferred_owner_once(
+    tmp_path, monkeypatch
+):
+    """Daemon startup failure closes the transferred graph/cache owner exactly once."""
+    import plugins.memory.cashew.sleep_refactor as sleep_module
+
+    graph = tmp_path / "brain.db"
+    cache = tmp_path / "cache.db"
+
+    class FailingThread:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+        def start(self):
+            raise RuntimeError("thread start failed")
+
+    monkeypatch.setattr(sleep_module.threading, "Thread", FailingThread)
+    with admit_operation(
+        graph_path=graph,
+        cache_path=cache,
+        exclusive=True,
+        cache_exclusive=True,
+    ) as admission:
+        with pytest.raises(RuntimeError, match="thread start failed"):
+            sleep_module._run_dream_async(
+                str(graph),
+                [],
+                model_fn=None,
+                admission=admission,
+            )
+        assert admission.lease_owner is not None
+        admission.lease_owner.close()
+    with try_maintenance_lock(graph) as graph_lease:
+        assert graph_lease is not None
+    with try_maintenance_lock(cache) as cache_lease:
+        assert cache_lease is not None
+
+
+def test_two_process_think_claim_has_one_opaque_call_and_no_duplicate(
+    tmp_path, monkeypatch
+):
+    """The real provider claim transaction serializes two pinned-host callers."""
+    del monkeypatch
+    db = tmp_path / "think.db"
+    _prepare_think_db(db)
+    calls = tmp_path / "calls.log"
+    context = multiprocessing.get_context("spawn")
+    first_control, first_child = context.Pipe()
+    second_control, second_child = context.Pipe()
+    first_entered = tmp_path / "first.entered"
+    second_entered = tmp_path / "second.entered"
+    first = context.Process(
+        target=_run_think_process,
+        args=(str(db), first_child, str(calls), str(first_entered)),
+    )
+    second = context.Process(
+        target=_run_think_process,
+        args=(str(db), second_child, str(calls), str(second_entered)),
+    )
+    first.start()
+    second.start()
+    try:
+        deadline = time.monotonic() + 15
+        while not first_entered.exists() and not second_entered.exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        selected_control = first_control if first_entered.exists() else second_control
+        other_entered = second_entered if first_entered.exists() else first_entered
+        assert selected_control.poll(2)
+        assert selected_control.recv() == "entered"
+        selected_control.send("release")
+        first.join(timeout=15)
+        second.join(timeout=15)
+        assert first.exitcode == 0
+        assert second.exitcode == 0
+        assert not other_entered.exists()
+        assert selected_control.poll(2)
+        assert selected_control.recv() == "done"
+        assert calls.read_text().splitlines() == ["call"]
+        with sqlite3.connect(db) as conn:
+            assert conn.execute(
+                "SELECT value FROM hermes_provider_meta WHERE key='think_claim_state'"
+            ).fetchone() == ("failed",)
+    finally:
+        if first.is_alive():
+            first.kill()
+            first.join(timeout=5)
+        if second.is_alive():
+            second.kill()
+            second.join(timeout=5)
+
+
+def test_crashed_think_claim_is_recovered_as_uncertain_before_next_call(tmp_path):
+    """A restart observes an abandoned claim and blocks replay until resolution."""
+    db = tmp_path / "think-crash.db"
+    _prepare_think_db(db)
+    calls = tmp_path / "calls.log"
+    context = multiprocessing.get_context("spawn")
+    control, child_control = context.Pipe()
+    entered_path = tmp_path / "crashed.entered"
+    crashed = context.Process(
+        target=_run_think_process,
+        args=(str(db), child_control, str(calls), str(entered_path), True),
+    )
+    crashed.start()
+    try:
+        deadline = time.monotonic() + 15
+        while not entered_path.exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert control.poll(2)
+        assert control.recv() == "entered"
+        crashed.join(timeout=15)
+        assert crashed.exitcode == 23
+        restarted_control, restarted_child = context.Pipe()
+        restarted_entered = tmp_path / "restarted.entered"
+        restarted = context.Process(
+            target=_run_think_process,
+            args=(
+                str(db),
+                restarted_child,
+                str(calls),
+                str(restarted_entered),
+                False,
+                True,
+            ),
+        )
+        restarted.start()
+        restarted.join(timeout=15)
+        assert restarted.exitcode == 0
+        assert restarted_control.poll()
+        assert restarted_control.recv() == "done"
+        assert calls.read_text().splitlines() == ["call"]
+        with sqlite3.connect(db) as conn:
+            assert conn.execute(
+                "SELECT value FROM hermes_provider_meta WHERE key='think_claim_state'"
+            ).fetchone() == ("uncertain",)
+    finally:
+        if crashed.is_alive():
+            crashed.kill()
+            crashed.join(timeout=5)
+
+
 def test_readonly_profile_verifies_persisted_identity_and_dimensions(tmp_path):
     db = tmp_path / "readonly.db"
     with sqlite3.connect(db) as conn:
@@ -418,6 +675,53 @@ def test_admitted_busy_failure_is_not_replayed(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="not replayable"):
         provider._drain_once(("u", "a", "s"))
     assert calls == 1
+
+
+def test_unknown_upstream_failure_is_uncertain_and_not_replayed(tmp_path, monkeypatch):
+    """Unknown progress stays uncertain and cannot be replayed automatically."""
+    db = tmp_path / "brain.db"
+    with sqlite3.connect(db) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE thought_nodes (id TEXT PRIMARY KEY);
+            CREATE TABLE hermes_provider_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            """
+        )
+    provider = CashewMemoryProvider()
+    provider._db_path = db
+    provider._config = CashewConfig(embedding_model="all-MiniLM-L6-v2")
+    provider._cache_writes_disabled = True
+    provider._embedding_identity_ready = True
+    provider._embedding_supervisor = types.SimpleNamespace(
+        dimension=384, generation="g1"
+    )
+    calls = 0
+
+    def swallowed_progress(**_kwargs):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("upstream outcome unavailable")
+
+    monkeypatch.setattr("core.session.end_session", swallowed_progress, raising=False)
+    ledger = provider._outcomes
+    ledger.admit()
+    ledger.start()
+    with pytest.raises(RuntimeError, match="not replayable") as caught:
+        provider._drain_once(("user", "assistant", "session"))
+    provider._fail_worker_turn(ledger, provider._health_generation, caught.value)
+    assert calls == 1
+    assert ledger.work_snapshot() == {
+        "accepted": 1,
+        "completed": 0,
+        "failed": 0,
+        "dropped": 0,
+        "rejected": 0,
+        "pending": 0,
+        "in_flight": 0,
+        "reconciled": True,
+        "partial": 0,
+        "uncertain": 1,
+    }
 
 
 def test_opaque_upstream_prefix_is_partial_and_unknown_is_not_replayed(

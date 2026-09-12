@@ -907,6 +907,55 @@ def test_migration_overlap_preserves_observed_stale_vec_dimension(
     _assert_consistent(home / "brain.db")
 
 
+def test_real_admitted_writer_serializes_before_pinned_migration(
+    tmp_path: Path,
+) -> None:
+    """A real upstream writer admitted before migration cannot publish stale vectors."""
+    home = tmp_path / "shared"
+    assert _extract(home, "migration-admitted-seed")["ok"] is True
+    overlap = tmp_path / "admitted-overlap"
+    overlap.mkdir()
+    writer = _start(home, "admitted-old-writer", "extract_embed_barrier")
+    migration = _start(home, "migration", "migration", overlap)
+    try:
+        _send(writer, "start")
+        _event(writer, "entered_upstream_write")
+        _send(writer, "write")
+        _event(writer, "writer_embeddings_snapshotted")
+
+        # The writer owns the ordinary graph admission while the real pinned
+        # upstream embedding call is paused. Maintenance must wait for that
+        # accepted call instead of migrating around it.
+        _send(migration, "start")
+        migration_result = _result(migration)
+        assert migration_result["outcome"] == "deferred_by_concurrent_writer"
+        assert not (overlap / "phase_started").exists()
+
+        _send(writer, "resume_embeddings")
+        writer_result = _result(writer)
+        assert writer_result["ok"] is True
+        migration = _start(home, "migration-after-writer", "migration", overlap)
+        _send(migration, "start")
+        _event(migration, "maintenance_locked")
+        _send(migration, "release")
+        migration_result = _result(migration)
+        assert migration_result["completed"] is True
+        assert migration_result["dimensions_after"] == [[384], 384]
+    finally:
+        _terminate(writer)
+        _terminate(migration)
+
+    with sqlite3.connect(home / "brain.db") as conn:
+        assert conn.execute(
+            "SELECT DISTINCT LENGTH(vector) / 4 FROM embeddings"
+        ).fetchall() == [(384,)]
+        assert conn.execute("SELECT DISTINCT model FROM embeddings").fetchall() == [
+            ("thenlper/gte-small",)
+        ]
+    assert any("admitted-old-writer" in value for value in _markers(home / "brain.db"))
+    _assert_consistent(home / "brain.db")
+
+
 def test_real_sqlite_write_lock_reports_extract_failure_within_timeout(
     tmp_path: Path,
 ) -> None:

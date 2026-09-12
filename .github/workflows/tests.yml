@@ -106,8 +106,6 @@ jobs:
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
       HF_DATASETS_OFFLINE: "1"
-      WHEEL_SMOKE_VENV: ${{ runner.temp }}/hermes-cashew-wheel-smoke
-      FLAT_SMOKE_VENV: ${{ runner.temp }}/hermes-cashew-flat-smoke
     steps:
       - uses: actions/checkout@v7
 
@@ -124,6 +122,7 @@ jobs:
       - name: CI-02 — install wheel into clean venv and verify discovery
         run: |
           set -o pipefail
+          WHEEL_SMOKE_VENV="$RUNNER_TEMP/hermes-cashew-wheel-smoke"
           python -m venv --clear "$WHEEL_SMOKE_VENV"
           {
             "$WHEEL_SMOKE_VENV/bin/pip" install dist/*.whl
@@ -141,6 +140,7 @@ jobs:
       - name: Install flat-manifest dependency and verify update and rollback
         run: |
           set -o pipefail
+          FLAT_SMOKE_VENV="$RUNNER_TEMP/hermes-cashew-flat-smoke"
           FLAT_DEP="$(.venv/bin/python -c "import yaml; print(next(d for d in yaml.safe_load(open('plugin.yaml'))['pip_dependencies'] if d.startswith('cashew-brain ')))")"
           python -m venv --clear "$FLAT_SMOKE_VENV"
           {

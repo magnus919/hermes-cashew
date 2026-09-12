@@ -25,7 +25,7 @@ import stat
 import tempfile
 import threading
 from collections.abc import Iterator
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 logger = logging.getLogger(__name__)
 
@@ -48,13 +48,11 @@ class _AuxiliaryCallGate:
 # names. Keep the process-wide budget on builtins so those aliases cannot each
 # admit their own set of late backend threads.
 _AUXILIARY_GATE_KEY = "_hermes_cashew_auxiliary_call_gate_v1"
-_AUXILIARY_CALL_GATE = getattr(builtins, _AUXILIARY_GATE_KEY, None)
-if not (
-    hasattr(_AUXILIARY_CALL_GATE, "lock")
-    and hasattr(_AUXILIARY_CALL_GATE, "outstanding")
-):
-    _AUXILIARY_CALL_GATE = _AuxiliaryCallGate()
-    setattr(builtins, _AUXILIARY_GATE_KEY, _AUXILIARY_CALL_GATE)
+_auxiliary_gate = getattr(builtins, _AUXILIARY_GATE_KEY, None)
+if not (hasattr(_auxiliary_gate, "lock") and hasattr(_auxiliary_gate, "outstanding")):
+    _auxiliary_gate = _AuxiliaryCallGate()
+    setattr(builtins, _AUXILIARY_GATE_KEY, _auxiliary_gate)
+_AUXILIARY_CALL_GATE = cast(_AuxiliaryCallGate, _auxiliary_gate)
 
 _CONFIG_SAVE_LOCK = threading.RLock()
 """Serialize in-process config writes before taking the profile lock."""

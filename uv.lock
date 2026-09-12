@@ -511,6 +511,7 @@ dev = [
     { name = "pyyaml" },
     { name = "ruff" },
     { name = "sentry-sdk" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
     { name = "vulture" },
 ]
 tracing = [
@@ -540,6 +541,7 @@ requires-dist = [
     { name = "sentry-sdk", marker = "extra == 'dev'", specifier = ">=1.40,<3" },
     { name = "sentry-sdk", marker = "extra == 'tracing'", specifier = ">=1.40,<3" },
     { name = "sqlite-vec" },
+    { name = "tomli", marker = "python_full_version < '3.11' and extra == 'dev'", specifier = ">=2.0" },
     { name = "vulture", marker = "extra == 'dev'", specifier = ">=2.11,<3" },
 ]
 provides-extras = ["dev", "tracing"]

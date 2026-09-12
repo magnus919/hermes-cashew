@@ -886,8 +886,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         worker or exposes a retriever. cashew-brain owns the destructive
         re-embedding operation; this adapter adds detection, a mandatory
         profile-scoped backup, postcondition validation, and rollback. It uses
-        the same advisory lock as the sleep cycle so separate Hermes processes
-        cannot mutate the graph during migration.
+        the same advisory lock as the synchronous sleep cycle so participating
+        maintenance operations do not overlap. Broader writer coordination is
+        deliberately outside this helper's scope.
         """
         lock_path = lock_path_for_db(db_path)
         with try_maintenance_lock(db_path) as lock_fd:

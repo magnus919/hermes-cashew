@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import select
 import subprocess
 import sys
 import time
@@ -34,17 +35,40 @@ def _start_lock_holder(db_path: Path) -> subprocess.Popen[str]:
         stderr=subprocess.PIPE,
         text=True,
     )
-    assert process.stdout is not None
-    assert process.stdout.readline().strip() == "ready"
-    return process
+    try:
+        assert process.stdout is not None
+        readable, _, _ = select.select([process.stdout], [], [], 5)
+        assert readable, "lock holder did not signal readiness within 5 seconds"
+        assert process.stdout.readline().strip() == "ready"
+        return process
+    except BaseException:
+        _stop_lock_holder(process, expect_success=False)
+        raise
 
 
-def _stop_lock_holder(process: subprocess.Popen[str]) -> None:
-    if process.poll() is None:
-        assert process.stdin is not None
-        process.stdin.write("release\n")
-        process.stdin.close()
-    assert process.wait(timeout=5) == 0
+def _stop_lock_holder(
+    process: subprocess.Popen[str], *, expect_success: bool = True
+) -> None:
+    try:
+        if process.poll() is None:
+            assert process.stdin is not None
+            process.stdin.write("release\n")
+            process.stdin.close()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=1)
+        if expect_success:
+            assert process.returncode == 0
+    finally:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
 
 
 def test_active_old_lock_keeps_identity_and_blocks_second_process(
@@ -75,8 +99,11 @@ def test_terminated_holder_releases_without_lock_file_deletion(tmp_path: Path) -
     holder = _start_lock_holder(db_path)
     lock_path = lock_path_for_db(db_path)
     original_inode = lock_path.stat().st_ino
-    holder.terminate()
-    assert holder.wait(timeout=5) != 0
+    try:
+        holder.terminate()
+        assert holder.wait(timeout=5) != 0
+    finally:
+        _stop_lock_holder(holder, expect_success=False)
 
     with try_maintenance_lock(db_path) as recovered:
         assert recovered is not None
@@ -143,16 +170,17 @@ def test_unexpected_lock_acquisition_error_is_not_reported_as_contention(
             pass
 
 
-def test_initialize_respects_held_custom_lock_without_removing_it(
-    tmp_path: Path, monkeypatch
+@pytest.mark.parametrize("configured_path", ["cashew/brain.db", "state/custom.sqlite"])
+def test_initialize_respects_held_aged_lock_without_removing_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, configured_path: str
 ) -> None:
     """Initialization defers migration while a different process holds the DB lock."""
     import plugins.memory.cashew as cashew_module
 
     (tmp_path / "cashew.json").write_text(
-        json.dumps({"cashew_db_path": "state/custom.sqlite"})
+        json.dumps({"cashew_db_path": configured_path})
     )
-    db_path = tmp_path / "state" / "custom.sqlite"
+    db_path = tmp_path / configured_path
     db_path.parent.mkdir()
     holder = _start_lock_holder(db_path)
     lock_path = lock_path_for_db(db_path)

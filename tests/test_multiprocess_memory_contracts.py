@@ -7,6 +7,7 @@ deterministic without replacing persistence with a success stub.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import select
@@ -17,7 +18,21 @@ import time
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from plugins.memory.cashew import CashewMemoryProvider
+
+# The fast suite supports a missing dependency with a core.session stub.
+# These subprocess contracts require the real upstream package instead.
+try:
+    _cashew_spec = importlib.util.find_spec("core.context")
+except ModuleNotFoundError:
+    _cashew_spec = None
+if _cashew_spec is None:
+    pytest.skip(
+        "cashew-brain is required for real-upstream multiprocess contracts",
+        allow_module_level=True,
+    )
 
 _READY_TIMEOUT = 10
 _EXIT_TIMEOUT = 15

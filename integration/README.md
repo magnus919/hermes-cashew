@@ -1,0 +1,59 @@
+# Pinned Hermes integration lane
+
+This lane verifies the provider against real Hermes modules in a separate
+process. It must not run through the repository `tests/conftest.py`, which
+injects a local `MemoryProvider` and `MemoryManager` substitute.
+
+The lane is supported on Python 3.11 through 3.13, matching the pinned Hermes
+source, on the POSIX platforms supported by this plugin. Install the host
+dependencies before running it. The command
+does not install packages, access credentials, or write the real `~/.hermes`.
+
+Prepare the pinned host source from the public immutable archive:
+
+```sh
+set -eu
+REV=990473a79c6b0396b0a648fdd85ee8f7a5c267d3
+SHA256=6c8585bfcb3807b7f0c1038be080429e0465137634745b9e48e11b65a9653bda
+DEST=/tmp/hermes-agent-$REV
+ARCHIVE=/tmp/hermes-agent-$REV.tar.gz
+mkdir -p "$(dirname "$DEST")"
+curl -fL "https://github.com/NousResearch/hermes-agent/archive/$REV.tar.gz" -o "$ARCHIVE"
+printf '%s  %s\n' "$SHA256" "$ARCHIVE" | shasum -a 256 -c -
+rm -rf "$DEST"
+mkdir -p "$DEST"
+tar -xzf "$ARCHIVE" --strip-components=1 -C "$DEST"
+cat > "$DEST/.hermes-source.json" <<EOF
+{"revision":"$REV","archive_sha256":"$SHA256"}
+EOF
+```
+
+Create a separate host environment from the pinned checkout before the
+offline run. Hermes' frozen lock supplies its host dependencies; Cashew's
+runtime artifacts are pinned explicitly:
+
+```sh
+HERMES_TEST_ENV=/tmp/hermes-agent-$REV-venv
+UV_PROJECT_ENVIRONMENT="$HERMES_TEST_ENV" uv sync --frozen --no-install-project --project "$DEST"
+uv pip install --python "$HERMES_TEST_ENV/bin/python" \
+  'cashew-brain==1.2.1' 'sqlite-vec==0.1.9'
+```
+
+Run the lane with the interpreter that has Hermes and Cashew installed:
+
+```sh
+HERMES_PINNED_SOURCE=/tmp/hermes-agent-990473a79c6b0396b0a648fdd85ee8f7a5c267d3 \
+  "$HERMES_TEST_ENV/bin/python" integration/run_pinned_host.py
+```
+
+The command runs both the flat `hermes plugins install` loader and the
+bundled/development loader. A missing or mismatched host source is an explicit
+setup failure. The test patches only the embedding model and external client
+resolution; Hermes loader, `MemoryManager`, `MemoryProvider`, auxiliary task
+routing, and `cron.jobs` remain real imports.
+
+Cron subprocess execution is part of the default command. While issue #186's
+flat-install import fix is being incorporated, the flat scenario exits with an
+actionable failure at that boundary. The development scenario can be run alone
+with `--scenario dev`; the complete default command remains blocked until #186
+is incorporated.

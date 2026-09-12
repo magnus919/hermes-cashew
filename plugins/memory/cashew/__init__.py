@@ -1995,7 +1995,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         """
         return [CASHEW_QUERY_SCHEMA, CASHEW_EXTRACT_SCHEMA]
 
-    def handle_tool_call(self, name: str, args: Dict[str, Any]) -> str:
+    def handle_tool_call(
+        self, name: str, args: Dict[str, Any], **kwargs: Any
+    ) -> str:
         """Route an LLM tool call to the Cashew backend.
 
         Two tools are handled:
@@ -2011,6 +2013,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             envelope, no log (initialize already warned).
           - Any exception during happy path -> WARNING + exc_info=True +
             error envelope.
+
+        ``kwargs`` is accepted for forward compatibility with Hermes' real
+        ``MemoryManager`` dispatch, which supplies session and turn metadata
+        to provider tool handlers.  Cashew tool behavior is unchanged; the
+        current handlers do not need those optional values.
 
         Returns:
             JSON string — NEVER None, NEVER raises into Hermes.

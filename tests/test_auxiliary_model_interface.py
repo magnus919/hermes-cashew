@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import contextvars
 import importlib.util
 import logging
@@ -168,6 +169,22 @@ def test_explicit_auto_role_is_an_allowed_host_opt_in(fake_host, tmp_path):
     assert fake_host.resolved_homes == [str(tmp_path)]
 
 
+def test_optional_host_route_fields_accept_null(fake_host, tmp_path):
+    fake_host.profiles[str(tmp_path)] = {
+        "auxiliary": {
+            "memory": {
+                "provider": "auto",
+                "base_url": None,
+                "api_key": None,
+                "key_env": None,
+            }
+        }
+    }
+    fake_host.client_holder["client"] = _FakeClient(lambda _: _response("[]"))
+
+    assert resolve_model_fn(tmp_path, CashewConfig(llm_aux_role="memory")) is not None
+
+
 def test_raw_config_and_request_exceptions_do_not_log_payloads(
     fake_host, tmp_path, caplog
 ):
@@ -264,6 +281,37 @@ def test_loader_aliases_share_the_process_wide_gate(monkeypatch):
     assert not config_module._claim_auxiliary_call()
     for _ in range(config_module._MAX_OUTSTANDING_AUXILIARY_CALLS):
         config_module._release_auxiliary_call()
+
+
+def test_concurrent_loader_aliases_atomically_share_new_gate(monkeypatch):
+    prior = builtins.__dict__.pop(config_module._AUXILIARY_GATE_KEY, None)
+    barrier = threading.Barrier(2)
+    gates = []
+
+    def load_alias(index):
+        name = f"_cashew_concurrent_alias_{index}"
+        spec = importlib.util.spec_from_file_location(name, config_module.__file__)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        barrier.wait(timeout=1)
+        spec.loader.exec_module(module)
+        gates.append(module._AUXILIARY_CALL_GATE)
+
+    threads = [threading.Thread(target=load_alias, args=(index,)) for index in range(2)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=1)
+            assert not thread.is_alive()
+        assert len(gates) == 2
+        assert gates[0] is gates[1]
+    finally:
+        if prior is not None:
+            builtins.__dict__[config_module._AUXILIARY_GATE_KEY] = prior
+        else:
+            builtins.__dict__.pop(config_module._AUXILIARY_GATE_KEY, None)
 
 
 @pytest.mark.parametrize(

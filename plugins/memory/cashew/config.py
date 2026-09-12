@@ -48,10 +48,15 @@ class _AuxiliaryCallGate:
 # names. Keep the process-wide budget on builtins so those aliases cannot each
 # admit their own set of late backend threads.
 _AUXILIARY_GATE_KEY = "_hermes_cashew_auxiliary_call_gate_v1"
-_auxiliary_gate = getattr(builtins, _AUXILIARY_GATE_KEY, None)
+_auxiliary_gate = builtins.__dict__.setdefault(
+    _AUXILIARY_GATE_KEY, _AuxiliaryCallGate()
+)
 if not (hasattr(_auxiliary_gate, "lock") and hasattr(_auxiliary_gate, "outstanding")):
+    # The private key is only ever populated above. Retain a defensive repair
+    # for a hostile or stale interpreter, while normal loader aliases use the
+    # atomic setdefault path and therefore share one gate.
     _auxiliary_gate = _AuxiliaryCallGate()
-    setattr(builtins, _AUXILIARY_GATE_KEY, _auxiliary_gate)
+    builtins.__dict__[_AUXILIARY_GATE_KEY] = _auxiliary_gate
 _AUXILIARY_CALL_GATE = cast(_AuxiliaryCallGate, _auxiliary_gate)
 
 _CONFIG_SAVE_LOCK = threading.RLock()
@@ -595,16 +600,21 @@ def _raw_role_mapping(role: str) -> bool:
     provider = mapping.get("provider")
     if not isinstance(provider, str) or not provider.strip():
         return False
+    if "model" in mapping and (
+        not isinstance(mapping["model"], str) or not mapping["model"].strip()
+    ):
+        return False
     for field in (
-        "model",
         "base_url",
         "api_key",
         "key_env",
         "api_key_env",
         "api_mode",
     ):
-        if field in mapping and (
-            not isinstance(mapping[field], str) or not mapping[field].strip()
+        if (
+            field in mapping
+            and mapping[field] is not None
+            and not isinstance(mapping[field], str)
         ):
             return False
     return True

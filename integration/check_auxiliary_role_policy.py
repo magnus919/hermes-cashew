@@ -49,7 +49,20 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="cashew-role-policy-") as raw_home:
         home = Path(raw_home)
         _check("auxiliary:\n  memory:\n    provider: auto\n", True, config_module, home)
+        _check(
+            "auxiliary:\n  memory:\n    provider: auto\n    base_url: null\n"
+            "    api_key: null\n    key_env: null\n",
+            True,
+            config_module,
+            home,
+        )
         _check("auxiliary:\n  memory:\n    model: null\n", False, config_module, home)
+        _check(
+            "auxiliary:\n  memory:\n    provider: auto\n    base_url: 42\n",
+            False,
+            config_module,
+            home,
+        )
     print("PASS pinned Hermes auxiliary role policy")
 
 

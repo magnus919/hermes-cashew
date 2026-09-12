@@ -665,8 +665,18 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         "cashew-brain dependency missing"
                     )
                 self._db_path.parent.mkdir(parents=True, exist_ok=True)
+                # Keep the wrapper-owned sqlite-vec migration behind the same
+                # backup boundary as upstream's destructive re-embedding.  In
+                # particular, an old vec table must not be dropped before a
+                # failed embedding repair has a chance to restore it.
                 self._ensure_db_schema(self._db_path)
-                self._repair_embedding_dimension(self._db_path)
+                if self._repair_embedding_dimension(self._db_path):
+                    self._finalize_vec_schema(self._db_path)
+                else:
+                    # Do not expose a vec index whose identity could not be
+                    # proved or restored.  Retrieval remains on upstream's
+                    # non-vector paths and health reports the degradation.
+                    self._vector_available = False
                 self._retriever = ContextRetriever(db_path=str(self._db_path))
                 self._model_fn = self._build_model_fn()
                 # Finish all synchronous setup before publishing the worker.
@@ -1139,7 +1149,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         upstream table creation (thought_nodes, derivation_edges, embeddings,
         hotspots, metrics), column migrations, index creation, and schema
         version stamping (PRAGMA user_version = 3). Then applies hermes-specific
-        extensions (vec_embeddings virtual table for sqlite-vec).
+        extensions (provider metadata).  The sqlite-vec schema is finalized
+        only after the backup-backed embedding repair has succeeded.
         """
         from core.db import ensure_schema
 
@@ -1147,6 +1158,21 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         import sqlite3
 
+        conn = sqlite3.connect(str(db_path))
+        try:
+            # Hermes provider metadata store (persistent counters, flags).
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS hermes_provider_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _finalize_vec_schema(self, db_path: pathlib.Path) -> None:
+        """Apply the reversible-wrapper vec schema work after repair succeeds."""
         conn = sqlite3.connect(str(db_path))
         try:
             self._vector_available = True
@@ -1163,13 +1189,6 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 pass  # sqlite-vec not available at platform level; graceful degradation active
             self._migrate_vec_embeddings(conn)
             self._create_vec_embeddings(conn)
-            # Hermes provider metadata store (persistent counters, flags)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS hermes_provider_meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                )
-            """)
             conn.commit()
         finally:
             conn.close()
@@ -1211,8 +1230,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             target.close()
             source.close()
 
-    def _repair_embedding_dimension(self, db_path: pathlib.Path) -> None:
-        """Back up and re-embed a brain whose stored dimensions are inconsistent.
+    def _repair_embedding_dimension(self, db_path: pathlib.Path) -> bool:
+        """Back up and re-embed a brain whose stored identity is inconsistent.
 
         Migration runs during initialization, before the provider starts its
         worker or exposes a retriever. cashew-brain owns the destructive
@@ -1227,11 +1246,11 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             with try_maintenance_lock(db_path) as lock_fd:
                 if lock_fd is None:
                     logger.warning(
-                        "embedding dimension migration deferred; another Cashew process holds %s",
+                        "embedding migration deferred; another Cashew process holds %s",
                         lock_path,
                     )
-                    return
-                self._repair_embedding_dimension_locked(db_path)
+                    return False
+                return self._repair_embedding_dimension_locked(db_path)
         except MaintenanceLockAcquisitionError:
             if self._embedding_migration_required(db_path):
                 raise
@@ -1240,6 +1259,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 lock_path,
                 exc_info=True,
             )
+            return False
 
     def _active_embedding_dimension(self) -> int | None:
         """Return only a dimension verified by this provider's child worker."""
@@ -1259,6 +1279,21 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 "AND content IS NOT NULL AND TRIM(content) != ''"
             ).fetchall()
             return {str(row[0]) for row in rows}
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _active_embedding_models(db_path: pathlib.Path) -> set[str]:
+        """Return model identities for the live rows a repair must replace."""
+        conn = sqlite3.connect(str(db_path))
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT e.model FROM embeddings e "
+                "JOIN thought_nodes n ON n.id = e.node_id "
+                "WHERE (n.decayed IS NULL OR n.decayed = 0) "
+                "AND n.content IS NOT NULL AND TRIM(n.content) != ''"
+            ).fetchall()
+            return {str(row[0]) for row in rows if row[0] is not None}
         finally:
             conn.close()
 
@@ -1318,6 +1353,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             if expected_dim is None:
                 return True
             stored_dims, vec_dim = self._embedding_dimensions(db_path)
+            stored_models = self._active_embedding_models(db_path)
         except Exception:
             logger.warning(
                 "could not inspect embedding dimensions after lock acquisition failure",
@@ -1327,31 +1363,38 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         stored_mismatch = bool(stored_dims) and stored_dims != {expected_dim}
         vec_mismatch = vec_dim is not None and vec_dim != expected_dim
-        return stored_mismatch or vec_mismatch
+        model_mismatch = bool(stored_models) and stored_models != {
+            self._config.embedding_model
+        }
+        return stored_mismatch or vec_mismatch or model_mismatch
 
-    def _repair_embedding_dimension_locked(self, db_path: pathlib.Path) -> None:
-        """Repair dimensions while the cross-process Cashew lock is held."""
+    def _repair_embedding_dimension_locked(self, db_path: pathlib.Path) -> bool:
+        """Repair embedding identity while the cross-process Cashew lock is held."""
         if self._config is None:
-            return
+            return False
         try:
             expected_dim = self._active_embedding_dimension()
             if expected_dim is None:
                 logger.warning(
                     "embedding dimension unavailable from owned child; migration skipped"
                 )
-                return
+                return False
             stored_dims, vec_dim = self._embedding_dimensions(db_path)
+            stored_models = self._active_embedding_models(db_path)
         except Exception:
             logger.warning(
                 "could not inspect embedding dimensions; migration skipped",
                 exc_info=True,
             )
-            return
+            return False
 
         stored_mismatch = bool(stored_dims) and stored_dims != {expected_dim}
         vec_mismatch = vec_dim is not None and vec_dim != expected_dim
-        if not stored_mismatch and not vec_mismatch:
-            return
+        model_mismatch = bool(stored_models) and stored_models != {
+            self._config.embedding_model
+        }
+        if not stored_mismatch and not vec_mismatch and not model_mismatch:
+            return True
 
         from core.backup import create_backup
 
@@ -1359,13 +1402,15 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         backup = create_backup(str(db_path), str(backup_dir))
         if backup is None:
             logger.warning(
-                "embedding dimension mismatch detected (stored=%s vec=%s expected=%s), "
+                "embedding identity mismatch detected (stored=%s models=%s vec=%s expected=%s/%s), "
                 "but backup failed; migration skipped",
                 sorted(stored_dims),
+                sorted(stored_models),
                 vec_dim,
+                self._config.embedding_model,
                 expected_dim,
             )
-            return
+            return False
 
         backup_path = pathlib.Path(backup)
         expected_ids = self._active_embedding_ids(db_path)
@@ -1412,17 +1457,20 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     db_path,
                     exc_info=True,
                 )
-            return
+            return False
 
         logger.info(
-            "embedding dimension migration complete: stored=%s vec=%s expected=%s "
+            "embedding migration complete: stored=%s models=%s vec=%s expected=%s/%s "
             "nodes_embedded=%s backup=%s",
             sorted(stored_dims),
+            sorted(stored_models),
             vec_dim,
+            self._config.embedding_model,
             expected_dim,
             summary.get("nodes_embedded", 0),
             backup_path,
         )
+        return True
 
     def _migrate_vec_embeddings(self, conn: sqlite3.Connection) -> None:
         """Migrate vec_embeddings from old schema (no node_id, no distance_metric)

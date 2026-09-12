@@ -210,6 +210,9 @@ def test_initialize_survives_acquisition_failure_when_inspection_needs_no_migrat
         CashewMemoryProvider, "_embedding_dimensions", lambda *_: (set(), None)
     )
     monkeypatch.setattr(
+        CashewMemoryProvider, "_active_embedding_models", lambda *_: set()
+    )
+    monkeypatch.setattr(
         CashewMemoryProvider,
         "_repair_embedding_dimension_locked",
         lambda *_: pytest.fail("migration must not run without the maintenance lock"),

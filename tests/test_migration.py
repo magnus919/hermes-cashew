@@ -190,6 +190,45 @@ def _logical_embedding_snapshot(db_path):
         conn.close()
 
 
+def _make_legacy_vec_schema(db_path):
+    """Replace the canonical vec table with the pre-node-id layout."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        _load_sqlite_vec(conn)
+        conn.execute("DROP TABLE vec_embeddings")
+        conn.execute(
+            "CREATE VIRTUAL TABLE vec_embeddings USING vec0(embedding float[384])"
+        )
+        vector = np.ones(384, dtype=np.float32)
+        vector /= np.linalg.norm(vector)
+        conn.execute(
+            "INSERT INTO vec_embeddings (embedding) VALUES (?)", (vector.tobytes(),)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _logical_legacy_vec_snapshot(db_path):
+    """Compare legacy vec state by schema and blob rows, never file bytes."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        _load_sqlite_vec(conn)
+        return {
+            "embeddings": conn.execute(
+                "SELECT node_id, vector, model, updated_at FROM embeddings ORDER BY node_id"
+            ).fetchall(),
+            "vec": conn.execute(
+                "SELECT rowid, embedding FROM vec_embeddings ORDER BY rowid"
+            ).fetchall(),
+            "vec_schema": conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='vec_embeddings'"
+            ).fetchone(),
+        }
+    finally:
+        conn.close()
+
+
 def test_v0_1_0_columns_added(tmp_path):
     """SCHEMA-01 through SCHEMA-03, SCHEMA-07 through SCHEMA-09:
     A v0.1.0 DB gains all missing columns after initialize()."""
@@ -390,6 +429,32 @@ def test_initialize_backs_up_and_migrates_embedding_dimension(tmp_path, monkeypa
         p.shutdown()
 
 
+def test_initialize_finalizes_vec_when_active_identity_already_matches(
+    tmp_path, monkeypatch
+):
+    """A no-op identity inspection still permits the post-repair vec step."""
+    db_path = tmp_path / "cashew" / "brain.db"
+    db_path.parent.mkdir(parents=True)
+    _make_dimension_mismatch_db(db_path)
+    finalized: list[pathlib.Path] = []
+    real_finalize = CashewMemoryProvider._finalize_vec_schema
+
+    def record_finalize(provider, path):
+        finalized.append(path)
+        return real_finalize(provider, path)
+
+    monkeypatch.setattr(CashewMemoryProvider, "_finalize_vec_schema", record_finalize)
+    provider = CashewMemoryProvider()
+    provider.save_config({"embedding_model": "all-MiniLM-L6-v2"}, str(tmp_path))
+    provider.initialize("already-matching", hermes_home=str(tmp_path))
+    try:
+        assert finalized == [db_path]
+        assert provider._vector_available is True
+        assert provider._embedding_dimensions(db_path) == ({384}, 384)
+    finally:
+        provider.shutdown()
+
+
 @pytest.mark.real_embedding_child
 def test_pinned_upstream_migration_uses_owned_child_embedding_boundary(tmp_path):
     """The dd57 migration persists child-produced vectors without a parent model."""
@@ -415,6 +480,34 @@ def test_pinned_upstream_migration_uses_owned_child_embedding_boundary(tmp_path)
             ).fetchone() == ("thenlper/gte-large", 1024)
         finally:
             conn.close()
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.real_embedding_child
+def test_pinned_upstream_migrates_same_dimension_model_identity(tmp_path):
+    """A 384-to-384 model switch is still a destructive identity migration."""
+    core_embeddings = importlib.import_module("core.embeddings")
+    migration_script = importlib.import_module("scripts.migrate_embeddings")
+    importlib.reload(core_embeddings)
+    importlib.reload(migration_script)
+    db_path = tmp_path / "cashew" / "brain.db"
+    db_path.parent.mkdir(parents=True)
+    _make_dimension_mismatch_db(db_path)
+
+    provider = CashewMemoryProvider()
+    provider.save_config({"embedding_model": "thenlper/gte-small"}, str(tmp_path))
+    provider.initialize("real-dd57-same-dimension", hermes_home=str(tmp_path))
+    try:
+        assert provider._embedding_dimensions(db_path) == ({384}, 384)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            assert conn.execute(
+                "SELECT model, LENGTH(vector) / 4 FROM embeddings WHERE node_id='n1'"
+            ).fetchone() == ("thenlper/gte-small", 384)
+        finally:
+            conn.close()
+        assert list((db_path.parent / "backups").glob("graph.db.*"))
     finally:
         provider.shutdown()
 
@@ -451,6 +544,42 @@ def test_failed_embedding_migration_restores_backup(tmp_path, monkeypatch, caplo
     ).fetchone() == ("dimension migration",)
     conn.close()
     assert "restoring pre-migration backup" in caplog.text
+
+
+def test_initialize_failure_restores_legacy_vec_before_wrapper_migration(
+    tmp_path, monkeypatch, caplog
+):
+    """Initialize never drops old vec rows before the repair rollback boundary."""
+    db_path = tmp_path / "cashew" / "brain.db"
+    db_path.parent.mkdir(parents=True)
+    _make_dimension_mismatch_db(db_path)
+    _make_legacy_vec_schema(db_path)
+    before = _logical_legacy_vec_snapshot(db_path)
+
+    def destructive_failure(path, *, confirm, quiet):
+        del confirm, quiet
+        conn = sqlite3.connect(str(path))
+        try:
+            _load_sqlite_vec(conn)
+            conn.execute("DELETE FROM embeddings")
+            conn.execute("DROP TABLE vec_embeddings")
+            conn.commit()
+        finally:
+            conn.close()
+        raise RuntimeError("synthetic migration failure")
+
+    monkeypatch.setattr(
+        "scripts.migrate_embeddings.migrate_embeddings", destructive_failure
+    )
+    provider = CashewMemoryProvider()
+    provider.save_config({"embedding_model": "thenlper/gte-large"}, str(tmp_path))
+    provider.initialize("failed-initialize", hermes_home=str(tmp_path))
+    try:
+        assert _logical_legacy_vec_snapshot(db_path) == before
+        assert provider._vector_available is False
+        assert "restoring pre-migration backup" in caplog.text
+    finally:
+        provider.shutdown()
 
 
 def test_partial_embedding_migration_restores_backup(tmp_path, monkeypatch, caplog):

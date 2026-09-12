@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import ast
+import importlib
 import inspect
+import textwrap
 import threading
 
 import numpy as np
@@ -11,6 +14,7 @@ import pytest
 import plugins.memory.cashew as cashew_module
 from plugins.memory.cashew import (
     _UPSTREAM_COMPATIBILITY_SHIMS,
+    CashewMemoryProvider,
     _bind_upstream_embedding,
     _GenerationBoundEmbeddingService,
 )
@@ -319,9 +323,72 @@ def test_same_model_profiles_keep_distinct_cache_and_late_close_cannot_clobber_b
     assert core.embedding_service._default_service is new_service
 
 
-def test_pinned_upstream_shims_are_bounded_and_have_retirement_provenance() -> None:
-    """Guard the dd57 compatibility seam against a return to class patching."""
+def test_same_model_profiles_do_not_cross_hit_the_upstream_embedding_cache(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Profile-scoped upstream caches stay separate even for one model name."""
     import core.embedding_service
+
+    class FakeSupervisor:
+        instances: list["FakeSupervisor"] = []
+
+        def __init__(self, *, dimension: int, **_kwargs: object) -> None:
+            self.dimension = dimension
+            self.calls: list[list[str]] = []
+            self.instances.append(self)
+
+        def start(self) -> int:
+            return self.dimension
+
+        def serve_generation(self):
+            from contextlib import nullcontext
+
+            return nullcontext()
+
+        def encode(self, texts: list[str], **_kwargs: object) -> np.ndarray:
+            self.calls.append(texts)
+            return np.full(
+                (len(texts), self.dimension), len(self.instances), np.float32
+            )
+
+        def _when_closed(self, callback) -> None:
+            callback()
+
+        def close(self, **_kwargs: object) -> None:
+            return None
+
+    monkeypatch.setattr(cashew_module, "EmbeddingSupervisor", FakeSupervisor)
+    first = CashewMemoryProvider()
+    second = CashewMemoryProvider()
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    first.save_config({"embedding_model": "thenlper/gte-small"}, str(home_a))
+    second.save_config({"embedding_model": "thenlper/gte-small"}, str(home_b))
+    try:
+        first.initialize("a", hermes_home=str(home_a))
+        service_a = core.embedding_service._default_service
+        service_a.embed_np(["same text"])
+        assert FakeSupervisor.instances[0].calls == [["same text"]]
+        first.shutdown()
+
+        second.initialize("b", hermes_home=str(home_b))
+        service_b = core.embedding_service._default_service
+        assert service_b._service.cache.path != service_a._service.cache.path
+        service_b.embed_np(["same text"])
+        assert FakeSupervisor.instances[1].calls == [["same text"]]
+    finally:
+        first.shutdown()
+        second.shutdown()
+
+
+def test_pinned_upstream_shims_are_bounded_and_have_retirement_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guard the dd57 compatibility seam against a return to class patching."""
+    import core.config
+    import core.embedding_service
+
+    monkeypatch.setattr(core.config.config, "embedding_model", "thenlper/gte-large")
 
     assert _UPSTREAM_COMPATIBILITY_SHIMS == (
         "core.config.config.embedding_model",
@@ -334,8 +401,82 @@ def test_pinned_upstream_shims_are_bounded_and_have_retirement_provenance() -> N
     assert "EMBEDDING_DIM" not in source
     assert "LocalBackend" not in source
     assert "DaemonBackend" not in source
-    # Pinned upstream still forces the three documented compatibility seams.
-    assert "get_default_service" in inspect.getsource(core.embedding_service)
-    assert "LocalBackend(name).dim" in inspect.getsource(
-        core.embedding_service.resolve_embedding_dim
+    # The broad offline fixture intentionally replaces this production entry
+    # point. Reload just the pinned module for its source-level contract.
+    core_embeddings = importlib.reload(importlib.import_module("core.embeddings"))
+    migration_script = importlib.reload(
+        importlib.import_module("scripts.migrate_embeddings")
     )
+
+    def calls(function) -> list[ast.Call]:
+        return [
+            node
+            for node in ast.walk(
+                ast.parse(textwrap.dedent(inspect.getsource(function)))
+            )
+            if isinstance(node, ast.Call)
+        ]
+
+    def called_name(call: ast.Call) -> str:
+        if isinstance(call.func, ast.Name):
+            return call.func.id
+        if isinstance(call.func, ast.Attribute):
+            return call.func.attr
+        return ""
+
+    # The pinned dd57 call graph requires the three documented seams.  These
+    # are AST checks so a comment or unrelated helper cannot satisfy them.
+    assert "get_default_service" in {
+        called_name(call) for call in calls(core_embeddings.embed_nodes)
+    }
+    migration_calls = calls(migration_script.detect_mismatch) + calls(
+        migration_script.migrate_embeddings
+    )
+    assert any(
+        called_name(call) == "resolve_embedding_dim"
+        and not call.args
+        and not call.keywords
+        for call in migration_calls
+    )
+    assert "_resolve_default_model" in {called_name(call) for call in migration_calls}
+    resolver_tree = ast.parse(
+        textwrap.dedent(inspect.getsource(core.embedding_service.resolve_embedding_dim))
+    )
+    assert any(
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "LocalBackend"
+        and node.attr == "dim"
+        for node in ast.walk(resolver_tree)
+    )
+
+    def assigned_target(target: ast.expr) -> str | None:
+        def dotted(node: ast.expr) -> str | None:
+            if isinstance(node, ast.Name):
+                return node.id
+            if isinstance(node, ast.Attribute):
+                parent = dotted(node.value)
+                return f"{parent}.{node.attr}" if parent else None
+            return None
+
+        if isinstance(target, ast.Attribute):
+            return dotted(target)
+        if isinstance(target, ast.Subscript):
+            base = dotted(target.value)
+            return f"{base}[model]" if base else None
+        return None
+
+    shim_writes = [
+        assigned_target(target)
+        for node in ast.walk(ast.parse(textwrap.dedent(source)))
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        if assigned_target(target) is not None
+    ]
+    assert len(shim_writes) == 3
+    assert set(shim_writes) == {
+        "core.config.config.embedding_model",
+        "core.embedding_service._KNOWN_DIMS[model]",
+        "core.embedding_service._default_service",
+    }

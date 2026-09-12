@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime
 import math
 import sqlite3
+import threading
 import warnings
 
 import numpy as np
@@ -1397,6 +1398,37 @@ def test_run_dream_async_handles_exception(small_graph):
 
     time.sleep(0.3)
     assert True
+
+
+def test_run_dream_async_captures_owned_client_and_verified_dimension(
+    small_graph, monkeypatch
+):
+    """Deferred work must retain the generation's child client and dimension."""
+    import plugins.memory.cashew.sleep_refactor as sleep
+
+    completed = threading.Event()
+    client = object()
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(sleep, "_generate_dream", lambda *_args, **_kwargs: None)
+
+    def record_orphans(_conn, **kwargs):
+        observed["client"] = kwargs["embedding_client"]
+        observed["dimension"] = kwargs["expected_dimension"]
+        completed.set()
+        return 0
+
+    monkeypatch.setattr(sleep, "_embed_orphans", record_orphans)
+    sleep._run_dream_async(
+        small_graph,
+        [],
+        None,
+        embedding_client=client,
+        expected_dimension=384,
+    )
+
+    assert completed.wait(timeout=2.0)
+    assert observed == {"client": client, "dimension": 384}
 
 
 def test_background_dream_flag_requires_model_fn_and_tuples(small_graph, monkeypatch):

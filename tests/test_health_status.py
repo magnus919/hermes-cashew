@@ -81,13 +81,12 @@ def test_missing_config_uses_defaults_and_reports_runtime(tmp_path):
 
 
 def test_init_vector_unavailable_reports_keyword_degradation(tmp_path, monkeypatch):
-    real_ensure_schema = CashewMemoryProvider._ensure_db_schema
-
-    def schema_without_vec(provider, db_path):
-        real_ensure_schema(provider, db_path)
+    # Vec work is deliberately finalized after backup-backed embedding repair.
+    # Keep this degradation seam at that finalization boundary.
+    def vec_unavailable(provider, _db_path):
         provider._vector_available = False
 
-    monkeypatch.setattr(CashewMemoryProvider, "_ensure_db_schema", schema_without_vec)
+    monkeypatch.setattr(CashewMemoryProvider, "_finalize_vec_schema", vec_unavailable)
     provider = CashewMemoryProvider()
     provider.initialize("vector-health", hermes_home=str(tmp_path))
     try:
@@ -123,7 +122,9 @@ def test_query_outcomes_distinguish_empty_success_from_failure(tmp_path, monkeyp
         lambda *args, **kwargs: [],
     )
     try:
-        result = json.loads(provider.handle_tool_call("cashew_query", {"query": "none"}))
+        result = json.loads(
+            provider.handle_tool_call("cashew_query", {"query": "none"})
+        )
         assert result["ok"] is True
         assert result["node_count"] == 0
         status = provider.health_status()
@@ -145,7 +146,9 @@ def test_vector_failure_reports_keyword_degradation_without_tool_error(
     )
     monkeypatch.setattr(provider, "_keyword_search", lambda *args, **kwargs: [])
     try:
-        result = json.loads(provider.handle_tool_call("cashew_query", {"query": "none"}))
+        result = json.loads(
+            provider.handle_tool_call("cashew_query", {"query": "none"})
+        )
         assert result["ok"] is True
         status = provider.health_status()
         assert status["state"] == "degraded"
@@ -207,7 +210,9 @@ def test_write_disabled_runtime_is_not_reported_unconfigured(tmp_path):
         assert status["state"] in {"ready", "degraded"}
         assert status["state"] != "unconfigured"
         assert status["runtime"]["write_enabled"] is False
-        assert json.loads(provider.handle_tool_call("cashew_extract", {}))["ok"] is False
+        assert (
+            json.loads(provider.handle_tool_call("cashew_extract", {}))["ok"] is False
+        )
     finally:
         provider.shutdown()
 
@@ -263,7 +268,9 @@ def test_late_old_generation_health_finding_cannot_mutate_new_generation(tmp_pat
         provider.shutdown()
 
 
-def test_late_query_failure_cannot_mutate_reinitialized_generation(tmp_path, monkeypatch):
+def test_late_query_failure_cannot_mutate_reinitialized_generation(
+    tmp_path, monkeypatch
+):
     provider = CashewMemoryProvider()
     provider.initialize("query-a", hermes_home=str(tmp_path / "a"))
     entered = threading.Event()
@@ -435,9 +442,7 @@ def test_late_extract_failure_cannot_reverse_completed_shutdown(tmp_path, monkey
         provider.shutdown()
 
 
-def test_worker_failure_during_stopping_cannot_overwrite_timeout(
-    tmp_path, monkeypatch
-):
+def test_worker_failure_during_stopping_cannot_overwrite_timeout(tmp_path, monkeypatch):
     provider = CashewMemoryProvider()
     provider.save_config({"sync_queue_timeout": 0}, str(tmp_path))
     provider.initialize("worker-stopping", hermes_home=str(tmp_path))
@@ -508,6 +513,7 @@ def test_health_publication_is_inside_worker_lifecycle_handoff(tmp_path, monkeyp
     assert not initializer.is_alive()
     assert not shutdown.is_alive()
     assert provider.health_status()["state"] == "stopped"
+
 
 def test_sync_failure_is_accounted_without_changing_hot_path(monkeypatch, tmp_path):
     provider = CashewMemoryProvider()

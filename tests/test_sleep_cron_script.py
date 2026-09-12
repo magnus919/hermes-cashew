@@ -34,11 +34,18 @@ def test_cron_process_waits_for_owned_sleep_phases(tmp_path: Path) -> None:
     )
     (package / "config.py").write_text(
         "from pathlib import Path\n"
+        "class Config:\n"
+        "    cashew_db_path = 'cashew/brain.db'\n"
+        "    sleep_max_nodes = 2000\n"
+        "    embedding_model = 'thenlper/gte-large'\n"
+        "    embedding_device = 'cpu'\n"
+        "def load_config(home):\n"
+        "    return Config()\n"
         "def resolve_db_path(home, raw):\n"
         "    path = Path(home) / raw\n"
         "    path.parent.mkdir(parents=True, exist_ok=True)\n"
         "    return path\n"
-        "def resolve_model_fn(*, hermes_home):\n"
+        "def resolve_model_fn(*, hermes_home, config):\n"
         "    return lambda prompt: 'dream'\n"
     )
     (package / "sleep_refactor.py").write_text(
@@ -107,7 +114,7 @@ def test_main_uses_profile_config_and_prints_cycle_result(
     monkeypatch.setattr(
         config_module,
         "resolve_model_fn",
-        lambda *, hermes_home: model_fn,
+        lambda *, hermes_home, config: model_fn,
     )
 
     def run_sleep_cycle(**kwargs):
@@ -134,6 +141,18 @@ def test_main_uses_profile_config_and_prints_cycle_result(
     ]
 
 
+def test_main_rejects_invalid_shared_config_before_running_sleep_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "cashew.json").write_text(json.dumps({"sleep_max_nodes": -1}))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    with pytest.raises(ValueError, match="sleep_max_nodes must be an integer"):
+        sleep_cron_script.main()
+
+
 def test_helpers_require_home_and_default_missing_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -141,4 +160,6 @@ def test_helpers_require_home_and_default_missing_config(
     with pytest.raises(RuntimeError, match="HERMES_HOME is not set"):
         sleep_cron_script._find_hermes_home()
 
-    assert sleep_cron_script._read_config(tmp_path) == {}
+    assert sleep_cron_script._resolve_db_path(tmp_path, "cashew/brain.db") == str(
+        tmp_path / "cashew" / "brain.db"
+    )

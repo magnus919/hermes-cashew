@@ -105,6 +105,13 @@ EOF
 | `think_cycles` | `true` | Enable periodic insight generation (think cycle) |
 | `think_interval` | `10` | Turns between think cycle runs (0 = disable) |
 
+Cashew validates the effective JSON and `CASHEW_*` configuration before use.
+`recall_k` and `prefetch_k` allow 1–20; `prefetch_cues` allows 0–20;
+`think_interval` allows 0–10,000; `sleep_max_nodes` allows 1–2,000; and
+`sync_queue_timeout` must be finite and between 0 and 300 seconds. Invalid
+JSON or values are left in place so they can be corrected instead of being
+silently overwritten. These numeric ceilings are a new validation policy.
+
 `embedding_device` defaults to `cpu` because native MPS failures can terminate
 the Python process before the plugin can recover. Set it to `auto` to restore
 SentenceTransformer's automatic hardware selection, or to an explicit device

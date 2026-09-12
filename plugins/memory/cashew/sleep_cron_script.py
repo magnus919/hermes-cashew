@@ -37,29 +37,16 @@ def _find_hermes_home() -> Path:
     )
 
 
-def _read_config(hermes_home: Path) -> dict:
-    """Read cashew.json, returning {} if absent."""
-    cfg_path = hermes_home / "cashew.json"
-    if cfg_path.exists():
-        return json.loads(cfg_path.read_text())
-    return {}
-
-
-def _resolve_db_path(hermes_home: Path, config: dict) -> str:
+def _resolve_db_path(hermes_home: Path, db_path_value: str) -> str:
     """Resolve the DB path through the provider's profile-isolation guard."""
     from plugins.memory.cashew.config import resolve_db_path
 
-    raw = config.get("cashew_db_path") or "cashew/brain.db"
-    return str(resolve_db_path(hermes_home, raw))
+    return str(resolve_db_path(hermes_home, db_path_value))
 
 
 def main() -> None:
     """Discover config, import sleep_refactor, run one cycle, print JSON."""
     hermes_home = _find_hermes_home()
-    config = _read_config(hermes_home)
-    limit = config.get("sleep_max_nodes", 2000)
-    embedding_model = config.get("embedding_model", "thenlper/gte-large")
-    embedding_device = config.get("embedding_device", "cpu")
 
     # Ensure the Hermes agent root is on sys.path so imports like
     # plugins.memory.cashew.sleep_refactor resolve correctly.
@@ -75,7 +62,10 @@ def main() -> None:
             sys.path.insert(0, str(candidate.resolve()))
             break
 
-    db_path = _resolve_db_path(hermes_home, config)
+    from plugins.memory.cashew.config import load_config, resolve_model_fn
+
+    config = load_config(hermes_home)
+    db_path = _resolve_db_path(hermes_home, config.cashew_db_path)
 
     try:
         from plugins.memory.cashew.sleep_refactor import run_sleep_cycle
@@ -85,21 +75,18 @@ def main() -> None:
             run_sleep_cycle,  # type: ignore[import-not-found]
         )
 
-    # Resolve the LLM callable from auxiliary config for dream generation.
-    from plugins.memory.cashew.config import resolve_model_fn as _resolve_model_fn
-
-    model_fn = _resolve_model_fn(hermes_home=hermes_home)
+    model_fn = resolve_model_fn(hermes_home=hermes_home, config=config)
 
     result = run_sleep_cycle(
         db_path=db_path,
-        limit=limit,
+        limit=config.sleep_max_nodes,
         model_fn=model_fn,
         # This process owns the scheduled cycle and exits immediately after
         # printing the result. Keep dream generation and orphan embedding
         # synchronous so they complete before interpreter shutdown.
         background_dream=False,
-        embedding_model=embedding_model,
-        embedding_device=embedding_device,
+        embedding_model=config.embedding_model,
+        embedding_device=config.embedding_device,
     )
     print(json.dumps(result, indent=2))
 

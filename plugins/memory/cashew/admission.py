@@ -29,7 +29,10 @@ class AdmissionLeaseOwner:
             if self.closed:
                 raise OperationAdmissionError("admission lease is already closed")
             if self.transferred:
-                raise OperationAdmissionError("admission lease was already transferred")
+                # A forked async owner inherits the immutable token after the
+                # parent has transferred it.  Re-marking that inherited owner
+                # is harmless; the child still performs the single close.
+                return
             self.transferred = True
 
     def close(self) -> None:

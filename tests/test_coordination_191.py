@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import multiprocessing
 import sqlite3
 import threading
 import time
 import types
+from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
 
@@ -134,6 +136,16 @@ def _run_inherited_async_dream(ready) -> None:
         str(admission.graph_path), [], model_fn=None, admission=admission
     )
     time.sleep(30)
+
+
+def _probe_exclusive_leases(graph: str, cache: str, control) -> None:
+    """Report whether an independent process can acquire either lease."""
+    with try_maintenance_lock(graph) as graph_lease:
+        graph_available = graph_lease is not None
+    with try_maintenance_lock(cache) as cache_lease:
+        cache_available = cache_lease is not None
+    control.send((graph_available, cache_available))
+    control.close()
 
 
 @pytest.mark.parametrize(
@@ -511,19 +523,38 @@ def test_async_dream_transfers_exact_token_and_process_death_releases_leases(
         cache_exclusive=True,
     ) as admission:
         _FORK_ADMISSION = admission
+        owner = admission.lease_owner
+        assert owner is not None
+        # Mark ownership transferred before fork.  The child receives the
+        # immutable token and re-enters the idempotent transfer path; the
+        # parent's context will not unlock descriptors still used by the child.
+        owner.transfer()
         child = context.Process(target=_run_inherited_async_dream, args=(ready,))
         child.start()
         try:
             assert ready.wait(timeout=10)
-            assert admission.lease_owner is not None
-            admission.lease_owner.close()
+            # The transferred child owns the exact token and both descriptors;
+            # independent exclusive contenders remain blocked until it exits.
+            probe_context = multiprocessing.get_context("spawn")
+            probe_read, probe_write = probe_context.Pipe(duplex=False)
+            probe = probe_context.Process(
+                target=_probe_exclusive_leases,
+                args=(str(graph), str(cache), probe_write),
+            )
+            probe.start()
+            probe_write.close()
+            assert probe_read.recv() == (False, False)
+            probe.join(timeout=10)
+            assert probe.exitcode == 0
             child.terminate()
             child.join(timeout=10)
             assert child.exitcode is not None
+            owner.close()
         finally:
             if child.is_alive():
                 child.kill()
                 child.join(timeout=10)
+            owner.close()
         _FORK_ADMISSION = None
     with try_maintenance_lock(graph) as graph_lease:
         assert graph_lease is not None
@@ -769,6 +800,138 @@ def test_readonly_verifier_rejects_declared_vec_dimension_mismatch(tmp_path):
         conn.close()
 
 
+def test_affected_provider_rejects_supported_but_malformed_keyword_schema(
+    tmp_path, monkeypatch
+):
+    """A version-stamped profile missing a keyword column is unavailable."""
+    db = tmp_path / "malformed-keyword.db"
+    with sqlite3.connect(db) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE thought_nodes (
+                id TEXT PRIMARY KEY, content TEXT, node_type TEXT, domain TEXT,
+                timestamp TEXT, access_count INTEGER, last_accessed TEXT,
+                source_file TEXT, decayed INTEGER, metadata TEXT, last_updated TEXT,
+                mood_state TEXT, permanent INTEGER, referent_time TEXT
+            );
+            CREATE TABLE derivation_edges (
+                parent_id TEXT, child_id TEXT, weight REAL, reasoning TEXT, timestamp TEXT
+            );
+            CREATE TABLE embeddings (
+                node_id TEXT PRIMARY KEY, vector BLOB, model TEXT, updated_at TEXT
+            );
+            CREATE TABLE hermes_provider_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO hermes_provider_meta VALUES ('embedding_model', 'model-a');
+            INSERT INTO hermes_provider_meta VALUES ('embedding_dim', '4');
+            INSERT INTO hermes_provider_meta VALUES ('vec_dim', '4');
+            INSERT INTO hermes_provider_meta VALUES ('maintenance_epoch', '1');
+            PRAGMA user_version = 3;
+            """
+        )
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 50, 4))
+    with pytest.raises(SQLiteWALUnsupportedError, match="verification failed"):
+        _sqlite_profile_policy(db)
+
+
+def test_cron_revalidates_identity_after_graph_cache_admission(
+    tmp_path, monkeypatch, capsys
+):
+    """A persisted identity change at the lease boundary prevents sleep work."""
+    import plugins.memory.cashew.sleep_cron_script as cron_module
+
+    db = tmp_path / "cron.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE hermes_provider_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        conn.executemany(
+            "INSERT INTO hermes_provider_meta VALUES (?, ?)",
+            [
+                ("embedding_model", "model-a"),
+                ("embedding_dim", "4"),
+                ("vec_dim", "4"),
+                ("maintenance_epoch", "1"),
+            ],
+        )
+
+    class Config:
+        cashew_db_path = str(db)
+        sleep_max_nodes = 10
+        embedding_model = "model-a"
+        embedding_device = "cpu"
+
+    class Supervisor:
+        dimension = 4
+        generation = "cron-generation"
+
+        def __init__(self, **_kwargs):
+            self.closed = False
+
+        def start(self):
+            return self.dimension
+
+        def close(self):
+            self.closed = True
+
+    sleep_calls: list[dict] = []
+    sleep_module = types.SimpleNamespace(
+        __package__="cron_fixture",
+        run_sleep_cycle=lambda **kwargs: sleep_calls.append(kwargs),
+    )
+    config_module = types.SimpleNamespace(
+        load_config=lambda _home: Config(),
+        resolve_db_path=lambda _home, value: value,
+        resolve_model_fn=lambda **_kwargs: None,
+    )
+    process_module = types.SimpleNamespace(EmbeddingSupervisor=Supervisor)
+    filter_module = types.SimpleNamespace(
+        acquire_provider_scrub_filters=lambda: None,
+        release_provider_scrub_filters=lambda: None,
+    )
+    real_admit = admit_operation
+
+    @contextmanager
+    def mutate_at_admission(**kwargs):
+        with real_admit(**kwargs) as token:
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    "UPDATE hermes_provider_meta SET value='model-b' WHERE key='embedding_model'"
+                )
+                conn.commit()
+            yield token
+
+    admission_module = types.SimpleNamespace(
+        admit_operation=mutate_at_admission,
+        OperationAdmissionError=OperationAdmissionError,
+    )
+    locking_module = types.SimpleNamespace(
+        guard_sqlite_journal=lambda _conn: "delete",
+        MaintenanceLockAcquisitionError=OSError,
+        SQLiteWALUnsupportedError=SQLiteWALUnsupportedError,
+    )
+
+    def import_module(name):
+        return {
+            "cron_fixture.log_filter": filter_module,
+            "cron_fixture.embedding_process": process_module,
+            "cron_fixture.admission": admission_module,
+            "cron_fixture.locking": locking_module,
+        }[name]
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        cron_module,
+        "_load_profile_modules",
+        lambda _home: (config_module, sleep_module),
+    )
+    monkeypatch.setattr(cron_module.importlib, "import_module", import_module)
+    cron_module.main()
+    assert json.loads(capsys.readouterr().out) == {}
+    assert sleep_calls == []
+
+
 def test_affected_wal_provider_never_enters_write_or_upstream_paths(
     tmp_path, monkeypatch
 ):
@@ -796,12 +959,22 @@ def test_affected_wal_provider_never_enters_write_or_upstream_paths(
         conn.commit()
     holder = sqlite3.connect(db)
     assert holder.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    # Keep a read transaction open while a separate writer commits.  This
+    # forces the live -wal and -shm sidecars to exist for the provider probe.
+    holder.execute("BEGIN")
     holder.execute("SELECT 1").fetchone()
-    tracked = {
+    with sqlite3.connect(db) as writer:
+        writer.execute(
+            "INSERT INTO thought_nodes (id, content, node_type, domain) "
+            "VALUES (?, ?, ?, ?)",
+            ("wal-live", "committed while reader is open", "observation", "user"),
+        )
+        writer.commit()
+    initial_tracked = {
         path: (path.stat().st_size, sha256(path.read_bytes()).hexdigest())
         for path in (db, Path(f"{db}-wal"), Path(f"{db}-shm"))
-        if path.exists()
     }
+    assert len(initial_tracked) == 3
     monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 50, 4))
     calls: list[str] = []
 
@@ -822,6 +995,13 @@ def test_affected_wal_provider_never_enters_write_or_upstream_paths(
     provider = CashewMemoryProvider()
     try:
         provider.initialize("affected-wal", hermes_home=str(tmp_path))
+        # Read-only connection setup may update SQLite's transient SHM lock
+        # bytes.  Freeze the live sidecars after that setup, then prove all
+        # provider calls leave the committed database and journal untouched.
+        tracked = {
+            path: (path.stat().st_size, sha256(path.read_bytes()).hexdigest())
+            for path in initial_tracked
+        }
         assert provider.prefetch("missing") == ""
         response = provider.handle_tool_call("cashew_query", {"query": "missing"})
         assert '"ok": true' in response
@@ -832,8 +1012,9 @@ def test_affected_wal_provider_never_enters_write_or_upstream_paths(
     assert {
         path: (path.stat().st_size, sha256(path.read_bytes()).hexdigest())
         for path in tracked
-        if path.exists()
     } == tracked
+    assert holder.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    holder.rollback()
     holder.close()
 
 

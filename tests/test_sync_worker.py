@@ -482,6 +482,67 @@ def test_shutdown_blocks_public_old_profile_access_until_cleanup(tmp_path, monke
         p.shutdown()
 
 
+def test_prefetch_uses_snapshot_after_shutdown_clears_runtime(tmp_path, monkeypatch):
+    """A prefetch admitted before teardown keeps its database snapshot."""
+    feature_entered = threading.Event()
+    feature_returned = threading.Event()
+    release_feature = threading.Event()
+    shutdown_done = threading.Event()
+    observed_paths: list[Any] = []
+
+    def blocked_feature(config, name):
+        del config, name
+        feature_entered.set()
+        assert release_feature.wait(timeout=2.0)
+        feature_returned.set()
+        return False
+
+    monkeypatch.setattr("plugins.memory.cashew.is_feature_enabled", blocked_feature)
+    p = make_initialized_provider(tmp_path)
+    expected_db = p._db_path
+
+    def keyword_search(*args: Any, db_path: str | Any = None, **kwargs: Any):
+        del args, kwargs
+        assert shutdown_done.wait(timeout=2.0)
+        observed_paths.append(db_path)
+        return []
+
+    monkeypatch.setattr(p, "_keyword_search", keyword_search)
+    prefetch_done = threading.Event()
+    prefetch_errors: list[BaseException] = []
+
+    def run_prefetch() -> None:
+        try:
+            assert p.prefetch("teardown race") == ""
+        except BaseException as exc:  # pragma: no cover - assertion aid
+            prefetch_errors.append(exc)
+        finally:
+            prefetch_done.set()
+
+    prefetch_thread = threading.Thread(target=run_prefetch)
+    prefetch_thread.start()
+    shutdown_thread: threading.Thread | None = None
+    try:
+        assert feature_entered.wait(timeout=1.0)
+        release_feature.set()
+        assert feature_returned.wait(timeout=1.0)
+        shutdown_thread = threading.Thread(target=p.shutdown)
+        shutdown_thread.start()
+        shutdown_thread.join(timeout=2.0)
+        assert not shutdown_thread.is_alive()
+        shutdown_done.set()
+        assert prefetch_done.wait(timeout=2.0)
+        assert prefetch_errors == []
+        assert observed_paths == [expected_db]
+    finally:
+        release_feature.set()
+        shutdown_done.set()
+        prefetch_thread.join(timeout=2.0)
+        if shutdown_thread is not None:
+            shutdown_thread.join(timeout=2.0)
+        p.shutdown()
+
+
 def test_shutdown_hung_worker_logs_warning_no_raise(tmp_path, monkeypatch, caplog):
     """0.3s sleep gives the shutdown timeout (0.1s) time to fire while
     guaranteeing the thread exits cleanly before the next test starts."""

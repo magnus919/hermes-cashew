@@ -755,15 +755,16 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         Half-state (_sync_queue is None) is a silent no-op.
         """
-        if (
-            not self._write_enabled
-            or self._config is None
-            or self._initializing
-            or not self._config.auto_extraction
-        ):
-            return
         with self._sync_state_lock:
-            if self._shutdown_started.is_set() or self._sync_queue is None:
+            config = self._config
+            if (
+                not self._write_enabled
+                or config is None
+                or self._initializing
+                or self._shutdown_started.is_set()
+                or not config.auto_extraction
+                or self._sync_queue is None
+            ):
                 return
             # Buffer assistant content for queue_prefetch cue extraction only
             # after the turn has been admitted.
@@ -1191,13 +1192,18 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 lines.append(content)
         return "\n".join(lines)
 
-    def _update_access_metrics(self, node_ids: list[str]) -> None:
+    def _update_access_metrics(
+        self, node_ids: list[str], db_path: pathlib.Path | str | None = None
+    ) -> None:
         if not self._write_enabled or not node_ids:
+            return
+        target_db = db_path if db_path is not None else self._db_path
+        if target_db is None:
             return
         try:
             import sqlite3
 
-            conn = sqlite3.connect(str(self._db_path))
+            conn = sqlite3.connect(str(target_db))
             try:
                 placeholders = ",".join("?" * len(node_ids))
                 conn.execute(
@@ -1676,15 +1682,20 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         domain: str | None,
         tag: str | None,
         exclude_tags: list[str] | None,
+        db_path: pathlib.Path | str | None = None,
     ) -> list[dict] | None:
         """Parallel retrieval: run upstream + keyword search concurrently."""
         from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        target_db = db_path if db_path is not None else self._db_path
+        if target_db is None:
+            return None
 
         def _upstream() -> list[dict] | None:
             from core.retrieval import retrieve_recursive_bfs
 
             results = retrieve_recursive_bfs(
-                db_path=str(self._db_path),
+                db_path=str(target_db),
                 query=query,
                 top_k=max_nodes,
                 domain=domain,
@@ -1693,12 +1704,14 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             )
             if results:
                 node_ids = [r.node_id for r in results]
-                self._update_access_metrics(node_ids)
-                return self._enrich_results(node_ids)
+                self._update_access_metrics(node_ids, db_path=target_db)
+                return self._enrich_results(node_ids, db_path=str(target_db))
             return None
 
         def _keyword() -> list[dict] | None:
-            return self._keyword_search(query, max_nodes, domain, tag, exclude_tags)
+            return self._keyword_search(
+                query, max_nodes, domain, tag, exclude_tags, db_path=target_db
+            )
 
         with ThreadPoolExecutor(max_workers=2) as _pool:
             futures = [
@@ -1742,18 +1755,32 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         - Empty result is valid (returns `""` without logging).
         - Failure path: `except Exception` logs ONE WARNING and returns `""`.
         """
-        if (
-            self._config is None
-            or self._initializing
-            or self._shutdown_started.is_set()
-        ):
-            return ""
-        requested_session = str(kwargs.get("session_id") or self._session_id)
-        self._warm_cache.update(self._consume_prefetch_pending(requested_session))
+        with self._sync_state_lock:
+            config = self._config
+            db_path = self._db_path
+            if (
+                config is None
+                or db_path is None
+                or self._initializing
+                or self._shutdown_started.is_set()
+            ):
+                return ""
+            requested_session = str(kwargs.get("session_id") or self._session_id)
+            max_nodes = config.recall_k
+            parallel_retrieval = is_feature_enabled(
+                config, "experimental_parallel_retrieval"
+            )
+        pending = self._consume_prefetch_pending(requested_session)
+        with self._sync_state_lock:
+            self._warm_cache.update(pending)
+            warm_cache = tuple(self._warm_cache.items())
+            # Consume the snapshot before doing any potentially slow retrieval.
+            # Shutdown may clear the live cache while this call continues.
+            self._warm_cache.clear()
         # Warm cache fast path: check if a cached cue matches the query.
-        if self._warm_cache:
+        if warm_cache:
             query_lower = query.lower()
-            for cue, ctx in self._warm_cache.items():
+            for cue, ctx in warm_cache:
                 if not cue:
                     continue
                 cue_lower = cue.lower()
@@ -1763,7 +1790,6 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         len(cue),
                         len(query),
                     )
-                    self._warm_cache.clear()
                     return ctx
                 cue_words = set(w for w in cue_lower.split() if len(w) > 3)
                 query_words = set(w for w in query_lower.split() if len(w) > 3)
@@ -1773,24 +1799,24 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         len(cue),
                         len(query),
                     )
-                    self._warm_cache.clear()
                     return ctx
             # No match — clear stale cache and fall through to cold retrieval.
             logger.info(
                 "prefetch warm cache MISS (%d cue(s) in cache) — falling through to cold retrieval",
-                len(self._warm_cache),
+                len(warm_cache),
             )
-            self._warm_cache.clear()
-        max_nodes = self._config.recall_k
         with trace_operation(
             "cashew.prefetch",
             {"query.length": len(query)},
         ) as _span:
-            if self._config is not None and is_feature_enabled(
-                self._config, "experimental_parallel_retrieval"
-            ):
+            if parallel_retrieval:
                 nodes = self._parallel_retrieve(
-                    query, max_nodes, domain, tag, exclude_tags
+                    query,
+                    max_nodes,
+                    domain,
+                    tag,
+                    exclude_tags,
+                    db_path=db_path,
                 )
                 if nodes:
                     return self._format_context(nodes)
@@ -1800,7 +1826,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 from core.retrieval import retrieve_recursive_bfs
 
                 results = retrieve_recursive_bfs(
-                    db_path=str(self._db_path),
+                    db_path=str(db_path),
                     query=query,
                     top_k=max_nodes,
                     domain=domain,
@@ -1809,8 +1835,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 )
                 if results:
                     node_ids = [r.node_id for r in results]
-                    self._update_access_metrics(node_ids)
-                    nodes = self._enrich_results(node_ids)
+                    self._update_access_metrics(node_ids, db_path=db_path)
+                    nodes = self._enrich_results(node_ids, db_path=str(db_path))
                     return self._format_context(nodes)
             except Exception:
                 logger.debug(
@@ -1818,10 +1844,17 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 )
             try:
                 nodes = self._keyword_search(
-                    query, max_nodes, domain, tag, exclude_tags
+                    query,
+                    max_nodes,
+                    domain,
+                    tag,
+                    exclude_tags,
+                    db_path=db_path,
                 )
                 if nodes:
-                    self._update_access_metrics([n["id"] for n in nodes])
+                    self._update_access_metrics(
+                        [n["id"] for n in nodes], db_path=db_path
+                    )
                     return self._format_context(nodes)
             except Exception:
                 logger.warning(
@@ -2005,10 +2038,14 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         domain: str | None = None,
         tag: str | None = None,
         exclude_tags: list[str] | None = None,
+        db_path: pathlib.Path | str | None = None,
     ) -> list[dict]:
         import sqlite3
 
-        conn = sqlite3.connect(str(self._db_path))
+        target_db = db_path if db_path is not None else self._db_path
+        if target_db is None:
+            return []
+        conn = sqlite3.connect(str(target_db))
         try:
             where_clauses: list[str] = ["(decayed IS NULL OR decayed = 0)"]
             params: list = []

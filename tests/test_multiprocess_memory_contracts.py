@@ -37,6 +37,15 @@ if _cashew_spec is None:
 _READY_TIMEOUT = 10
 _EXIT_TIMEOUT = 15
 
+
+class _KnownIssue191MissingVecRowError(AssertionError):
+    """Exact stale-writer missing-vec-row inconsistency pending issue #191."""
+
+
+class _KnownIssue191StaleVecDimensionError(AssertionError):
+    """Exact stale-writer 1024/384 inconsistency pending issue #191."""
+
+
 _CHILD = r"""
 import fcntl, hashlib, json, os, sqlite3, sys, time
 from pathlib import Path
@@ -61,6 +70,11 @@ class DeterministicEmbeddingService:
             seed = int.from_bytes(hashlib.sha256(text.encode()).digest()[:8], "big")
             vector = np.random.default_rng(seed).normal(size=self.dim).astype(np.float32)
             vectors.append(vector / np.linalg.norm(vector))
+        if action == "extract_embed_barrier" and not getattr(self, "_paused_once", False):
+            self._paused_once = True
+            emit("writer_embeddings_snapshotted")
+            if command() != "resume_embeddings":
+                raise RuntimeError("expected resume_embeddings command")
         return np.stack(vectors) if vectors else np.zeros((0, self.dim), dtype=np.float32)
 
     def embed(self, text):
@@ -110,7 +124,8 @@ def install_extract_barrier(provider):
         if command() != "write":
             raise RuntimeError("expected write command")
         if overlap is not None:
-            wait_for(overlap / "phase_started")
+            if action != "extract_embed_barrier":
+                wait_for(overlap / "phase_started")
             (overlap / "writer_started").write_text(marker)
         try:
             return original(*args, **kwargs)
@@ -129,7 +144,7 @@ if action == "initialize":
     emit("initialized", available=provider._db_path is not None)
     provider.shutdown()
 
-elif action == "extract":
+elif action in {"extract", "extract_embed_barrier"}:
     provider = initialize()
     install_extract_barrier(provider)
     emit("ready")
@@ -204,7 +219,6 @@ elif action == "migration":
             if command() != "release":
                 raise RuntimeError("expected release command")
             (overlap / "phase_started").write_text("migration")
-            wait_for(overlap / "writer_started")
         return original_repair(db_path)
     provider._repair_embedding_dimension_locked = paused_repair
     emit("ready")
@@ -463,6 +477,96 @@ def _assert_consistent(db_path: Path) -> None:
         connection.close()
 
 
+def _raise_if_exact_issue_191_stale_writer_mismatch(
+    db_path: Path,
+    *,
+    seed_marker: str,
+    writer_marker: str,
+    expected_writer_vec_dimension: int | None,
+) -> None:
+    """Raise only for an exact verified #191 stale-writer divergence."""
+    connection = sqlite3.connect(db_path)
+    try:
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert (
+            connection.execute(
+                "SELECT e.node_id FROM embeddings e "
+                "LEFT JOIN thought_nodes n ON n.id = e.node_id WHERE n.id IS NULL"
+            ).fetchall()
+            == []
+        )
+        assert (
+            connection.execute(
+                "SELECT parent_id FROM derivation_edges "
+                "WHERE parent_id NOT IN (SELECT id FROM thought_nodes) "
+                "UNION ALL SELECT child_id FROM derivation_edges "
+                "WHERE child_id NOT IN (SELECT id FROM thought_nodes)"
+            ).fetchall()
+            == []
+        )
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec_embeddings'"
+        ).fetchone()
+        import sqlite_vec
+
+        connection.enable_load_extension(True)
+        sqlite_vec.load(connection)
+        ordinary_dimensions = dict(
+            connection.execute("SELECT node_id, LENGTH(vector) / 4 FROM embeddings")
+        )
+        vec_dimensions = dict(
+            connection.execute(
+                "SELECT node_id, LENGTH(embedding) / 4 FROM vec_embeddings"
+            )
+        )
+        seed_ids = [
+            row[0]
+            for row in connection.execute(
+                "SELECT id FROM thought_nodes WHERE content = ?",
+                (f"durable marker {seed_marker}",),
+            )
+        ]
+        writer_ids = [
+            row[0]
+            for row in connection.execute(
+                "SELECT id FROM thought_nodes WHERE content = ?",
+                (f"durable marker {writer_marker}",),
+            )
+        ]
+        assert len(seed_ids) == 1
+        assert len(writer_ids) == 1
+        seed_id, writer_id = seed_ids[0], writer_ids[0]
+        assert ordinary_dimensions[seed_id] == 384
+        assert vec_dimensions[seed_id] == 384
+        assert ordinary_dimensions[writer_id] == 1024
+        if expected_writer_vec_dimension is None:
+            assert writer_id not in vec_dimensions
+            assert set(ordinary_dimensions) == set(vec_dimensions) | {writer_id}
+            assert all(
+                ordinary_dimensions[node_id] == vec_dimensions[node_id]
+                for node_id in vec_dimensions
+            )
+        else:
+            assert vec_dimensions[writer_id] == expected_writer_vec_dimension
+            assert set(ordinary_dimensions) == set(vec_dimensions)
+            assert all(
+                ordinary_dimensions[node_id] == vec_dimensions[node_id]
+                for node_id in vec_dimensions
+                if node_id != writer_id
+            )
+    finally:
+        connection.close()
+    if expected_writer_vec_dimension is None:
+        raise _KnownIssue191MissingVecRowError(
+            "issue #191: preinitialized 1024-dimensional writer omitted its vec row "
+            "after a 384-dimensional migration"
+        )
+    raise _KnownIssue191StaleVecDimensionError(
+        "issue #191: preinitialized writer stored a 1024-dimensional ordinary "
+        f"embedding beside a {expected_writer_vec_dimension}-dimensional vec row"
+    )
+
+
 def test_two_processes_initialize_extract_and_recall_one_brain(tmp_path: Path) -> None:
     """Two real provider initializations and upstream writes overlap by barrier."""
     home = tmp_path / "shared"
@@ -621,10 +725,15 @@ def test_uncontended_migration_reaches_new_dimension_and_preserves_seed(
     _assert_consistent(home / "brain.db")
 
 
-def test_migration_maintenance_overlaps_real_writer_and_keeps_database_sound(
+@pytest.mark.xfail(
+    strict=True,
+    raises=_KnownIssue191MissingVecRowError,
+    reason="issue #191: old writers must coordinate with embedding migration",
+)
+def test_migration_maintenance_stages_real_old_writer_until_migration_completes(
     tmp_path: Path,
 ) -> None:
-    """Migration inspection and real upstream persistence start from one barrier."""
+    """A preinitialized writer persists only after the real migration completes."""
     home = tmp_path / "shared"
     assert _extract(home, "migration-seed")["ok"] is True
     overlap = tmp_path / "migration-write"
@@ -637,21 +746,12 @@ def test_migration_maintenance_overlaps_real_writer_and_keeps_database_sound(
         _send(writer, "start")
         _event(writer, "entered_upstream_write")
         _send(migration, "release")
-        _send(writer, "write")
         migration_result = _result(migration)
         assert migration_result["completed"] is True
         assert migration_result["dimensions_before"] == [[1024], 1024]
-        # Issue #191 owns ordinary writer coordination. This test keeps the
-        # concurrent outcome visible without expecting that unrelated fix.
-        assert migration_result["outcome"] in {
-            "migrated",
-            "deferred_by_concurrent_writer",
-        }
-        if migration_result["outcome"] == "deferred_by_concurrent_writer":
-            assert any(
-                "database is locked" in record["exception"].lower()
-                for record in migration_result["migration_records"]
-            )
+        assert migration_result["outcome"] == "migrated"
+        assert migration_result["dimensions_after"] == [[384], 384]
+        _send(writer, "write")
         assert _result(writer)["ok"] is True
     finally:
         _terminate(migration)
@@ -661,7 +761,66 @@ def test_migration_maintenance_overlaps_real_writer_and_keeps_database_sound(
         "writer-during-migration" in value for value in _markers(home / "brain.db")
     )
     assert any("migration-seed" in value for value in _markers(home / "brain.db"))
-    _assert_consistent(home / "brain.db")
+    try:
+        _assert_consistent(home / "brain.db")
+    except AssertionError:
+        _raise_if_exact_issue_191_stale_writer_mismatch(
+            home / "brain.db",
+            seed_marker="migration-seed",
+            writer_marker="writer-during-migration",
+            expected_writer_vec_dimension=None,
+        )
+        raise
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=_KnownIssue191StaleVecDimensionError,
+    reason="issue #191: old writers must coordinate with embedding migration",
+)
+def test_migration_overlap_preserves_observed_stale_vec_dimension(
+    tmp_path: Path,
+) -> None:
+    """A snapshotted old writer resumes after migration with its original vector."""
+    home = tmp_path / "shared"
+    assert _extract(home, "migration-overlap-seed")["ok"] is True
+    overlap = tmp_path / "migration-overlap"
+    overlap.mkdir()
+    migration = _start(home, "migration", "migration", overlap)
+    writer = _start(home, "writer-overlap", "extract_embed_barrier", overlap)
+    try:
+        _send(migration, "start")
+        _event(migration, "maintenance_locked")
+        _send(writer, "start")
+        _event(writer, "entered_upstream_write")
+        _send(writer, "write")
+        _event(writer, "writer_embeddings_snapshotted")
+        _send(migration, "release")
+        migration_result = _result(migration)
+        assert migration_result["completed"] is True
+        assert migration_result["dimensions_before"] == [[1024], 1024]
+        assert migration_result["outcome"] == "migrated"
+        assert migration_result["dimensions_after"] == [[384], 384]
+        _send(writer, "resume_embeddings")
+        assert _result(writer)["ok"] is True
+    finally:
+        _terminate(migration)
+        _terminate(writer)
+
+    assert any("writer-overlap" in value for value in _markers(home / "brain.db"))
+    assert any(
+        "migration-overlap-seed" in value for value in _markers(home / "brain.db")
+    )
+    try:
+        _assert_consistent(home / "brain.db")
+    except AssertionError:
+        _raise_if_exact_issue_191_stale_writer_mismatch(
+            home / "brain.db",
+            seed_marker="migration-overlap-seed",
+            writer_marker="writer-overlap",
+            expected_writer_vec_dimension=384,
+        )
+        raise
 
 
 def test_real_sqlite_write_lock_reports_extract_failure_within_timeout(

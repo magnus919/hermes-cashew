@@ -9,8 +9,9 @@ failures therefore remain ordinary test failures.
 
 from __future__ import annotations
 
-import importlib.util
+import importlib.machinery
 import math
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -24,11 +25,7 @@ import plugins.memory.cashew.sleep_refactor as sleep
 # The fast suite intentionally supports running without cashew-brain. These
 # contracts require its real schema and calibrated profiles. Guard only the
 # confirmed-absent case; a present but broken installation must fail import.
-try:
-    _cashew_spec = importlib.util.find_spec("core.context")
-except ModuleNotFoundError:
-    _cashew_spec = None
-if _cashew_spec is None:
+if importlib.machinery.PathFinder.find_spec("core") is None:
     pytest.skip(
         "cashew-brain is required for consolidation safety contracts",
         allow_module_level=True,
@@ -75,10 +72,23 @@ def _new_brain(tmp_path: Path, name: str, *, vec_dim: int | None = None) -> Path
             conn.enable_load_extension(True)
             sqlite_vec.load(conn)
             conn.execute(
-                "CREATE VIRTUAL TABLE vec_embeddings USING vec0("
+                "CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings USING vec0("
                 "node_id TEXT PRIMARY KEY, "
                 f"embedding float[{vec_dim}] distance_metric=cosine)"
             )
+            schema = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'vec_embeddings'"
+            ).fetchone()
+            assert schema is not None and schema[0] is not None
+            canonical_schema = re.sub(r'[\s"`]+', "", schema[0].lower())
+            assert "createvirtualtablevec_embeddingsusingvec0(" in canonical_schema
+            assert "node_idtextprimarykey" in canonical_schema
+            assert (
+                f"embeddingfloat[{vec_dim}]distance_metric=cosine" in canonical_schema
+            )
+            assert [
+                row[1] for row in conn.execute("PRAGMA table_info(vec_embeddings)")
+            ] == ["node_id", "embedding"]
         conn.commit()
     finally:
         conn.close()

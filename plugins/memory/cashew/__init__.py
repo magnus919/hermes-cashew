@@ -2,6 +2,7 @@
 # Source: Pattern mirrored from plugins/memory/hindsight/__init__.py (NousResearch/hermes-agent@main)
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 import json
@@ -14,6 +15,11 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, cast
 
+from .admission import (
+    OperationAdmissionError,
+    admit_operation,
+    current_admission,
+)
 from .embedding import (
     DEFAULT_EMBEDDING_DEVICE,
     normalize_embedding_device,
@@ -35,8 +41,15 @@ from .error_tracking import (
 from .health import OutcomeLedger, safe_error_class
 from .locking import (
     MaintenanceLockAcquisitionError,
+    SQLiteWALUnsupportedError,
+    bootstrap_sqlite_journal,
+    guard_sqlite_journal,
     lock_path_for_db,
+    open_readonly_verified,
+    sqlite_journal_report,
+    sqlite_wal_reset_vulnerable,
     try_maintenance_lock,
+    verify_readonly_profile,
 )
 from .log_filter import acquire_provider_scrub_filters, release_provider_scrub_filters
 from .metrics import _METRICS
@@ -121,6 +134,8 @@ class _PrefetchRequestIdentity:
     domain: str | None
     tag: str | None
     exclude_tags: tuple[str, ...]
+    embedding_epoch: int | None = None
+    embedding_generation: str | int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -147,6 +162,18 @@ class _InitializationCancelledError(RuntimeError):
     """Private control flow for shutdown cancelling a slow initialize()."""
 
 
+class _PreAdmissionRejectedError(RuntimeError):
+    """A queued turn could not enter the provider generation."""
+
+
+class _OpaqueUpstreamError(RuntimeError):
+    """An upstream write failed after admission, with bounded outcome evidence."""
+
+    def __init__(self, *, partial: bool) -> None:
+        super().__init__("upstream persistence outcome is not replayable")
+        self.partial = partial
+
+
 class _GenerationBoundEmbeddingService:
     """Make one upstream service unavailable once its owner closes.
 
@@ -155,9 +182,20 @@ class _GenerationBoundEmbeddingService:
     letting a closed profile serve another profile's global singleton.
     """
 
-    def __init__(self, service: Any, supervisor: EmbeddingSupervisor) -> None:
+    def __init__(
+        self,
+        service: Any,
+        supervisor: EmbeddingSupervisor,
+        *,
+        cache_path: pathlib.Path | None = None,
+        model: str | None = None,
+        dimension: int | None = None,
+    ) -> None:
         self._service = service
         self._supervisor = supervisor
+        self._cache_path = cache_path
+        self._model = model
+        self._dimension = dimension
 
     @property
     def model(self) -> str:
@@ -168,11 +206,37 @@ class _GenerationBoundEmbeddingService:
         return cast(int, self._service.dim)
 
     def embed_np(self, texts: list[str]) -> Any:
+        admission = current_admission()
+        if admission is None and self._cache_path is not None:
+            with admit_operation(
+                cache_path=self._cache_path,
+                model=self._model,
+                embedding_dim=self._dimension,
+                supervisor=self._supervisor,
+                embedding_generation=getattr(self._supervisor, "generation", None),
+                cache_exclusive=True,
+                deadline=1.5,
+            ):
+                with self._supervisor.serve_generation():
+                    return self._service.embed_np(texts)
         with self._supervisor.serve_generation():
             return self._service.embed_np(texts)
 
     def embed(self, text: Any) -> Any:
         """Keep upstream's public single-text route behind the same gate."""
+        admission = current_admission()
+        if admission is None and self._cache_path is not None:
+            with admit_operation(
+                cache_path=self._cache_path,
+                model=self._model,
+                embedding_dim=self._dimension,
+                supervisor=self._supervisor,
+                embedding_generation=getattr(self._supervisor, "generation", None),
+                cache_exclusive=True,
+                deadline=1.5,
+            ):
+                with self._supervisor.serve_generation():
+                    return self._service.embed(text)
         with self._supervisor.serve_generation():
             return self._service.embed(text)
 
@@ -275,8 +339,115 @@ _UPSTREAM_COMPATIBILITY_SHIMS = (
 )
 
 
+class _NoopEmbeddingCache:
+    """Exact cache surface used when the affected SQLite runtime is unsafe."""
+
+    def __init__(self, path: pathlib.Path) -> None:
+        self.path = str(path)
+
+    def get_many(self, model: str, texts: list[str]) -> list[None]:
+        del model
+        return [None for _ in texts]
+
+    def put_many(self, model: str, pairs: list[tuple[str, Any]]) -> int:
+        del model, pairs
+        return 0
+
+    def get(self, model: str, text: str) -> None:
+        del model, text
+        return None
+
+    def put(self, model: str, text: str, vector: Any) -> None:
+        del model, text, vector
+
+    def size(self, model: str | None = None) -> int:
+        del model
+        return 0
+
+    def invalidate_model(self, model: str) -> None:
+        del model
+
+
+class _GenerationBoundEmbeddingCache:
+    """Reuse the admission-owned cache lease without opening another handle."""
+
+    def __init__(
+        self,
+        cache: Any,
+        *,
+        path: pathlib.Path,
+        model: str,
+        embedding_dim: int,
+        supervisor: Any,
+        generation: str | int | None,
+    ) -> None:
+        self._cache = cache
+        self.path = str(path)
+        self._path = path.resolve(strict=False)
+        self._model = model
+        self._embedding_dim = embedding_dim
+        self._supervisor = supervisor
+        self._generation = generation
+
+    def _check(self, model: str) -> None:
+        admission = current_admission()
+        if admission is None:
+            raise OperationAdmissionError("embedding cache operation is not admitted")
+        if isinstance(self._cache, _NoopEmbeddingCache):
+            # Affected-runtime profiles deliberately carry no cache lease; the
+            # facade remains a harmless exact no-op for upstream calls.
+            if model != self._model:
+                raise OperationAdmissionError(
+                    "embedding cache admission model mismatch"
+                )
+            return
+        if admission.cache_path != self._path:
+            raise OperationAdmissionError("embedding cache admission path mismatch")
+        if admission.model != model or admission.model != self._model:
+            raise OperationAdmissionError("embedding cache admission model mismatch")
+        if admission.embedding_dim not in (None, self._embedding_dim):
+            raise OperationAdmissionError(
+                "embedding cache admission dimension mismatch"
+            )
+        if admission.supervisor is not self._supervisor:
+            raise OperationAdmissionError(
+                "embedding cache admission supervisor mismatch"
+            )
+        if admission.embedding_generation != self._generation:
+            raise OperationAdmissionError(
+                "embedding cache admission generation mismatch"
+            )
+        if admission.cache_lease is None:
+            raise OperationAdmissionError("embedding cache lease is not owned")
+
+    def get_many(self, model: str, texts: list[str]) -> Any:
+        self._check(model)
+        return self._cache.get_many(model, texts)
+
+    def put_many(self, model: str, pairs: list[tuple[str, Any]]) -> Any:
+        self._check(model)
+        return self._cache.put_many(model, pairs)
+
+    def get(self, model: str, text: str) -> Any:
+        self._check(model)
+        return self._cache.get(model, text)
+
+    def put(self, model: str, text: str, vector: Any) -> Any:
+        self._check(model)
+        return self._cache.put(model, text, vector)
+
+    def size(self, model: str | None = None) -> Any:
+        selected = model or self._model
+        self._check(selected)
+        return self._cache.size(selected)
+
+    def invalidate_model(self, model: str) -> Any:
+        self._check(model)
+        return self._cache.invalidate_model(model)
+
+
 def _open_profile_embedding_cache(cache_path: pathlib.Path) -> Any:
-    """Serialize only upstream's one-time shared cache schema initialization."""
+    """Serialize upstream cache schema setup behind its independent lease."""
     from core.embedding_cache import EmbeddingCache
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -295,6 +466,7 @@ def _bind_upstream_embedding(
     device: str = DEFAULT_EMBEDDING_DEVICE,
     *,
     cache_path: pathlib.Path | None = None,
+    cache_disabled: bool = False,
 ) -> EmbeddingSupervisor | None:
     """Bind one active profile to the owned child embedding service.
 
@@ -327,13 +499,32 @@ def _bind_upstream_embedding(
         # owns model construction and validates known-model dimensions before
         # any schema/migration write can occur.
         dim = supervisor.start()
+        raw_cache = (
+            _NoopEmbeddingCache(cache_path)
+            if cache_disabled
+            else _open_profile_embedding_cache(cache_path)
+        )
+        cache = _GenerationBoundEmbeddingCache(
+            raw_cache,
+            path=cache_path,
+            model=model_name,
+            embedding_dim=dim,
+            supervisor=supervisor,
+            generation=getattr(supervisor, "generation", None),
+        )
         raw_service = core.embedding_service.EmbeddingService(
             model=model_name,
-            cache=_open_profile_embedding_cache(cache_path),
+            cache=cache,
             daemon=ProcessEmbeddingBackend(supervisor),
             local=NoInProcessEmbeddingBackend(dim),
         )
-        service = _GenerationBoundEmbeddingService(raw_service, supervisor)
+        service = _GenerationBoundEmbeddingService(
+            raw_service,
+            supervisor,
+            cache_path=cache_path,
+            model=model_name,
+            dimension=dim,
+        )
     except Exception:
         supervisor.close()
         raise
@@ -351,6 +542,84 @@ def _bind_upstream_embedding(
         selected_device,
     )
     return supervisor
+
+
+def _sqlite_profile_policy(
+    db_path: pathlib.Path,
+) -> tuple[bool, bool, str | None]:
+    """Return ``(read_only, cache_disabled, reason)`` before any Cashew writes."""
+    affected = sqlite_wal_reset_vulnerable(sqlite3.sqlite_version_info)
+    if not affected:
+        return False, False, None
+    if not db_path.exists():
+        return False, True, "wal_runtime_unsupported_fresh_cache"
+    try:
+        conn, mode = open_readonly_verified(db_path)
+        try:
+            if mode == "wal":
+                verify_readonly_profile(conn)
+                return True, True, "wal_runtime_unsupported"
+        finally:
+            conn.close()
+    except Exception as exc:
+        # A profile that cannot be inspected safely is not a readable keyword
+        # fallback.  Keep it unavailable rather than serving an identity we
+        # could not prove against the affected WAL runtime.
+        raise SQLiteWALUnsupportedError(
+            "read-only WAL profile verification failed"
+        ) from exc
+    return False, True, "wal_runtime_unsupported_fresh_cache"
+
+
+def _bootstrap_sqlite_profile(
+    db_path: pathlib.Path,
+    cache_path: pathlib.Path,
+    *,
+    cache_disabled: bool,
+    model: str | None = None,
+    embedding_dim: int | None = None,
+) -> None:
+    """Apply journal policy under one exclusive graph then cache bootstrap."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with admit_operation(graph_path=db_path, exclusive=True, deadline=5.0):
+        conn = sqlite3.connect(str(db_path))
+        try:
+            if sqlite_wal_reset_vulnerable(sqlite3.sqlite_version_info):
+                guard_sqlite_journal(conn)
+            else:
+                bootstrap_sqlite_journal(conn)
+        finally:
+            conn.close()
+    if not cache_disabled:
+        with admit_operation(cache_path=cache_path, exclusive=True, deadline=5.0):
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_conn = sqlite3.connect(str(cache_path))
+            try:
+                if sqlite_wal_reset_vulnerable(sqlite3.sqlite_version_info):
+                    guard_sqlite_journal(cache_conn)
+                else:
+                    bootstrap_sqlite_journal(cache_conn)
+                cache_conn.execute(
+                    "CREATE TABLE IF NOT EXISTS hermes_cashew_cache_meta "
+                    "(model TEXT PRIMARY KEY, embedding_dim INTEGER NOT NULL)"
+                )
+                if model and embedding_dim and embedding_dim > 0:
+                    prior = cache_conn.execute(
+                        "SELECT embedding_dim FROM hermes_cashew_cache_meta WHERE model=?",
+                        (model,),
+                    ).fetchone()
+                    if prior is not None and int(prior[0]) != embedding_dim:
+                        raise OperationAdmissionError(
+                            "embedding cache model dimension metadata mismatch"
+                        )
+                    cache_conn.execute(
+                        "INSERT OR IGNORE INTO hermes_cashew_cache_meta "
+                        "(model, embedding_dim) VALUES (?, ?)",
+                        (model, embedding_dim),
+                    )
+                    cache_conn.commit()
+            finally:
+                cache_conn.close()
 
 
 # Import-time model construction is intentionally avoided. The provider binds
@@ -395,6 +664,15 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         self._hermes_home: pathlib.Path | None = None
         self._config: CashewConfig | None = None
         self._db_path: pathlib.Path | None = None
+        self._embedding_cache_path: pathlib.Path | None = None
+        self._cache_writes_disabled = False
+        self._read_only_mode = False
+        self._sqlite_policy_reason: str | None = None
+        self._sqlite_bootstrap_failed = False
+        self._sqlite_report: dict[str, str] | None = None
+        self._runtime_epoch: int | None = None
+        self._embedding_generation: str | int | None = None
+        self._think_claim_state = "none"
         self._sync_queue: queue.Queue | None = None
         self._session_id: str = ""
         # Hermes permits user-memory writes only from the primary agent context.
@@ -517,7 +795,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     self._sync_worker is not None and self._sync_worker.is_alive()
                 ),
             }
-            snapshot = {
+            snapshot: dict[str, Any] = {
                 "state": self._health_state,
                 "reason_code": self._health_reason,
                 "generation": self._health_generation,
@@ -527,6 +805,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 "last_error": last_error,
             }
             snapshot.update(self._outcomes.snapshot())
+            if self._sqlite_report is not None:
+                snapshot["sqlite"] = dict(self._sqlite_report)
+            if self._think_claim_state != "none":
+                snapshot["think"] = {"claim_state": self._think_claim_state}
             return snapshot
 
     def _set_health_locked(
@@ -584,6 +866,55 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             and self._health_state not in {"stopping", "stopped"}
         )
 
+    @contextlib.contextmanager
+    def _operation_admission(self, *, exclusive: bool = False) -> Any:
+        """Reuse a matching token or admit this provider operation once."""
+        if self._db_path is None or self._config is None:
+            raise OperationAdmissionError("provider is not initialized")
+        current = current_admission()
+        cache_path = None if self._cache_writes_disabled else self._embedding_cache_path
+        if current is not None:
+            expected_graph = pathlib.Path(self._db_path).resolve(strict=False)
+            expected_cache = (
+                pathlib.Path(cache_path).resolve(strict=False)
+                if cache_path is not None
+                else None
+            )
+            expected_dim = self._active_embedding_dimension()
+            if (
+                current.graph_path != expected_graph
+                or current.cache_path != expected_cache
+                or current.model != self._config.embedding_model
+                or current.embedding_dim != expected_dim
+                or current.vec_dim != expected_dim
+                or current.supervisor is not self._embedding_supervisor
+                or current.embedding_generation != self._embedding_generation
+                or (
+                    self._runtime_epoch is not None
+                    and current.epoch != self._runtime_epoch
+                )
+                or (exclusive and not current.exclusive)
+                or (cache_path is not None and current.cache_lease is None)
+            ):
+                raise OperationAdmissionError("operation admission identity mismatch")
+            yield current
+            return
+        with admit_operation(
+            graph_path=self._db_path,
+            cache_path=cache_path,
+            model=self._config.embedding_model,
+            embedding_dim=self._active_embedding_dimension(),
+            vec_dim=self._active_embedding_dimension(),
+            epoch=self._runtime_epoch,
+            supervisor=self._embedding_supervisor,
+            embedding_generation=self._embedding_generation,
+            exclusive=exclusive,
+            cache_exclusive=exclusive,
+            deadline=1.5,
+        ) as admission:
+            self._validate_runtime_identity(admission)
+            yield admission
+
     def get_config_schema(self) -> list[dict[str, Any]]:
         """Return the JSON-Schema-shaped dict Hermes uses to drive `hermes memory setup` (CONF-01)."""
         return _config_get_config_schema()
@@ -640,6 +971,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._health_last_error = None
                 self._health_last_error_at = None
                 self._vector_available = None
+                self._sqlite_bootstrap_failed = False
+                self._sqlite_report = None
+                self._embedding_generation = None
                 self._embedding_identity_ready = False
                 self._set_health_locked("initializing", "initializing")
         try:
@@ -666,11 +1000,59 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._db_path = resolve_db_path(
                     self._hermes_home, self._config.cashew_db_path
                 )
-                self._embedding_supervisor = _bind_upstream_embedding(
-                    self._config.embedding_model,
-                    self._config.embedding_device,
-                    cache_path=self._db_path.parent / "embedding-cache.db",
-                )
+                self._embedding_cache_path = self._db_path.parent / "embedding-cache.db"
+                (
+                    self._read_only_mode,
+                    self._cache_writes_disabled,
+                    self._sqlite_policy_reason,
+                ) = _sqlite_profile_policy(self._db_path)
+                if self._read_only_mode:
+                    # Existing WAL on an affected runtime is never opened by
+                    # Cashew's write-capable upstream APIs. Keyword recall
+                    # remains available through the wrapper's read path.
+                    self._write_enabled = False
+                    self._embedding_identity_ready = False
+                    self._vector_available = False
+                    self._retriever = None
+                    self._model_fn = self._build_model_fn()
+                else:
+                    try:
+                        _bootstrap_sqlite_profile(
+                            self._db_path,
+                            self._embedding_cache_path,
+                            cache_disabled=self._cache_writes_disabled,
+                            model=self._config.embedding_model,
+                            embedding_dim=_UPSTREAM_KNOWN_DIMS.get(
+                                self._config.embedding_model
+                            ),
+                        )
+                    except (MaintenanceLockAcquisitionError, OperationAdmissionError):
+                        self._sqlite_bootstrap_failed = True
+                        self._cache_writes_disabled = True
+                        self._sqlite_policy_reason = "journal_bootstrap_unavailable"
+                        logger.warning(
+                            "sqlite journal bootstrap unavailable; using keyword-only recall",
+                            exc_info=True,
+                        )
+                    self._embedding_supervisor = _bind_upstream_embedding(
+                        self._config.embedding_model,
+                        self._config.embedding_device,
+                        cache_path=self._embedding_cache_path,
+                        cache_disabled=self._cache_writes_disabled,
+                    )
+                    self._embedding_generation = getattr(
+                        self._embedding_supervisor, "generation", None
+                    )
+                    if self._sqlite_bootstrap_failed:
+                        logger.warning(
+                            "embedding identity %s; unable to acquire %s; using keyword-only recall",
+                            (
+                                "could not be verified"
+                                if self._embedding_migration_required(self._db_path)
+                                else "inspection deferred"
+                            ),
+                            lock_path_for_db(self._db_path),
+                        )
                 # ContextRetriever.__init__ is lazy — no SQLite open, no embedding load yet.
                 # Guard against the defensive-import fallback (ContextRetriever = None).
                 if ContextRetriever is None:
@@ -683,16 +1065,62 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 # backup boundary as upstream's destructive re-embedding.  In
                 # particular, an old vec table must not be dropped before a
                 # failed embedding repair has a chance to restore it.
-                self._ensure_db_schema(self._db_path)
-                identity_ready = self._repair_embedding_dimension(self._db_path)
+                if self._read_only_mode or self._sqlite_bootstrap_failed:
+                    identity_ready = False
+                else:
+                    # Keep one exclusive graph->cache admission from schema
+                    # bootstrap through claim recovery, migration, vec
+                    # finalization, and identity publication. This prevents a
+                    # second process from observing a half-published profile.
+                    with admit_operation(
+                        graph_path=self._db_path,
+                        cache_path=(
+                            None
+                            if self._cache_writes_disabled
+                            else self._embedding_cache_path
+                        ),
+                        model=self._config.embedding_model,
+                        embedding_dim=self._active_embedding_dimension(),
+                        vec_dim=self._active_embedding_dimension(),
+                        epoch=self._runtime_epoch,
+                        supervisor=self._embedding_supervisor,
+                        embedding_generation=self._embedding_generation,
+                        exclusive=True,
+                        cache_exclusive=True,
+                        deadline=5.0,
+                    ) as bootstrap_admission:
+                        self._ensure_db_schema(self._db_path)
+                        self._recover_think_claim(self._db_path)
+                        identity_ready = self._repair_embedding_dimension_locked(
+                            self._db_path
+                        )
+                        if identity_ready:
+                            self._finalize_vec_schema(self._db_path)
+                            self._validate_runtime_identity(
+                                bootstrap_admission, allow_metadata_mismatch=True
+                            )
+                            self._write_runtime_identity(self._db_path)
+                try:
+                    if self._read_only_mode:
+                        conn, _mode = open_readonly_verified(self._db_path)
+                        try:
+                            self._sqlite_report = verify_readonly_profile(conn)
+                            self._sqlite_report["journal_mode"] = _mode
+                            self._sqlite_report["sqlite_version"] = (
+                                sqlite3.sqlite_version
+                            )
+                        finally:
+                            conn.close()
+                    else:
+                        self._sqlite_report = sqlite_journal_report(self._db_path)
+                except Exception:
+                    self._sqlite_report = None
                 with self._sync_state_lock:
                     self._embedding_identity_ready = identity_ready
                     if not identity_ready:
                         self._warm_cache.clear()
                         self._prefetch_pending = None
-                if identity_ready:
-                    self._finalize_vec_schema(self._db_path)
-                else:
+                if not identity_ready and not self._read_only_mode:
                     # Do not expose an embedding service whose persisted
                     # identity could not be proved or restored.  Query stays
                     # available through keyword search, but all semantic
@@ -701,8 +1129,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     self._vector_available = False
                     self._suspend_sleep_cron()
                     self._close_embedding_runtime(self._embedding_supervisor)
-                self._retriever = ContextRetriever(db_path=str(self._db_path))
-                self._model_fn = self._build_model_fn()
+                if not self._read_only_mode:
+                    self._retriever = ContextRetriever(db_path=str(self._db_path))
+                    self._model_fn = self._build_model_fn()
                 # Finish all synchronous setup before publishing the worker.
                 # Shutdown can cancel a slow initialize while this work runs;
                 # the final lifecycle-locked handoff below is the only place
@@ -1169,6 +1598,14 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         span.set_attribute("input_length", len(turn[0]))
                         completed = self._drain_once(turn)
                     self._finish_worker_turn(ledger, generation, completed)
+                except _PreAdmissionRejectedError:
+                    with self._sync_state_lock:
+                        if (
+                            ledger is self._outcomes
+                            and generation == self._health_generation
+                        ):
+                            ledger.reject_in_flight()
+                    logger.info("cashew sync: turn rejected before provider admission")
                 except Exception as _exc:
                     self._fail_worker_turn(ledger, generation, _exc)
                     _METRICS.record_sync_failure()
@@ -1203,7 +1640,13 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         with self._sync_state_lock:
             if ledger is not self._outcomes or generation != self._health_generation:
                 return
-            ledger.fail()
+            # core.session owns a multi-statement persistence operation.  A
+            # failure after admission is never replayed: a visible node prefix
+            # is partial, while an unchanged/unknown prefix is uncertain.
+            ledger.fail(
+                partial=isinstance(error, _OpaqueUpstreamError) and error.partial,
+                uncertain=isinstance(error, _OpaqueUpstreamError) and not error.partial,
+            )
             if not self._shutdown_started.is_set() and self._health_state not in {
                 "stopping",
                 "stopped",
@@ -1222,22 +1665,189 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         """
         from core.db import ensure_schema
 
-        ensure_schema(str(db_path))
+        with admit_operation(
+            graph_path=db_path,
+            cache_path=None
+            if self._cache_writes_disabled
+            else self._embedding_cache_path,
+            model=self._config.embedding_model if self._config else None,
+            embedding_dim=self._active_embedding_dimension(),
+            vec_dim=self._active_embedding_dimension(),
+            epoch=self._runtime_epoch,
+            supervisor=self._embedding_supervisor,
+            embedding_generation=self._embedding_generation,
+            exclusive=True,
+            cache_exclusive=True,
+            deadline=5.0,
+        ):
+            ensure_schema(str(db_path))
 
-        import sqlite3
+        with self._operation_admission(exclusive=True):
+            conn = sqlite3.connect(str(db_path))
+            try:
+                # Hermes provider metadata store (persistent counters, flags).
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS hermes_provider_meta (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    )
+                """)
+                conn.commit()
+            finally:
+                conn.close()
 
+    @staticmethod
+    def _runtime_metadata(db_path: pathlib.Path) -> dict[str, str]:
+        """Read provider identity, tolerating pre-extension databases."""
         conn = sqlite3.connect(str(db_path))
         try:
-            # Hermes provider metadata store (persistent counters, flags).
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS hermes_provider_meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
+            try:
+                return dict(
+                    conn.execute(
+                        "SELECT key, value FROM hermes_provider_meta"
+                    ).fetchall()
                 )
-            """)
-            conn.commit()
+            except sqlite3.OperationalError:
+                return {}
         finally:
             conn.close()
+
+    def _connect_graph(self, db_path: pathlib.Path | str) -> sqlite3.Connection:
+        """Open the graph read-only when affected WAL policy requires it."""
+        path = pathlib.Path(db_path).resolve(strict=False)
+        if (
+            self._read_only_mode
+            and self._db_path is not None
+            and path == pathlib.Path(self._db_path).resolve(strict=False)
+        ):
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            conn.execute("PRAGMA query_only=ON")
+            if conn.execute("PRAGMA query_only").fetchone()[0] != 1:
+                conn.close()
+                raise SQLiteWALUnsupportedError("query-only verification failed")
+            return conn
+        return sqlite3.connect(str(path))
+
+    def _write_runtime_identity(self, db_path: pathlib.Path) -> None:
+        """Publish identity atomically, preserving an unchanged maintenance epoch."""
+        if self._config is None:
+            return
+        dim = self._active_embedding_dimension()
+        if dim is None:
+            raise OperationAdmissionError("embedding dimension is unavailable")
+        vec_dim = self._embedding_dimensions(db_path)[1]
+        values = {
+            "embedding_model": self._config.embedding_model,
+            "embedding_dim": str(dim),
+            "vec_dim": str(vec_dim if vec_dim is not None else dim),
+        }
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            previous = dict(
+                conn.execute(
+                    "SELECT key, value FROM hermes_provider_meta WHERE key IN "
+                    "('embedding_model','embedding_dim','vec_dim','maintenance_epoch')"
+                ).fetchall()
+            )
+            try:
+                old_epoch = int(previous.get("maintenance_epoch", "0"))
+            except ValueError:
+                old_epoch = 0
+            # A partial or malformed previous record is not a stable identity.
+            # Only an exact complete match may retain the maintenance epoch.
+            identity_changed = any(
+                previous.get(key) != value for key, value in values.items()
+            )
+            # The first publication and a maintenance identity transition fence
+            # prior owners. A same-identity concurrent provider keeps its epoch.
+            epoch = old_epoch + 1 if not previous or identity_changed else old_epoch
+            values["maintenance_epoch"] = str(epoch)
+            conn.executemany(
+                "INSERT OR REPLACE INTO hermes_provider_meta (key, value) VALUES (?, ?)",
+                values.items(),
+            )
+            conn.commit()
+            self._runtime_epoch = epoch
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _recover_think_claim(self, db_path: pathlib.Path) -> None:
+        """Mark a previous process's unfinished claim uncertain on startup."""
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT value FROM hermes_provider_meta WHERE key='think_claim_state'"
+            ).fetchone()
+            if row is not None and row[0] == "in_flight":
+                conn.execute(
+                    "UPDATE hermes_provider_meta SET value='uncertain' "
+                    "WHERE key='think_claim_state'"
+                )
+            conn.commit()
+        except sqlite3.OperationalError:
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def _validate_runtime_identity(
+        self, admission: Any | None = None, *, allow_metadata_mismatch: bool = False
+    ) -> None:
+        """Reject stale graph/cache work immediately before opaque calls."""
+        token = admission or current_admission()
+        if token is None or self._db_path is None or self._config is None:
+            raise OperationAdmissionError("operation has no active identity")
+        if token.graph_path != pathlib.Path(self._db_path).resolve(strict=False):
+            raise OperationAdmissionError("graph admission path mismatch")
+        if token.model != self._config.embedding_model:
+            raise OperationAdmissionError("graph admission model mismatch")
+        expected_dim = token.embedding_dim
+        if self._embedding_supervisor is not None:
+            expected_dim = self._active_embedding_dimension()
+            if expected_dim is None or token.embedding_dim not in (None, expected_dim):
+                raise OperationAdmissionError("graph admission dimension mismatch")
+            if token.supervisor is not self._embedding_supervisor:
+                raise OperationAdmissionError(
+                    "embedding supervisor generation mismatch"
+                )
+        if self._runtime_epoch is not None and token.epoch not in (
+            None,
+            self._runtime_epoch,
+        ):
+            raise OperationAdmissionError("maintenance epoch mismatch")
+        metadata = self._runtime_metadata(self._db_path)
+        if not allow_metadata_mismatch and (
+            token.epoch is not None or self._runtime_epoch is not None
+        ):
+            try:
+                persisted_epoch = int(metadata.get("maintenance_epoch", ""))
+            except (TypeError, ValueError):
+                raise OperationAdmissionError(
+                    "persisted maintenance epoch is invalid"
+                ) from None
+            if token.epoch != persisted_epoch or self._runtime_epoch != persisted_epoch:
+                raise OperationAdmissionError("persisted maintenance epoch is stale")
+        if not allow_metadata_mismatch and metadata.get("embedding_model") not in (
+            None,
+            self._config.embedding_model,
+        ):
+            raise OperationAdmissionError("persisted embedding model is stale")
+        if not allow_metadata_mismatch and metadata.get("embedding_dim") not in (
+            None,
+            str(expected_dim),
+        ):
+            raise OperationAdmissionError("persisted embedding dimension is stale")
+        if not allow_metadata_mismatch and metadata.get("vec_dim") not in (
+            None,
+            str(expected_dim),
+        ):
+            raise OperationAdmissionError("persisted vector dimension is stale")
+        if token.vec_dim not in (None, expected_dim):
+            raise OperationAdmissionError("admitted vector dimension mismatch")
 
     def _finalize_vec_schema(self, db_path: pathlib.Path) -> None:
         """Apply the reversible-wrapper vec schema work after repair succeeds."""
@@ -1311,15 +1921,27 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         """
         lock_path = lock_path_for_db(db_path)
         try:
-            with try_maintenance_lock(db_path) as lock_fd:
-                if lock_fd is None:
-                    logger.warning(
-                        "embedding migration deferred; another Cashew process holds %s",
-                        lock_path,
-                    )
-                    return False
+            with admit_operation(
+                graph_path=db_path,
+                cache_path=(
+                    None if self._cache_writes_disabled else self._embedding_cache_path
+                ),
+                model=self._config.embedding_model if self._config else None,
+                embedding_dim=self._active_embedding_dimension(),
+                epoch=self._runtime_epoch,
+                supervisor=self._embedding_supervisor,
+                embedding_generation=self._embedding_generation,
+                exclusive=True,
+                cache_exclusive=True,
+                deadline=0.1,
+            ):
                 return self._repair_embedding_dimension_locked(db_path)
-        except MaintenanceLockAcquisitionError:
+        except (MaintenanceLockAcquisitionError, OperationAdmissionError) as exc:
+            if isinstance(exc, OperationAdmissionError):
+                logger.warning(
+                    "embedding migration deferred; another Cashew process holds %s",
+                    lock_path,
+                )
             required = self._embedding_migration_required(db_path)
             logger.warning(
                 "embedding identity %s; unable to acquire %s; using keyword-only recall",
@@ -1437,6 +2059,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 return True
             stored_dims, vec_dim = self._embedding_dimensions(db_path)
             stored_models = self._active_embedding_models(db_path)
+            metadata = self._runtime_metadata(db_path)
         except Exception:
             logger.warning(
                 "could not inspect embedding dimensions after lock acquisition failure",
@@ -1449,7 +2072,21 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         model_mismatch = bool(stored_models) and stored_models != {
             self._config.embedding_model
         }
-        return stored_mismatch or vec_mismatch or model_mismatch
+        persisted_model_mismatch = metadata.get("embedding_model") not in (
+            None,
+            self._config.embedding_model,
+        )
+        persisted_dim_mismatch = metadata.get("embedding_dim") not in (
+            None,
+            str(expected_dim),
+        )
+        return (
+            stored_mismatch
+            or vec_mismatch
+            or model_mismatch
+            or persisted_model_mismatch
+            or persisted_dim_mismatch
+        )
 
     def _repair_embedding_dimension_locked(self, db_path: pathlib.Path) -> bool:
         """Repair embedding identity while the cross-process Cashew lock is held."""
@@ -1464,6 +2101,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 return False
             stored_dims, vec_dim = self._embedding_dimensions(db_path)
             stored_models = self._active_embedding_models(db_path)
+            metadata = self._runtime_metadata(db_path)
         except Exception:
             logger.warning(
                 "could not inspect embedding dimensions; migration skipped",
@@ -1476,7 +2114,21 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         model_mismatch = bool(stored_models) and stored_models != {
             self._config.embedding_model
         }
-        if not stored_mismatch and not vec_mismatch and not model_mismatch:
+        persisted_model_mismatch = metadata.get("embedding_model") not in (
+            None,
+            self._config.embedding_model,
+        )
+        persisted_dim_mismatch = metadata.get("embedding_dim") not in (
+            None,
+            str(expected_dim),
+        )
+        if not (
+            stored_mismatch
+            or vec_mismatch
+            or model_mismatch
+            or persisted_model_mismatch
+            or persisted_dim_mismatch
+        ):
             return True
 
         from core.backup import create_backup
@@ -1634,12 +2286,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         """
         if not node_ids:
             return []
-        import sqlite3
-
         target_db = db_path if db_path is not None else self._db_path
         if target_db is None:
             return []
-        conn = sqlite3.connect(str(target_db))
+        conn = self._connect_graph(target_db)
         try:
             placeholders = ",".join("?" * len(node_ids))
             cursor = conn.execute(
@@ -1687,23 +2337,26 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         if target_db is None:
             return
         try:
-            import sqlite3
-
-            conn = sqlite3.connect(str(target_db))
-            try:
-                placeholders = ",".join("?" * len(node_ids))
-                conn.execute(
-                    f"""
-                    UPDATE thought_nodes
-                    SET access_count = access_count + 1,
-                        last_accessed = CURRENT_TIMESTAMP
-                    WHERE id IN ({placeholders})
-                    """,
-                    node_ids,
-                )
-                conn.commit()
-            finally:
-                conn.close()
+            with self._operation_admission():
+                conn = self._connect_graph(target_db)
+                try:
+                    placeholders = ",".join("?" * len(node_ids))
+                    conn.execute(
+                        f"""
+                        UPDATE thought_nodes
+                        SET access_count = access_count + 1,
+                            last_accessed = CURRENT_TIMESTAMP
+                        WHERE id IN ({placeholders})
+                        """,
+                        node_ids,
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+        except OperationAdmissionError:
+            logger.info(
+                "cashew access metrics deferred: operation admission unavailable"
+            )
         except Exception:
             logger.warning("cashew access metrics update failed", exc_info=True)
 
@@ -1716,8 +2369,9 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         cycles, and sleep synthesis. When None, Cashew's built-in heuristic
         extractor is used (no LLM round-trip).
 
-        Retries up to 3 times on SQLITE_BUSY with exponential backoff before
-        dropping the turn."""
+        Lease contention is handled before admission. Once upstream begins, an
+        exception is terminal for this turn; replaying it could duplicate the
+        stages that Cashew already committed."""
         from core.session import end_session  # lazy import
 
         user, assistant, session_id = turn
@@ -1728,76 +2382,189 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             logger.debug("cashew sync: interpreter shutdown flag set, dropping turn")
             return False
 
-        import sqlite3
-
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                end_session(
-                    db_path=str(self._db_path),
-                    session_id=session_id or self._session_id,
-                    conversation_text=f"User: {user}\nAssistant: {assistant}",
-                    model_fn=self._model_fn,
-                )
-                _METRICS.record_sync_success()
-                break  # success
-            except RuntimeError as e:
-                # Python interpreter shutdown: sentence-transformers' thread pool
-                # was finalized by atexit handlers. There is no recovery — drop
-                # the turn silently and let the worker loop terminate naturally.
-                msg = str(e)
-                if "can't register atexit after shutdown" in msg:
-                    logger.info("cashew sync: interpreter shutting down, dropping turn")
-                    self._shutdown_flag.set()
-                    return False
-                raise
-            except sqlite3.OperationalError as e:
-                if "database is locked" in str(e) and attempt < max_retries - 1:
-                    wait = 0.5 * (2**attempt)
-                    logger.info(
-                        "cashew sync: database locked, retrying in %.1fs (attempt %d/%d)",
-                        wait,
-                        attempt + 1,
-                        max_retries,
-                    )
-                    time.sleep(wait)
-                else:
-                    raise  # give up — let the outer except in _worker_loop handle it
-        # Run think cycle periodically if LLM is wired
-        if (
-            self._model_fn is not None
-            and self._embedding_identity_ready
-            and self._config
-            and self._config.think_cycles
-            and self._config.think_interval > 0
-        ):
-            counter = self._load_think_counter() + 1
-            if counter >= self._config.think_interval:
-                counter = 0
+        try:
+            with self._operation_admission() as admission:
+                self._validate_runtime_identity(admission)
+                before_nodes: int | None
                 try:
-                    from core.session import think_cycle
+                    conn = sqlite3.connect(str(self._db_path))
+                    try:
+                        before_nodes = int(
+                            conn.execute(
+                                "SELECT COUNT(*) FROM thought_nodes"
+                            ).fetchone()[0]
+                        )
+                    finally:
+                        conn.close()
+                except Exception:
+                    before_nodes = None
+                try:
+                    end_session(
+                        db_path=str(self._db_path),
+                        session_id=session_id or self._session_id,
+                        conversation_text=f"User: {user}\nAssistant: {assistant}",
+                        model_fn=self._model_fn,
+                    )
+                except Exception as exc:
+                    # Interpreter finalization is a terminal local condition,
+                    # not an opaque upstream persistence outcome.  Preserve
+                    # the outer drop path that stops the worker cleanly.
+                    if isinstance(
+                        exc, RuntimeError
+                    ) and "can't register atexit after shutdown" in str(exc):
+                        raise
+                    try:
+                        conn = sqlite3.connect(str(self._db_path))
+                        try:
+                            after_nodes = int(
+                                conn.execute(
+                                    "SELECT COUNT(*) FROM thought_nodes"
+                                ).fetchone()[0]
+                            )
+                        finally:
+                            conn.close()
+                    except Exception:
+                        after_nodes = None
+                    raise _OpaqueUpstreamError(
+                        partial=(
+                            before_nodes is not None
+                            and after_nodes is not None
+                            and after_nodes > before_nodes
+                        )
+                    ) from exc
+            _METRICS.record_sync_success()
+        except RuntimeError as e:
+            # Python interpreter shutdown: sentence-transformers' thread pool
+            # was finalized by atexit handlers. There is no recovery — drop
+            # the turn silently and let the worker loop terminate naturally.
+            msg = str(e)
+            if "can't register atexit after shutdown" in msg:
+                logger.info("cashew sync: interpreter shutting down, dropping turn")
+                self._shutdown_flag.set()
+                return False
+            raise
+        except OperationAdmissionError:
+            logger.info("cashew sync: operation rejected before upstream admission")
+            raise _PreAdmissionRejectedError() from None
+        self._run_think_cycle_if_due()
+        return True
 
+    def _run_think_cycle_if_due(self) -> None:
+        """Atomically claim one think cycle and retain its identity lease."""
+        if (
+            self._model_fn is None
+            or not self._embedding_identity_ready
+            or self._config is None
+            or not self._config.think_cycles
+            or self._config.think_interval <= 0
+            or self._db_path is None
+        ):
+            return
+        from core.session import think_cycle
+
+        claim_epoch: str | None = None
+        try:
+            with self._operation_admission(exclusive=True) as admission:
+                self._validate_runtime_identity(admission)
+                conn = sqlite3.connect(str(self._db_path))
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute(
+                        "CREATE TABLE IF NOT EXISTS hermes_provider_meta "
+                        "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                    )
+                    values = dict(
+                        conn.execute(
+                            "SELECT key, value FROM hermes_provider_meta WHERE key IN "
+                            "('think_counter','think_claim_epoch','think_claim_state')"
+                        ).fetchall()
+                    )
+                    state = values.get("think_claim_state", "none")
+                    if state in {"in_flight", "failed", "partial", "uncertain"}:
+                        conn.rollback()
+                        return
+                    counter = int(values.get("think_counter", "0")) + 1
+                    if counter < self._config.think_interval:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO hermes_provider_meta (key,value) "
+                            "VALUES ('think_counter', ?)",
+                            (str(counter),),
+                        )
+                        conn.commit()
+                        return
+                    claim_epoch = f"{self._health_generation}:{time.monotonic_ns()}"
+                    with self._sync_state_lock:
+                        self._think_claim_state = "in_flight"
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO hermes_provider_meta (key,value) VALUES (?,?)",
+                        [
+                            ("think_counter", str(counter)),
+                            ("think_claim_epoch", claim_epoch),
+                            ("think_claim_state", "in_flight"),
+                        ],
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                try:
                     result = think_cycle(
                         db_path=str(self._db_path),
                         model_fn=self._model_fn,
                     )
-                    if result.new_nodes:
-                        logger.info(
-                            "think cycle produced %d insight(s) on cluster: %s",
-                            len(result.new_nodes),
-                            result.cluster_topic or "unknown",
-                        )
+                    progress = bool(
+                        getattr(result, "new_nodes", None)
+                        or getattr(result, "new_edges", None)
+                    )
+                    terminal = "completed" if progress else "failed"
                 except Exception:
                     logger.warning("think cycle failed", exc_info=True)
-            self._save_think_counter(counter)
-        return True
+                    terminal = "uncertain"
+                    result = None
+                conn = sqlite3.connect(str(self._db_path))
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    row = conn.execute(
+                        "SELECT value FROM hermes_provider_meta WHERE key='think_claim_epoch'"
+                    ).fetchone()
+                    state_row = conn.execute(
+                        "SELECT value FROM hermes_provider_meta WHERE key='think_claim_state'"
+                    ).fetchone()
+                    if (
+                        claim_epoch is not None
+                        and row is not None
+                        and row[0] == claim_epoch
+                        and state_row is not None
+                        and state_row[0] == "in_flight"
+                    ):
+                        if terminal == "completed":
+                            conn.execute(
+                                "UPDATE hermes_provider_meta SET value=? WHERE key='think_counter'",
+                                (str(max(0, counter - self._config.think_interval)),),
+                            )
+                        conn.execute(
+                            "UPDATE hermes_provider_meta SET value=? WHERE key='think_claim_state'",
+                            (terminal,),
+                        )
+                        with self._sync_state_lock:
+                            self._think_claim_state = terminal
+                    conn.commit()
+                finally:
+                    conn.close()
+                if result is not None and getattr(result, "new_nodes", None):
+                    logger.info(
+                        "think cycle produced %d insight(s) on cluster: %s",
+                        len(result.new_nodes),
+                        getattr(result, "cluster_topic", None) or "unknown",
+                    )
+        except (OperationAdmissionError, sqlite3.Error):
+            logger.info("think cycle deferred: admission or transaction unavailable")
 
     def _load_think_counter(self) -> int:
         """Read persistent think counter from DB. Resets to 0 on any error."""
         try:
-            import sqlite3
-
-            conn = sqlite3.connect(str(self._db_path))
+            assert self._db_path is not None
+            conn = self._connect_graph(self._db_path)
             try:
                 row = conn.execute(
                     "SELECT value FROM hermes_provider_meta WHERE key='think_counter'"
@@ -1948,6 +2715,16 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         return exchanges
 
     def _create_insight_nodes(self, items: list[dict]) -> int:
+        """Persist pre-compression insights under the graph/cache admission."""
+        try:
+            with self._operation_admission() as admission:
+                self._validate_runtime_identity(admission)
+                return self._create_insight_nodes_unlocked(items)
+        except OperationAdmissionError:
+            logger.info("on_pre_compress: operation rejected before admission")
+            return 0
+
+    def _create_insight_nodes_unlocked(self, items: list[dict]) -> int:
         """Create insight/observation nodes in the Cashew graph.
 
         Uses upstream _create_node / _set_node_tags for persistence, then
@@ -2385,48 +3162,61 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             vector_failed = False
             keyword_failed = False
             try:
-                results = _retrieve_with_embedding_wait(
-                    db_path=str(db_path),
-                    query=query,
-                    top_k=max_nodes,
-                    domain=domain,
-                    tags=[tag] if tag else None,
-                    exclude_tags=exclude_tags,
-                )
-                if results:
-                    node_ids = [r.node_id for r in results]
-                    self._update_access_metrics(node_ids, db_path=db_path)
-                    nodes = self._enrich_results(node_ids, db_path=str(db_path))
-                    return self._format_context(nodes)
-            except Exception:
-                vector_failed = True
-                logger.debug(
-                    "upstream retrieval failed, falling back to keyword", exc_info=True
-                )
-            try:
-                nodes = self._keyword_search(
-                    query,
-                    max_nodes,
-                    domain,
-                    tag,
-                    exclude_tags,
-                    db_path=db_path,
-                )
-                if nodes:
-                    if vector_failed:
-                        self._mark_health_if_current(
-                            ledger,
-                            generation,
-                            "degraded",
-                            "vector_unavailable",
-                            fallback="keyword",
+                with self._operation_admission() as admission:
+                    try:
+                        results = _retrieve_with_embedding_wait(
+                            db_path=str(db_path),
+                            query=query,
+                            top_k=max_nodes,
+                            domain=domain,
+                            tags=[tag] if tag else None,
+                            exclude_tags=exclude_tags,
                         )
-                    self._update_access_metrics(
-                        [n["id"] for n in nodes], db_path=db_path
-                    )
-                    return self._format_context(nodes)
+                    except Exception:
+                        vector_failed = True
+                        results = None
+                        logger.debug(
+                            "upstream retrieval failed, falling back to keyword",
+                            exc_info=True,
+                        )
+                    if results:
+                        node_ids = [r.node_id for r in results]
+                        self._validate_runtime_identity(admission)
+                        # Keep the original graph/cache token through
+                        # enrichment, metrics, and publication.
+                        nodes = self._enrich_results(node_ids, db_path=str(db_path))
+                        self._update_access_metrics(node_ids, db_path=db_path)
+                        self._validate_runtime_identity(admission)
+                        return self._format_context(nodes)
+                    try:
+                        nodes = self._keyword_search(
+                            query,
+                            max_nodes,
+                            domain,
+                            tag,
+                            exclude_tags,
+                            db_path=db_path,
+                        )
+                    except Exception:
+                        keyword_failed = True
+                        raise
+                    if nodes:
+                        if vector_failed:
+                            self._mark_health_if_current(
+                                ledger,
+                                generation,
+                                "degraded",
+                                "vector_unavailable",
+                                fallback="keyword",
+                            )
+                        self._update_access_metrics(
+                            [n["id"] for n in nodes], db_path=db_path
+                        )
+                        self._validate_runtime_identity(admission)
+                        return self._format_context(nodes)
             except Exception:
-                keyword_failed = True
+                if not keyword_failed:
+                    vector_failed = True
                 logger.warning(
                     "cashew recall failed (query_len=%d)", len(query), exc_info=True
                 )
@@ -2618,15 +3408,19 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         with self._sync_state_lock:
             identity_ready = self._embedding_identity_ready
         if identity_ready:
-            results = _retrieve_with_embedding_wait(
-                db_path=request.db_path,
-                query=cue,
-                top_k=request.top_k,
-            )
-            if results:
-                return self._enrich_results(
-                    [result.node_id for result in results], db_path=request.db_path
+            with self._operation_admission() as admission:
+                results = _retrieve_with_embedding_wait(
+                    db_path=request.db_path,
+                    query=cue,
+                    top_k=request.top_k,
                 )
+                if results:
+                    self._validate_runtime_identity(admission)
+                    nodes = self._enrich_results(
+                        [result.node_id for result in results], db_path=request.db_path
+                    )
+                    self._validate_runtime_identity(admission)
+                    return nodes
         return self._keyword_search(cue, request.top_k, db_path=request.db_path)
 
     def _prefetch_request_is_current(self, identity: _PrefetchRequestIdentity) -> bool:
@@ -2719,6 +3513,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             exclude_tags=tuple(
                 sorted({value for value in exclude_tags or [] if value})
             ),
+            embedding_epoch=self._runtime_epoch,
+            embedding_generation=(
+                getattr(self._embedding_supervisor, "generation", None)
+            ),
         )
 
     def _extract_prefetch_cues(self, query: str) -> list[str]:
@@ -2764,12 +3562,10 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         exclude_tags: list[str] | None = None,
         db_path: pathlib.Path | str | None = None,
     ) -> list[dict]:
-        import sqlite3
-
         target_db = db_path if db_path is not None else self._db_path
         if target_db is None:
             return []
-        conn = sqlite3.connect(str(target_db))
+        conn = self._connect_graph(target_db)
         try:
             where_clauses: list[str] = ["(decayed IS NULL OR decayed = 0)"]
             params: list = []
@@ -2876,29 +3672,38 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     exclude_tags = args.get("exclude_tags")
                     vector_failed = False
                     if identity_ready:
-                        try:
-                            results = _retrieve_with_embedding_wait(
-                                db_path=str(self._db_path),
-                                query=query,
-                                top_k=max_nodes,
-                                domain=domain,
-                                tags=[tag] if tag else None,
-                                exclude_tags=exclude_tags,
-                            )
-                        except Exception:
-                            vector_failed = True
-                            results = None
+                        # One immutable admission owns every graph-facing
+                        # phase.  In particular, enrichment and access metrics
+                        # must not reacquire against a newer provider identity
+                        # after BFS has produced its node IDs.
+                        with self._operation_admission():
+                            try:
+                                results = _retrieve_with_embedding_wait(
+                                    db_path=str(self._db_path),
+                                    query=query,
+                                    top_k=max_nodes,
+                                    domain=domain,
+                                    tags=[tag] if tag else None,
+                                    exclude_tags=exclude_tags,
+                                )
+                            except Exception:
+                                vector_failed = True
+                                results = None
+                            if results:
+                                node_ids = [r.node_id for r in results]
+                                nodes = self._enrich_results(node_ids)
+                            else:
+                                nodes = self._keyword_search(
+                                    query, max_nodes, domain, tag, exclude_tags
+                                )
+                            if nodes:
+                                self._update_access_metrics([n["id"] for n in nodes])
                     else:
                         results = None
-                    if results:
-                        node_ids = [r.node_id for r in results]
-                        nodes = self._enrich_results(node_ids)
-                    else:
                         nodes = self._keyword_search(
                             query, max_nodes, domain, tag, exclude_tags
                         )
                     if nodes:
-                        self._update_access_metrics([n["id"] for n in nodes])
                         context = self._format_context(nodes)
                         node_count = len(nodes)
                     else:
@@ -2979,12 +3784,14 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 # Lazy import — keeps is_available free of core.session side effects.
                 from core.session import end_session
 
-                result = end_session(
-                    db_path=str(self._db_path),
-                    session_id=self._session_id,
-                    conversation_text=f"User: {user}\nAssistant: {assistant}",
-                    model_fn=self._model_fn,
-                )
+                with self._operation_admission() as admission:
+                    self._validate_runtime_identity(admission)
+                    result = end_session(
+                        db_path=str(self._db_path),
+                        session_id=self._session_id,
+                        conversation_text=f"User: {user}\nAssistant: {assistant}",
+                        model_fn=self._model_fn,
+                    )
                 with self._sync_state_lock:
                     if self._outcome_current_locked(ledger, generation):
                         ledger.record_tool(
@@ -3058,9 +3865,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             )
 
         try:
-            import sqlite3
-
-            conn = sqlite3.connect(str(self._db_path))
+            conn = self._connect_graph(self._db_path)
             cursor = conn.execute(
                 "SELECT COUNT(*), (SELECT COUNT(*) FROM derivation_edges) FROM thought_nodes"
             )

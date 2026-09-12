@@ -690,6 +690,13 @@ def test_two_processes_initialize_extract_and_recall_one_brain(tmp_path: Path) -
         _terminate(first)
         _terminate(second)
 
+    with sqlite3.connect(home / "brain.db") as conn:
+        # Concurrent owners of the same verified identity must not fence each
+        # other merely by starting in a different process.
+        assert conn.execute(
+            "SELECT value FROM hermes_provider_meta WHERE key='maintenance_epoch'"
+        ).fetchone() == ("1",)
+
     first = _start(home, "marker-alpha", "extract")
     second = _start(home, "marker-beta", "extract")
     try:
@@ -783,7 +790,7 @@ def test_sleep_lock_contention_has_bounded_named_skip(tmp_path: Path) -> None:
 
 
 def test_real_extract_overlaps_sleep_and_preserves_its_marker(tmp_path: Path) -> None:
-    """Extraction enters upstream persistence while sleep holds its maintenance lock."""
+    """Extraction is rejected before upstream while sleep owns maintenance."""
     home = tmp_path / "shared"
     assert _extract(home, "sleep-seed-one")["ok"] is True
     assert _extract(home, "sleep-seed-two")["ok"] is True
@@ -795,18 +802,20 @@ def test_real_extract_overlaps_sleep_and_preserves_its_marker(tmp_path: Path) ->
         _send(sleeper, "start")
         _event(sleeper, "maintenance_locked")
         _send(writer, "start")
-        _event(writer, "entered_upstream_write")
+        writer_result = _result(writer)
+        assert writer_result["ok"] is False
+        (overlap / "writer_started").write_text("rejected")
         _send(sleeper, "release")
-        _send(writer, "write")
         sleep_result = _result(sleeper)
         assert "error" not in sleep_result
         assert sleep_result["nodes_selected"] >= 2
-        assert _result(writer)["ok"] is True
     finally:
         _terminate(sleeper)
         _terminate(writer)
 
-    assert any("extract-during-sleep" in value for value in _markers(home / "brain.db"))
+    assert not any(
+        "extract-during-sleep" in value for value in _markers(home / "brain.db")
+    )
     _assert_consistent(home / "brain.db")
 
 
@@ -832,15 +841,10 @@ def test_uncontended_migration_reaches_new_dimension_and_preserves_seed(
     _assert_consistent(home / "brain.db")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=_KnownIssue191MissingVecRowError,
-    reason="issue #191: old writers must coordinate with embedding migration",
-)
 def test_migration_maintenance_stages_real_old_writer_until_migration_completes(
     tmp_path: Path,
 ) -> None:
-    """A preinitialized writer persists only after the real migration completes."""
+    """A concurrent writer is rejected before migration can begin upstream work."""
     home = tmp_path / "shared"
     assert _extract(home, "migration-seed")["ok"] is True
     overlap = tmp_path / "migration-write"
@@ -851,44 +855,29 @@ def test_migration_maintenance_stages_real_old_writer_until_migration_completes(
         _send(migration, "start")
         _event(migration, "maintenance_locked")
         _send(writer, "start")
-        _event(writer, "entered_upstream_write")
+        writer_result = _result(writer)
+        assert writer_result["ok"] is False
         _send(migration, "release")
         migration_result = _result(migration)
         assert migration_result["completed"] is True
         assert migration_result["dimensions_before"] == [[1024], 1024]
         assert migration_result["outcome"] == "migrated"
         assert migration_result["dimensions_after"] == [[384], 384]
-        _send(writer, "write")
-        assert _result(writer)["ok"] is True
     finally:
         _terminate(migration)
         _terminate(writer)
 
-    assert any(
+    assert not any(
         "writer-during-migration" in value for value in _markers(home / "brain.db")
     )
     assert any("migration-seed" in value for value in _markers(home / "brain.db"))
-    try:
-        _assert_consistent(home / "brain.db")
-    except AssertionError:
-        _raise_if_exact_issue_191_stale_writer_mismatch(
-            home / "brain.db",
-            seed_marker="migration-seed",
-            writer_marker="writer-during-migration",
-            expected_writer_vec_dimension=None,
-        )
-        raise
+    _assert_consistent(home / "brain.db")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=_KnownIssue191StaleVecDimensionError,
-    reason="issue #191: old writers must coordinate with embedding migration",
-)
 def test_migration_overlap_preserves_observed_stale_vec_dimension(
     tmp_path: Path,
 ) -> None:
-    """A snapshotted old writer resumes after migration with its original vector."""
+    """A writer cannot snapshot vectors until migration owns the profile."""
     home = tmp_path / "shared"
     assert _extract(home, "migration-overlap-seed")["ok"] is True
     overlap = tmp_path / "migration-overlap"
@@ -899,35 +888,23 @@ def test_migration_overlap_preserves_observed_stale_vec_dimension(
         _send(migration, "start")
         _event(migration, "maintenance_locked")
         _send(writer, "start")
-        _event(writer, "entered_upstream_write")
-        _send(writer, "write")
-        _event(writer, "writer_embeddings_snapshotted")
+        writer_result = _result(writer)
+        assert writer_result["ok"] is False
         _send(migration, "release")
         migration_result = _result(migration)
         assert migration_result["completed"] is True
         assert migration_result["dimensions_before"] == [[1024], 1024]
         assert migration_result["outcome"] == "migrated"
         assert migration_result["dimensions_after"] == [[384], 384]
-        _send(writer, "resume_embeddings")
-        assert _result(writer)["ok"] is True
     finally:
         _terminate(migration)
         _terminate(writer)
 
-    assert any("writer-overlap" in value for value in _markers(home / "brain.db"))
+    assert not any("writer-overlap" in value for value in _markers(home / "brain.db"))
     assert any(
         "migration-overlap-seed" in value for value in _markers(home / "brain.db")
     )
-    try:
-        _assert_consistent(home / "brain.db")
-    except AssertionError:
-        _raise_if_exact_issue_191_stale_writer_mismatch(
-            home / "brain.db",
-            seed_marker="migration-overlap-seed",
-            writer_marker="writer-overlap",
-            expected_writer_vec_dimension=384,
-        )
-        raise
+    _assert_consistent(home / "brain.db")
 
 
 def test_real_sqlite_write_lock_reports_extract_failure_within_timeout(

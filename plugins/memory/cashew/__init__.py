@@ -1891,58 +1891,6 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             self._set_health_locked("stopped", "shutdown_complete")
         logger.debug("cashew provider shutdown complete")
 
-    def _parallel_retrieve(
-        self,
-        query: str,
-        max_nodes: int,
-        domain: str | None,
-        tag: str | None,
-        exclude_tags: list[str] | None,
-        db_path: pathlib.Path | str | None = None,
-    ) -> list[dict] | None:
-        """Parallel retrieval: run upstream + keyword search concurrently."""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        target_db = db_path if db_path is not None else self._db_path
-        if target_db is None:
-            return None
-
-        def _upstream() -> list[dict] | None:
-            from core.retrieval import retrieve_recursive_bfs
-
-            results = retrieve_recursive_bfs(
-                db_path=str(target_db),
-                query=query,
-                top_k=max_nodes,
-                domain=domain,
-                tags=[tag] if tag else None,
-                exclude_tags=exclude_tags,
-            )
-            if results:
-                node_ids = [r.node_id for r in results]
-                self._update_access_metrics(node_ids, db_path=target_db)
-                return self._enrich_results(node_ids, db_path=str(target_db))
-            return None
-
-        def _keyword() -> list[dict] | None:
-            return self._keyword_search(
-                query, max_nodes, domain, tag, exclude_tags, db_path=target_db
-            )
-
-        with ThreadPoolExecutor(max_workers=2) as _pool:
-            futures = [
-                _pool.submit(_upstream),
-                _pool.submit(_keyword),
-            ]
-            for fut in as_completed(futures):
-                try:
-                    nodes: list[dict] | None = fut.result(timeout=30)
-                except Exception:
-                    nodes = None
-                if nodes:
-                    return nodes
-        return None
-
     def prefetch(  # noqa: C901 - retrieval fallback branches preserve the adapter contract
         self,
         query: str,
@@ -1973,9 +1921,6 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 exclude_tags=exclude_tags,
             )
             max_nodes = config.recall_k
-            parallel_retrieval = is_feature_enabled(
-                config, "experimental_parallel_retrieval"
-            )
             # Consume the pending result and snapshot the warm cache while
             # the same runtime identity is admitted. Releasing the lock
             # between these steps could let a reinitialized profile publish a
@@ -2021,19 +1966,6 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             "cashew.prefetch",
             {"query.length": len(query)},
         ) as _span:
-            if parallel_retrieval:
-                nodes = self._parallel_retrieve(
-                    query,
-                    max_nodes,
-                    domain,
-                    tag,
-                    exclude_tags,
-                    db_path=db_path,
-                )
-                if nodes:
-                    return self._format_context(nodes)
-                return ""
-
             vector_failed = False
             keyword_failed = False
             try:

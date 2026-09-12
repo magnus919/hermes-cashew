@@ -124,7 +124,7 @@ def test_full_lifecycle_feature_flags(tmp_path):
             "recall_k": 3,
             "_features": {
                 "experimental_batch_sync": True,
-                "experimental_parallel_retrieval": False,
+                "future_feature": False,
             },
         },
         str(tmp_path),
@@ -132,7 +132,7 @@ def test_full_lifecycle_feature_flags(tmp_path):
 
     config = load_config(str(tmp_path))
     assert is_feature_enabled(config, "experimental_batch_sync") is True
-    assert is_feature_enabled(config, "experimental_parallel_retrieval") is False
+    assert is_feature_enabled(config, "future_feature") is False
     assert is_feature_enabled(config, "nonexistent_flag") is False
 
 
@@ -145,7 +145,7 @@ def test_full_lifecycle_config_roundtrip(tmp_path):
         "sleep_schedule": "0 3 * * *",
         "_features": {
             "experimental_batch_sync": True,
-            "experimental_parallel_retrieval": True,
+            "future_feature": True,
         },
     }
     provider.save_config(custom, str(tmp_path))

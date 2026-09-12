@@ -95,7 +95,6 @@ DEFAULTS: dict[str, Any] = {
     # without affecting stable code paths. All default to false.
     "_features": {
         "experimental_batch_sync": False,
-        "experimental_parallel_retrieval": False,
     },
 }
 
@@ -251,7 +250,13 @@ def _validate_features(value: Any) -> dict[str, bool]:
         raise _invalid_value("_features", "an object with non-empty string flag names")
     if any(type(enabled) is not bool for enabled in value.values()):
         raise _invalid_value("_features", "an object of boolean feature flags")
-    return dict(value)
+    # Retired experiment: accept old profiles without advertising or running
+    # the unbounded retrieval race. Preserve unrelated feature flags.
+    return {
+        name: enabled
+        for name, enabled in value.items()
+        if name != "experimental_parallel_retrieval"
+    }
 
 
 def _validate_field(key: str, value: Any, hermes_home: pathlib.Path) -> Any:

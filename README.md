@@ -300,6 +300,22 @@ to an external checkout.
 ``model_fn=None``. Cross-linking, dedup, and GC are the 80% benefit without
 the API key dependency in a subprocess.
 
+### Maintenance lock scope
+
+Embedding-dimension migration and the synchronous portion of a sleep cycle use
+the same nonblocking advisory lock derived from the configured
+``cashew_db_path``. A contended migration defers and a contended cycle skips;
+the lock file is retained because a process exit releases its ``flock``
+descriptor automatically. Do not delete an old lock file to recover a cycle:
+unlinking it can let a second pathname refer to a different inode while the
+original process still holds the lock.
+
+When an API caller enables ``background_dream=True``, the returned cycle
+summary records ``dream_pending`` and the daemon uses its own connection; it is
+not guarded by the synchronous maintenance lock. This advisory lock is not a complete
+shared-brain writer-coordination policy; broader coordination is tracked in
+[#191](https://github.com/magnus919/hermes-cashew/issues/191).
+
 ### Config reference
 
 | Key | Default | Description |

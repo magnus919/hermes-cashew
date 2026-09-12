@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import dataclasses
-import fcntl
 import json
 import logging
 import os
@@ -23,6 +22,11 @@ from .embedding import (
     normalize_embedding_device,
 )
 from .error_tracking import capture_exception, set_plugin_context
+from .locking import (
+    MaintenanceLockAcquisitionError,
+    lock_path_for_db,
+    try_maintenance_lock,
+)
 from .log_filter import add_scrub_filter
 from .metrics import _METRICS
 from .tracing import trace_operation
@@ -573,8 +577,6 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                         "cashew-brain dependency missing"
                     )
                 self._db_path.parent.mkdir(parents=True, exist_ok=True)
-                # Self-healing — clean up stale state from prior crashes.
-                self._heal_stale_lock()
                 self._ensure_db_schema(self._db_path)
                 self._repair_embedding_dimension(self._db_path)
                 self._retriever = ContextRetriever(db_path=str(self._db_path))
@@ -925,36 +927,6 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     q.task_done()
                     _METRICS.set_queue_depth(q.qsize())
 
-    def _heal_stale_lock(self) -> None:
-        """Remove stale sleep-cycle lock files left by prior crashes.
-
-        The sleep cycle creates ``brain.db.sleep.lock`` while running. If the
-        process is killed (SIGKILL, power loss, OOM) before the lock is
-        released, the file persists and blocks future sleep cycles.
-
-        Rule: any lock file older than 60 minutes is considered stale and
-        removed silently.  Newer locks are left alone (the sleep cycle may
-        still be running in another process).
-        """
-        import time
-
-        stale_threshold = 3600  # 60 minutes in seconds
-        if self._db_path is None:
-            return
-        lock_path = self._db_path.parent / "brain.db.sleep.lock"
-        if lock_path.exists():
-            age = time.time() - lock_path.stat().st_mtime
-            if age > stale_threshold:
-                lock_path.unlink(missing_ok=True)
-                logger.info(
-                    "cashew self-heal: removed stale sleep lock (age=%.0fs)", age
-                )
-            elif age > 0:
-                logger.debug(
-                    "cashew self-heal: sleep lock is fresh (age=%.0fs) — leaving in place",
-                    age,
-                )
-
     def _ensure_db_schema(self, db_path: pathlib.Path) -> None:
         """Create or migrate Cashew schema tables.
 
@@ -1039,26 +1011,48 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         worker or exposes a retriever. cashew-brain owns the destructive
         re-embedding operation; this adapter adds detection, a mandatory
         profile-scoped backup, postcondition validation, and rollback. It uses
-        the same advisory lock as the sleep cycle so separate Hermes processes
-        cannot mutate the graph during migration.
+        the same advisory lock as the synchronous sleep cycle so participating
+        maintenance operations do not overlap. Broader writer coordination is
+        deliberately outside this helper's scope.
         """
-        lock_path = pathlib.Path(f"{db_path}.sleep.lock")
-        lock_fd = lock_path.open("a+")
+        lock_path = lock_path_for_db(db_path)
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            lock_fd.close()
+            with try_maintenance_lock(db_path) as lock_fd:
+                if lock_fd is None:
+                    logger.warning(
+                        "embedding dimension migration deferred; another Cashew process holds %s",
+                        lock_path,
+                    )
+                    return
+                self._repair_embedding_dimension_locked(db_path)
+        except MaintenanceLockAcquisitionError:
+            if self._embedding_migration_required(db_path):
+                raise
             logger.warning(
-                "embedding dimension migration deferred; another Cashew process "
-                "holds %s",
+                "embedding dimension migration not needed; unable to acquire %s",
                 lock_path,
+                exc_info=True,
             )
-            return
+
+    def _embedding_migration_required(self, db_path: pathlib.Path) -> bool:
+        """Fail closed unless a read-only inspection proves migration is unnecessary."""
+        if self._config is None:
+            return True
         try:
-            self._repair_embedding_dimension_locked(db_path)
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            lock_fd.close()
+            from core.embedding_service import resolve_embedding_dim
+
+            expected_dim = resolve_embedding_dim(self._config.embedding_model)
+            stored_dims, vec_dim = self._embedding_dimensions(db_path)
+        except Exception:
+            logger.warning(
+                "could not inspect embedding dimensions after lock acquisition failure",
+                exc_info=True,
+            )
+            return True
+
+        stored_mismatch = bool(stored_dims) and stored_dims != {expected_dim}
+        vec_mismatch = vec_dim is not None and vec_dim != expected_dim
+        return stored_mismatch or vec_mismatch
 
     def _repair_embedding_dimension_locked(self, db_path: pathlib.Path) -> None:
         """Repair dimensions while the cross-process Cashew lock is held."""

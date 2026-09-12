@@ -235,6 +235,32 @@ def test_shutdown_posts_sentinel_and_joins(tmp_path, monkeypatch):
     assert p._sync_queue is None
     assert p._config is None
     assert p._db_path is None
+    assert not p._shutdown_flag.is_set()
+
+
+def test_interpreter_termination_drops_turn_and_stops_worker(tmp_path, monkeypatch):
+    """Interpreter-finalization errors use the terminal drop path explicitly."""
+    attempted = threading.Event()
+
+    def finalizing_end_session(**kwargs):
+        del kwargs
+        attempted.set()
+        raise RuntimeError("can't register atexit after shutdown")
+
+    monkeypatch.setattr(
+        "core.session.end_session", finalizing_end_session, raising=False
+    )
+    p = make_initialized_provider(tmp_path)
+    try:
+        p.sync_turn("u", "a")
+        assert attempted.wait(timeout=1.0)
+        for _ in range(100):
+            if p._shutdown_flag.is_set():
+                break
+            threading.Event().wait(0.01)
+        assert p._shutdown_flag.is_set()
+    finally:
+        p.shutdown()
 
 
 def test_shutdown_drains_accepted_turns_and_rejects_new_ones(tmp_path, monkeypatch):
@@ -267,6 +293,254 @@ def test_shutdown_drains_accepted_turns_and_rejects_new_ones(tmp_path, monkeypat
 
     assert not shutdown_thread.is_alive()
     assert calls == ["User: u1\nAssistant: a1", "User: u2\nAssistant: a2"]
+
+
+def test_shutdown_full_queue_drains_after_blocked_backend_without_watcher_leak(
+    tmp_path, monkeypatch
+):
+    """A full queue and blocked backend still drain every admitted turn."""
+    first_started = threading.Event()
+    release_first = threading.Event()
+    all_calls_done = threading.Event()
+    calls: list[str] = []
+
+    def controlled_end_session(**kwargs):
+        calls.append(kwargs["conversation_text"])
+        if len(calls) == 1:
+            first_started.set()
+            assert release_first.wait(timeout=2.0)
+        if len(calls) == 17:
+            all_calls_done.set()
+        return types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[])
+
+    monkeypatch.setattr(
+        "core.session.end_session", controlled_end_session, raising=False
+    )
+    p = CashewMemoryProvider()
+    p.save_config({"sync_queue_timeout": 0.05}, str(tmp_path))
+    p.initialize("session-a", hermes_home=str(tmp_path))
+    worker = p._sync_worker
+    assert worker is not None
+    try:
+        p.sync_turn("u0", "a0")
+        assert first_started.wait(timeout=1.0)
+        # The worker is holding u0, so these fill every queue slot.
+        for i in range(1, 17):
+            p.sync_turn(f"u{i}", f"a{i}")
+
+        shutdown_thread = threading.Thread(target=p.shutdown)
+        shutdown_thread.start()
+        assert p._shutdown_started.wait(timeout=1.0)
+        assert shutdown_thread.join(timeout=1.0) is None
+        assert not shutdown_thread.is_alive()
+
+        # The bounded shutdown returned while the backend was still blocked;
+        # releasing it lets the daemon finish accepted work and self-clean.
+        release_first.set()
+        assert all_calls_done.wait(timeout=2.0)
+        worker.join(timeout=1.0)
+        assert not worker.is_alive()
+        assert len(calls) == 17
+        assert {f"User: u{i}\nAssistant: a{i}" for i in range(17)} == set(calls)
+        # Cleanup runs only after the worker exits, so dependencies are no
+        # longer retained by a watcher once the worker has drained.
+        for _ in range(100):
+            if p._sync_queue is None:
+                break
+            threading.Event().wait(0.01)
+        assert p._sync_queue is None
+        assert p._sync_worker is None
+    finally:
+        release_first.set()
+        p.shutdown()
+
+
+def test_repeated_shutdown_is_idempotent_while_cleanup_is_deferred(
+    tmp_path, monkeypatch
+):
+    """A second shutdown does not signal or extend the first shutdown."""
+    backend_started = threading.Event()
+    release_backend = threading.Event()
+
+    def blocked_end_session(**kwargs):
+        del kwargs
+        backend_started.set()
+        assert release_backend.wait(timeout=2.0)
+        return types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[])
+
+    monkeypatch.setattr("core.session.end_session", blocked_end_session, raising=False)
+    p = CashewMemoryProvider()
+    p.save_config({"sync_queue_timeout": 0.05}, str(tmp_path))
+    p.initialize("session-a", hermes_home=str(tmp_path))
+    try:
+        p.sync_turn("u", "a")
+        assert backend_started.wait(timeout=1.0)
+        first_shutdown = threading.Thread(target=p.shutdown)
+        first_shutdown.start()
+        assert p._shutdown_started.wait(timeout=1.0)
+        assert first_shutdown.join(timeout=1.0) is None
+        assert not first_shutdown.is_alive()
+
+        start = time.monotonic()
+        p.shutdown()
+        assert time.monotonic() - start < 0.01
+
+        release_backend.set()
+        worker = p._sync_worker
+        if worker is not None:
+            worker.join(timeout=1.0)
+    finally:
+        release_backend.set()
+        p.shutdown()
+
+
+def test_admitted_turn_keeps_session_when_switch_occurs_while_worker_blocked(
+    tmp_path, monkeypatch
+):
+    """Omitted session IDs are captured at admission, before a session switch."""
+    first_started = threading.Event()
+    release_first = threading.Event()
+    calls: list[dict[str, Any]] = []
+
+    def controlled_end_session(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            first_started.set()
+            assert release_first.wait(timeout=2.0)
+        return types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[])
+
+    monkeypatch.setattr(
+        "core.session.end_session", controlled_end_session, raising=False
+    )
+    p = make_initialized_provider(tmp_path)
+    try:
+        p.sync_turn("u1", "a1")
+        assert first_started.wait(timeout=1.0)
+        p.sync_turn("u2", "a2")
+        p.on_session_switch("session-b")
+        release_first.set()
+        assert drain_queue(p, budget_s=2.0)
+        assert [call["session_id"] for call in calls] == ["test-sync", "test-sync"]
+        assert p._session_id == "session-b"
+    finally:
+        release_first.set()
+        p.shutdown()
+
+
+def test_shutdown_blocks_public_old_profile_access_until_cleanup(tmp_path, monkeypatch):
+    """Deferred cleanup keeps old worker dependencies private from new calls."""
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    def blocked_end_session(**kwargs):
+        first_started.set()
+        assert release_first.wait(timeout=2.0)
+        return types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[])
+
+    monkeypatch.setattr("core.session.end_session", blocked_end_session, raising=False)
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    p = CashewMemoryProvider()
+    p.save_config({"sync_queue_timeout": 0.05}, str(home_a))
+    p.initialize("session-a", hermes_home=str(home_a))
+    try:
+        p.sync_turn("u", "a")
+        assert first_started.wait(timeout=1.0)
+        old_db_path = p._db_path
+
+        shutdown_thread = threading.Thread(target=p.shutdown)
+        shutdown_thread.start()
+        assert p._shutdown_started.wait(timeout=1.0)
+        assert shutdown_thread.join(timeout=1.0) is None
+        assert not shutdown_thread.is_alive()
+
+        p.initialize("session-b", hermes_home=str(home_b))
+        assert p._db_path == old_db_path
+        assert p._session_id == "session-a"
+        assert p.prefetch("old profile") == ""
+        result = p.handle_tool_call("cashew_query", {"query": "old profile"})
+        assert '"ok": false' in result
+        p.on_session_switch("session-b")
+        assert p._session_id == "session-a"
+
+        release_first.set()
+        old_worker = p._sync_worker
+        if old_worker is not None:
+            old_worker.join(timeout=1.0)
+        for _ in range(100):
+            if p._sync_queue is None:
+                break
+            threading.Event().wait(0.01)
+        assert p._sync_queue is None
+
+        p.save_config({}, str(home_b))
+        p.initialize("session-b", hermes_home=str(home_b))
+        assert p._hermes_home == home_b
+        assert p._session_id == "session-b"
+    finally:
+        release_first.set()
+        p.shutdown()
+
+
+def test_prefetch_uses_snapshot_after_shutdown_clears_runtime(tmp_path, monkeypatch):
+    """A prefetch admitted before teardown keeps its database snapshot."""
+    feature_entered = threading.Event()
+    feature_returned = threading.Event()
+    release_feature = threading.Event()
+    shutdown_done = threading.Event()
+    observed_paths: list[Any] = []
+
+    def blocked_feature(config, name):
+        del config, name
+        feature_entered.set()
+        assert release_feature.wait(timeout=2.0)
+        feature_returned.set()
+        return False
+
+    monkeypatch.setattr("plugins.memory.cashew.is_feature_enabled", blocked_feature)
+    p = make_initialized_provider(tmp_path)
+    expected_db = p._db_path
+
+    def keyword_search(*args: Any, db_path: str | Any = None, **kwargs: Any):
+        del args, kwargs
+        assert shutdown_done.wait(timeout=2.0)
+        observed_paths.append(db_path)
+        return []
+
+    monkeypatch.setattr(p, "_keyword_search", keyword_search)
+    prefetch_done = threading.Event()
+    prefetch_errors: list[BaseException] = []
+
+    def run_prefetch() -> None:
+        try:
+            assert p.prefetch("teardown race") == ""
+        except BaseException as exc:  # pragma: no cover - assertion aid
+            prefetch_errors.append(exc)
+        finally:
+            prefetch_done.set()
+
+    prefetch_thread = threading.Thread(target=run_prefetch)
+    prefetch_thread.start()
+    shutdown_thread: threading.Thread | None = None
+    try:
+        assert feature_entered.wait(timeout=1.0)
+        release_feature.set()
+        assert feature_returned.wait(timeout=1.0)
+        shutdown_thread = threading.Thread(target=p.shutdown)
+        shutdown_thread.start()
+        shutdown_thread.join(timeout=2.0)
+        assert not shutdown_thread.is_alive()
+        shutdown_done.set()
+        assert prefetch_done.wait(timeout=2.0)
+        assert prefetch_errors == []
+        assert observed_paths == [expected_db]
+    finally:
+        release_feature.set()
+        shutdown_done.set()
+        prefetch_thread.join(timeout=2.0)
+        if shutdown_thread is not None:
+            shutdown_thread.join(timeout=2.0)
+        p.shutdown()
 
 
 def test_shutdown_hung_worker_logs_warning_no_raise(tmp_path, monkeypatch, caplog):
@@ -329,6 +603,36 @@ def test_sync_turn_does_not_block_behind_full_queue_shutdown():
     assert elapsed < 0.01
     shutdown_thread.join(timeout=2.0)
     assert not shutdown_thread.is_alive()
+
+
+def test_sync_turn_handles_config_clear_between_teardown_admission_reads(tmp_path):
+    """A teardown between config reads cannot make sync_turn raise."""
+
+    class ConfigClearRaceProvider(CashewMemoryProvider):
+        _clear_on_config_read = False
+
+        def __getattribute__(self, name: str) -> Any:
+            if name == "_config" and object.__getattribute__(
+                self, "_clear_on_config_read"
+            ):
+                object.__setattr__(self, "_clear_on_config_read", False)
+                config = object.__getattribute__(self, "_config")
+                object.__setattr__(self, "_config", None)
+                object.__getattribute__(self, "_shutdown_started").set()
+                return config
+            return object.__getattribute__(self, name)
+
+    p = ConfigClearRaceProvider()
+    p.initialize("session-a", hermes_home=str(tmp_path))
+    saved_config = p._config
+    try:
+        p._clear_on_config_read = True
+        p.sync_turn("u", "a")
+    finally:
+        p._clear_on_config_read = False
+        p._config = saved_config
+        p._shutdown_started.clear()
+        p.shutdown()
 
 
 def test_on_session_end_returns_without_draining_queue(tmp_path, monkeypatch):

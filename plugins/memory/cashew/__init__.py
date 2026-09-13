@@ -13,8 +13,9 @@ import re
 import sqlite3
 import threading
 import time
-from typing import Any, Callable, Dict, List, cast
+from typing import Any, Callable, Dict, List
 
+from . import embedding_compat as _embedding_compat
 from .admission import (
     OperationAdmissionError,
     admit_operation,
@@ -103,6 +104,14 @@ from .tools import (
     build_success_envelope,
 )
 
+# Keep these private names available to existing adapter tests and loader
+# integrations while making embedding ownership explicit in embedding_compat.
+_GenerationBoundEmbeddingCache = _embedding_compat.GenerationBoundEmbeddingCache
+_GenerationBoundEmbeddingService = _embedding_compat.GenerationBoundEmbeddingService
+_NoopEmbeddingCache = _embedding_compat.NoopEmbeddingCache
+_UPSTREAM_COMPATIBILITY_SHIMS = _embedding_compat.UPSTREAM_COMPATIBILITY_SHIMS
+_UPSTREAM_KNOWN_DIMS = _embedding_compat.UPSTREAM_KNOWN_DIMS
+
 logger = logging.getLogger(__name__)
 
 
@@ -184,73 +193,6 @@ class _OpaqueUpstreamError(RuntimeError):
         self.partial = partial
 
 
-class _GenerationBoundEmbeddingService:
-    """Make one upstream service unavailable once its owner closes.
-
-    Upstream's service returns cache hits and zero vectors without consulting a
-    backend.  The outer generation gate prevents those convenience paths from
-    letting a closed profile serve another profile's global singleton.
-    """
-
-    def __init__(
-        self,
-        service: Any,
-        supervisor: EmbeddingSupervisor,
-        *,
-        cache_path: pathlib.Path | None = None,
-        model: str | None = None,
-        dimension: int | None = None,
-    ) -> None:
-        self._service = service
-        self._supervisor = supervisor
-        self._cache_path = cache_path
-        self._model = model
-        self._dimension = dimension
-
-    @property
-    def model(self) -> str:
-        return cast(str, self._service.model)
-
-    @property
-    def dim(self) -> int:
-        return cast(int, self._service.dim)
-
-    def embed_np(self, texts: list[str]) -> Any:
-        admission = current_admission()
-        if admission is None and self._cache_path is not None:
-            with admit_operation(
-                cache_path=self._cache_path,
-                model=self._model,
-                embedding_dim=self._dimension,
-                supervisor=self._supervisor,
-                embedding_generation=getattr(self._supervisor, "generation", None),
-                cache_exclusive=True,
-                deadline=1.5,
-            ):
-                with self._supervisor.serve_generation():
-                    return self._service.embed_np(texts)
-        with self._supervisor.serve_generation():
-            return self._service.embed_np(texts)
-
-    def embed(self, text: Any) -> Any:
-        """Keep upstream's public single-text route behind the same gate."""
-        admission = current_admission()
-        if admission is None and self._cache_path is not None:
-            with admit_operation(
-                cache_path=self._cache_path,
-                model=self._model,
-                embedding_dim=self._dimension,
-                supervisor=self._supervisor,
-                embedding_generation=getattr(self._supervisor, "generation", None),
-                cache_exclusive=True,
-                deadline=1.5,
-            ):
-                with self._supervisor.serve_generation():
-                    return self._service.embed(text)
-        with self._supervisor.serve_generation():
-            return self._service.embed(text)
-
-
 # Probe for the Hermes cron module. In a full Hermes Agent environment the
 # cron.jobs package is importable (the agent root is on sys.path). In CI and
 # standalone test environments it is not — the sleep cycle cron job cannot be
@@ -314,163 +256,6 @@ def _ensure_config_file(hermes_home: pathlib.Path) -> None:
 
 
 # ── Upstream embedding model patching ──────────────────────────────────
-
-_UPSTREAM_KNOWN_DIMS: dict[str, int] = {
-    "all-MiniLM-L6-v2": 384,
-    "sentence-transformers/all-MiniLM-L6-v2": 384,
-    "thenlper/gte-large": 1024,
-    "thenlper/gte-base": 768,
-    "thenlper/gte-small": 384,
-    "all-mpnet-base-v2": 768,
-    "BAAI/bge-large-en-v1.5": 1024,
-    "BAAI/bge-base-en-v1.5": 768,
-    "BAAI/bge-small-en-v1.5": 384,
-}
-
-# Cashew-brain at dd57ef0 has no instance-scoped migration or embedding API.
-# These are the only private compatibility seams retained by this adapter:
-#
-# * ``core.config.config.embedding_model`` selects the model used by pinned
-#   migration helpers, which call ``resolve_embedding_dim()`` without args.
-# * ``core.embedding_service._default_service`` is read by ``embed_nodes()``
-#   without accepting a service/backend argument.
-# * ``core.embedding_service._KNOWN_DIMS[model]`` prevents that no-argument
-#   resolver from constructing an in-process LocalBackend for an *unknown*
-#   model after the child has already verified its dimension.
-#
-# Retire these assignments once upstream accepts an explicit service or
-# dimension in its embedding and migration entry points.  Do not add backend
-# method patches, reset the singleton, or write DEFAULT_MODEL/EMBEDDING_DIM:
-# those process-wide compatibility constants cannot safely represent profiles.
-_UPSTREAM_COMPATIBILITY_SHIMS = (
-    "core.config.config.embedding_model",
-    "core.embedding_service._default_service",
-    "core.embedding_service._KNOWN_DIMS[model]",
-)
-
-
-class _NoopEmbeddingCache:
-    """Exact cache surface used when the affected SQLite runtime is unsafe."""
-
-    def __init__(self, path: pathlib.Path) -> None:
-        self.path = str(path)
-
-    def get_many(self, model: str, texts: list[str]) -> list[None]:
-        del model
-        return [None for _ in texts]
-
-    def put_many(self, model: str, pairs: list[tuple[str, Any]]) -> int:
-        del model, pairs
-        return 0
-
-    def get(self, model: str, text: str) -> None:
-        del model, text
-        return None
-
-    def put(self, model: str, text: str, vector: Any) -> None:
-        del model, text, vector
-
-    def size(self, model: str | None = None) -> int:
-        del model
-        return 0
-
-    def invalidate_model(self, model: str) -> None:
-        del model
-
-
-class _GenerationBoundEmbeddingCache:
-    """Reuse the admission-owned cache lease without opening another handle."""
-
-    def __init__(
-        self,
-        cache: Any,
-        *,
-        path: pathlib.Path,
-        model: str,
-        embedding_dim: int,
-        supervisor: Any,
-        generation: str | int | None,
-    ) -> None:
-        self._cache = cache
-        self.path = str(path)
-        self._path = path.resolve(strict=False)
-        self._model = model
-        self._embedding_dim = embedding_dim
-        self._supervisor = supervisor
-        self._generation = generation
-
-    def _check(self, model: str) -> None:
-        admission = current_admission()
-        if admission is None:
-            raise OperationAdmissionError("embedding cache operation is not admitted")
-        if isinstance(self._cache, _NoopEmbeddingCache):
-            # Affected-runtime profiles deliberately carry no cache lease; the
-            # facade remains a harmless exact no-op for upstream calls.
-            if model != self._model:
-                raise OperationAdmissionError(
-                    "embedding cache admission model mismatch"
-                )
-            return
-        if admission.cache_path != self._path:
-            raise OperationAdmissionError("embedding cache admission path mismatch")
-        if admission.model != model or admission.model != self._model:
-            raise OperationAdmissionError("embedding cache admission model mismatch")
-        if admission.embedding_dim not in (None, self._embedding_dim):
-            raise OperationAdmissionError(
-                "embedding cache admission dimension mismatch"
-            )
-        if admission.supervisor is not self._supervisor:
-            raise OperationAdmissionError(
-                "embedding cache admission supervisor mismatch"
-            )
-        if admission.embedding_generation != self._generation:
-            raise OperationAdmissionError(
-                "embedding cache admission generation mismatch"
-            )
-        if admission.cache_lease is None:
-            raise OperationAdmissionError("embedding cache lease is not owned")
-        # The child handshake is the source of truth for dimensions.  Keep the
-        # per-model cache record in the same file scoped to this admission so a
-        # stale facade cannot publish a vector before identity is durable.
-        try:
-            with sqlite3.connect(str(self._path)) as conn:
-                row = conn.execute(
-                    "SELECT embedding_dim FROM hermes_cashew_cache_meta WHERE model=?",
-                    (model,),
-                ).fetchone()
-        except sqlite3.Error as exc:
-            raise OperationAdmissionError(
-                "embedding cache identity metadata is unavailable"
-            ) from exc
-        if row is None or int(row[0]) != self._embedding_dim:
-            raise OperationAdmissionError(
-                "embedding cache model dimension metadata mismatch"
-            )
-
-    def get_many(self, model: str, texts: list[str]) -> Any:
-        self._check(model)
-        return self._cache.get_many(model, texts)
-
-    def put_many(self, model: str, pairs: list[tuple[str, Any]]) -> Any:
-        self._check(model)
-        return self._cache.put_many(model, pairs)
-
-    def get(self, model: str, text: str) -> Any:
-        self._check(model)
-        return self._cache.get(model, text)
-
-    def put(self, model: str, text: str, vector: Any) -> Any:
-        self._check(model)
-        return self._cache.put(model, text, vector)
-
-    def size(self, model: str | None = None) -> Any:
-        selected = model or self._model
-        self._check(selected)
-        return self._cache.size(selected)
-
-    def invalidate_model(self, model: str) -> Any:
-        self._check(model)
-        return self._cache.invalidate_model(model)
 
 
 def _open_profile_embedding_cache(cache_path: pathlib.Path) -> Any:

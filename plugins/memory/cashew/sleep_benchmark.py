@@ -1,14 +1,14 @@
-"""Deterministic, opt-in measurements for the local sleep adapter.
+"""Deterministic, opt-in measurements for the pinned sleep adapter.
 
-This module is deliberately diagnostic.  It runs the existing
-``sleep_refactor.run_sleep_cycle`` against a temporary SQLite database and
+This module is deliberately diagnostic.  It runs the pinned upstream sleep
+cycle through the Hermes adapter against a temporary SQLite database and
 reports the work selected by each phase, phase wall time, edge-cap commit
 integrity, and writer contention.  It does not change the production sleep
 pipeline or provide a second consolidation engine.
 
-The benchmark is useful while the upstream bounded sleep contract is being
-reviewed.  Once that contract is pinned, the same probe can be run against
-the replacement boundary to compare measurements at the same fixture sizes.
+The benchmark records the current bounded sleep contract at the adapter
+boundary.  It can be rerun after a dependency or adapter change to compare
+measurements at the same fixture sizes.
 """
 
 from __future__ import annotations
@@ -25,11 +25,13 @@ from collections.abc import Callable, Iterator
 from typing import Any
 
 import numpy as np
+from core import sleep as upstream_sleep
 
-from . import sleep_refactor
+from . import sleep_adapter
 from .locking import try_shared_lock
 
-DEFAULT_DIMENSION = 64
+EMBEDDING_MODEL = "thenlper/gte-large"
+DEFAULT_DIMENSION = 1024
 
 
 class _SlowEmbeddingClient:
@@ -93,6 +95,23 @@ def _create_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    # sqlite-vec is a required runtime dependency, but retaining the ordinary
+    # table path makes this diagnostic useful on platforms where its native
+    # extension cannot load.  The upstream cycle will then report the
+    # degraded vector capability in its normal result fields.
+    try:
+        import sqlite_vec
+
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.execute(
+            "CREATE VIRTUAL TABLE vec_embeddings USING vec0("
+            f"node_id TEXT PRIMARY KEY, embedding float[{DEFAULT_DIMENSION}] "
+            "distance_metric=cosine)"
+        )
+        conn.enable_load_extension(False)
+    except Exception:
+        conn.enable_load_extension(False)
 
 
 def _seed_database(
@@ -126,7 +145,7 @@ def _seed_database(
                 vector = np.zeros(dimension, dtype=np.float32)
                 vector[index % dimension] = 1.0
             else:
-                vector = np.zeros(node_count + 1, dtype=np.float32)
+                vector = np.zeros(dimension, dtype=np.float32)
                 vector[0] = np.sqrt(pair_similarity)
                 vector[index + 1] = np.sqrt(1.0 - pair_similarity)
             conn.execute(
@@ -166,7 +185,7 @@ def _timed_phases(
 ) -> Iterator[None]:
     """Instrument the existing phase functions for one benchmark call."""
     names = (
-        "_find_candidates",
+        "_find_pairs",
         "_batch_cross_links",
         "_run_dedup",
         "_compute_metrics",
@@ -182,7 +201,7 @@ def _timed_phases(
     def wrap(name: str, original: Callable[..., Any]) -> Callable[..., Any]:
         def measured(*args: Any, **kwargs: Any) -> Any:
             start = time.perf_counter()
-            if name == "_find_candidates":
+            if name == "_find_pairs":
                 event.set()
                 # Do not let a fast candidate pass release the maintenance
                 # lease before the competing participant has sampled it.
@@ -198,13 +217,13 @@ def _timed_phases(
 
     try:
         for name in names:
-            original = getattr(sleep_refactor, name)
+            original = getattr(upstream_sleep, name)
             originals[name] = original
-            setattr(sleep_refactor, name, wrap(name, original))
+            setattr(upstream_sleep, name, wrap(name, original))
         yield
     finally:
         for name, original in originals.items():
-            setattr(sleep_refactor, name, original)
+            setattr(upstream_sleep, name, original)
 
 
 def _measure_sleep_cycle(
@@ -220,7 +239,7 @@ def _measure_sleep_cycle(
 ) -> dict[str, Any]:
     """Run one deterministic cycle and return JSON-safe measurements.
 
-    ``pair_similarity=0.8`` creates cross-link candidates without dedup
+    ``pair_similarity=0.92`` creates cross-link candidates without dedup
     candidates and is useful for exercising the edge cap.  The default uses
     orthogonal vectors, isolating phase and contention costs.
     """
@@ -231,11 +250,12 @@ def _measure_sleep_cycle(
         raise ValueError("limit must be at least 2")
     if max_edges < 0:
         raise ValueError("max_edges must be non-negative")
-    effective_dimension = (
-        node_count + 1
-        if pair_similarity is not None
-        else max(dimension, node_count)
-    )
+    effective_dimension = dimension
+    if effective_dimension != DEFAULT_DIMENSION:
+        raise ValueError(
+            f"dimension must be the calibrated {DEFAULT_DIMENSION}-dimensional "
+            f"{EMBEDDING_MODEL} profile"
+        )
     _seed_database(
         db_path,
         node_count=node_count,
@@ -302,13 +322,13 @@ def _measure_sleep_cycle(
         sqlite_thread.start()
     cycle_started = time.perf_counter()
     with _timed_phases(phase_started, timings, lock_probe_complete):
-        summary = sleep_refactor.run_sleep_cycle(
+        summary = sleep_adapter.run_sleep_cycle(
             str(db_path),
             limit=effective_limit,
             max_edges=max_edges,
             model_fn=None,
             background_dream=False,
-            embedding_model="benchmark",
+            embedding_model=EMBEDDING_MODEL,
             embedding_device="cpu",
             embedding_client=client,
         )

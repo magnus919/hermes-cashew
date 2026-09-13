@@ -37,30 +37,28 @@ def test_benchmark_is_deterministic_and_records_phase_and_contention_evidence() 
     }
     assert report["summary"]["nodes_selected"] == 4
     assert report["summary"]["orphans_embedded"] == 2
-    assert report["embedding_calls"] == 2
+    assert report["embedding_calls"] == 1
     assert report["orphan_rows_with_embeddings"] == 2
     assert report["bounded_integrity"] is True
     assert report["participating_writer"]["observed"] is True
     assert report["participating_writer"]["admitted"] is False
     assert report["participating_writer"]["sqlite_writer_commit_ms"] >= 0
-    assert {"find_candidates", "compute_metrics", "embed_orphans"}.issubset(
+    assert {"find_pairs", "compute_metrics", "embed_orphans"}.issubset(
         report["phase_ms"]
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="#193 upstream replacement must flush pending edges at the cap",
-)
 def test_benchmark_catches_edge_cap_commit_gap() -> None:
     report = run_benchmark(
         node_count=4,
         orphan_count=0,
         delay_s=0,
         max_edges=1,
-        pair_similarity=0.8,
+        pair_similarity=0.92,
     )
 
     assert report["summary"]["cross_link_capped"] is True
+    # Count persisted directed rows separately from pair statistics so a
+    # future dependency update cannot silently claim work that was not
+    # committed.
     assert report["bounded_integrity"] is True

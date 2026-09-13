@@ -198,9 +198,9 @@ python3 scripts/benchmark-sleep-contention.py --nodes 32 128 --orphans 4 --delay
 ```
 
 The default orthogonal fixture isolates phase cost. To exercise the edge cap,
-use `--pair-similarity 0.8 --max-edges 1`; the current pinned local adapter is
-expected to report `bounded_integrity: false` because its known pending batch
-is not flushed when the cap is reached. That is measurement evidence for
+use `--pair-similarity 0.92 --max-edges 1`; the current pinned adapter is
+expected to report truthful directed-row accounting when the cap is reached.
+That is measurement evidence for
 [#193](https://github.com/magnus919/hermes-cashew/issues/193), not a production
 claim. The harness never opens `~/.hermes` and does not alter the production
 sleep implementation.

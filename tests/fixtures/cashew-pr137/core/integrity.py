@@ -28,6 +28,7 @@ from typing import Any
 
 import numpy as np
 
+
 _REQUIRED_TABLES = {
     "thought_nodes",
     "embeddings",
@@ -309,7 +310,8 @@ def inspect_integrity(
     )
     counts = report["counts"]
     rows = conn.execute(
-        "SELECT node_id, vector, model FROM embeddings ORDER BY node_id LIMIT 1001"
+        "SELECT node_id, vector, model FROM embeddings "
+        "ORDER BY node_id LIMIT 1001"
     ).fetchall()
     counts["embeddings"] = len(rows)
     if len(rows) > 1000:
@@ -390,7 +392,9 @@ def inspect_integrity(
             "WHERE node_type='core_memory' AND COALESCE(permanent,0)=0"
         ).fetchone()[0]
     )
-    anomaly_keys = {key for key in counts if key not in {"embeddings"}}
+    anomaly_keys = {
+        key for key in counts if key not in {"embeddings"}
+    }
     report["status"] = "findings" if any(counts[key] for key in anomaly_keys) else "ok"
     report["uncertainty"] = ["historical_consolidation"]
     return report
@@ -509,8 +513,9 @@ def repair_integrity(
         ).fetchone()[0]
     )
     vec_operational = vec_status == "present" and _load_vec(conn)
-    vec_ready = vec_operational and (
-        expected_dimension is None or vec_dimension == expected_dimension
+    vec_ready = (
+        vec_operational
+        and (expected_dimension is None or vec_dimension == expected_dimension)
     )
     if vec_operational:
         vec_ids, vec_issues = _vec_issues(
@@ -544,10 +549,7 @@ def repair_integrity(
     if vec_needed and require_vec_parity and not vec_ready:
         if vec_reason:
             report["reasons"].append(vec_reason)
-        elif expected_dimension is not None and vec_dimension not in (
-            None,
-            expected_dimension,
-        ):
+        elif expected_dimension is not None and vec_dimension not in (None, expected_dimension):
             report["reasons"].append("vec_dimension_mismatch")
         else:
             report["reasons"].append("vec_index_unverifiable")
@@ -605,17 +607,12 @@ def repair_integrity(
 
             def remove_orphan(rowid=rowid, node_id=node_id) -> None:
                 conn.execute("DELETE FROM embeddings WHERE rowid=?", (rowid,))
-                if (
-                    conn.execute(
-                        "SELECT 1 FROM embeddings WHERE rowid=?", (rowid,)
-                    ).fetchone()
-                    is not None
-                ):
+                if conn.execute(
+                    "SELECT 1 FROM embeddings WHERE rowid=?", (rowid,)
+                ).fetchone() is not None:
                     raise RuntimeError("orphan_embedding_not_removed")
                 if vec_ready and node_id is not None:
-                    conn.execute(
-                        "DELETE FROM vec_embeddings WHERE node_id=?", (node_id,)
-                    )
+                    conn.execute("DELETE FROM vec_embeddings WHERE node_id=?", (node_id,))
 
             if run_item(remove_orphan):
                 repairs["orphan_embeddings_removed"] += 1
@@ -636,12 +633,9 @@ def repair_integrity(
 
             def remove_edge(rowid=rowid) -> None:
                 conn.execute("DELETE FROM derivation_edges WHERE rowid=?", (rowid,))
-                if (
-                    conn.execute(
-                        "SELECT 1 FROM derivation_edges WHERE rowid=?", (rowid,)
-                    ).fetchone()
-                    is not None
-                ):
+                if conn.execute(
+                    "SELECT 1 FROM derivation_edges WHERE rowid=?", (rowid,)
+                ).fetchone() is not None:
                     raise RuntimeError("orphan_edge_not_removed")
 
             if run_item(remove_edge):
@@ -685,9 +679,7 @@ def repair_integrity(
                 else "embedding_missing"
             )
             stale = node_id is None or ordinary is None or decayed not in (None, 0)
-            model_compatible = (
-                embedding_model is None or ordinary_model == embedding_model
-            )
+            model_compatible = embedding_model is None or ordinary_model == embedding_model
             mismatched = (
                 not stale
                 and vector_reason is None
@@ -786,28 +778,16 @@ def repair_integrity(
                 if not item_budget():
                     break
                 old_reason = _decode_vector(_old_blob, expected_dimension)
-                if (
-                    _old_blob is not None
-                    and old_reason is None
-                    and _old_model == embedding_model
-                ):
+                if _old_blob is not None and old_reason is None and _old_model == embedding_model:
                     continue
                 try:
                     encoded = embedding_fn([str(content)])
                     blob = _normalise_vector(encoded[0], expected_dimension)
-                except (
-                    IndexError,
-                    TypeError,
-                    ValueError,
-                    RuntimeError,
-                    OSError,
-                ) as exc:
+                except (IndexError, TypeError, ValueError, RuntimeError, OSError) as exc:
                     _record(skipped, str(exc) or type(exc).__name__)
                     continue
 
-                def replace_embedding(
-                    node_id=node_id, content=content, blob=blob
-                ) -> None:
+                def replace_embedding(node_id=node_id, content=content, blob=blob) -> None:
                     current = conn.execute(
                         "SELECT content FROM thought_nodes WHERE id=?", (node_id,)
                     ).fetchone()
@@ -820,9 +800,7 @@ def repair_integrity(
                         (node_id, blob, embedding_model, now),
                     )
                     if vec_ready:
-                        conn.execute(
-                            "DELETE FROM vec_embeddings WHERE node_id=?", (node_id,)
-                        )
+                        conn.execute("DELETE FROM vec_embeddings WHERE node_id=?", (node_id,))
                         conn.execute(
                             "INSERT INTO vec_embeddings(node_id, embedding) VALUES (?, ?)",
                             (node_id, blob),
@@ -846,14 +824,8 @@ def repair_integrity(
                 break
 
             def resolve_conflict(node_id=node_id) -> None:
-                column = (
-                    "decayed"
-                    if permanence_policy == "preserve_permanent"
-                    else "permanent"
-                )
-                conn.execute(
-                    f"UPDATE thought_nodes SET {column}=0 WHERE id=?", (node_id,)
-                )
+                column = "decayed" if permanence_policy == "preserve_permanent" else "permanent"
+                conn.execute(f"UPDATE thought_nodes SET {column}=0 WHERE id=?", (node_id,))
 
             if run_item(resolve_conflict):
                 repairs["permanence_conflicts_resolved"] += 1
@@ -904,7 +876,9 @@ def repair_integrity(
         actionable_keys.add("permanent_and_decayed")
     if "promote_core_memories" in selected:
         actionable_keys.add("core_memory_not_permanent")
-    remaining_actionable = any(remaining_counts.get(key, 0) for key in actionable_keys)
+    remaining_actionable = any(
+        remaining_counts.get(key, 0) for key in actionable_keys
+    )
     report["status"] = (
         "partial" if skipped or failures or remaining_actionable else "completed"
     )

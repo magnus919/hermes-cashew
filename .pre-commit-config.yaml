@@ -4,7 +4,9 @@ repos:
     hooks:
       - id: ruff
         args: [--fix]
+        exclude: ^tests/fixtures/cashew-pr137/core/integrity\.py$
       - id: ruff-format
+        exclude: ^tests/fixtures/cashew-pr137/core/integrity\.py$
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0

@@ -587,3 +587,31 @@ def test_path_apply_without_confirmation_is_rejected_before_opening_database(
         "confirmed": False,
         "reason": "explicit_confirmation_required",
     }
+
+
+def test_apply_with_caller_connection_fails_closed_without_upstream_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Older Cashew installations remain safe when a caller supplies a handle."""
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(path)
+    conn.execute("BEGIN")
+    monkeypatch.setattr(integrity, "_upstream_integrity_api", lambda: None)
+
+    report = apply_integrity_repairs(conn=conn, confirm=True)
+
+    assert report == {
+        "schema_version": 1,
+        "status": "unavailable",
+        "mutated": False,
+        "confirmed": True,
+        "reason": "stable_targeted_repair_api_unavailable",
+        "message": (
+            "Cashew repair remains unavailable because this installed Cashew "
+            "does not provide the connection-aware targeted repair API."
+        ),
+        "repairs": [],
+    }
+    assert conn.in_transaction
+    conn.rollback()
+    conn.close()

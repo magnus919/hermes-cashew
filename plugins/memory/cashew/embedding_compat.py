@@ -40,7 +40,7 @@ UPSTREAM_KNOWN_DIMS: dict[str, int] = {
 }
 
 # These are the only private compatibility seams retained by the adapter for
-# cashew-brain at the pinned dd57ef0 source.  See the provider binding call for
+# cashew-brain at the pinned composite source. See the provider binding call for
 # the publication ordering and #193 for the upstream replacement gate.
 UPSTREAM_COMPATIBILITY_SHIMS = (
     "core.config.config.embedding_model",

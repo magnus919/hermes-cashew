@@ -35,11 +35,12 @@ def main() -> None:
     expected_hash = f"sha256={ARCHIVE_SHA256}"
     url_hash = urlsplit(actual_url).fragment
     archive_hash = direct_url.get("archive_info", {}).get("hash", "")
-    if expected_hash not in (url_hash, archive_hash):
-        raise SystemExit(
-            f"unexpected cashew-brain archive hash: {url_hash or archive_hash}; "
-            f"expected {expected_hash}"
-        )
+    if url_hash or archive_hash:
+        if expected_hash not in (url_hash, archive_hash):
+            raise SystemExit(
+                f"unexpected cashew-brain archive hash: {url_hash or archive_hash}; "
+                f"expected {expected_hash}"
+            )
 
     session_path = Path(distribution.locate_file("core/session.py"))
     actual_hash = hashlib.sha256(session_path.read_bytes()).hexdigest()

@@ -44,7 +44,10 @@ This archive is a temporary composite fork of upstream Cashew. It combines PR
 those changes are reviewed upstream; replace this pin with the canonical
 upstream release once both changes are available there.
 
-The verification step is required because the selected source and the older
+The lockfile enforces the archive digest during installation; uv may omit that
+digest from the installed PEP 610 metadata, so verification requires the exact
+source URL and validates a recorded digest when one is present. The verification
+step is required because the selected source and the older
 PyPI release both report version `1.2.1`. A version-only check cannot tell them
 apart. It also checks the linked SQLite version and source ID. Both the selected
 source and the existing PyPI `1.2.1` code require SQLite 3.35 or newer to

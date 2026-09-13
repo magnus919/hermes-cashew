@@ -50,11 +50,10 @@ def test_installed_cashew_has_selected_source_provenance() -> None:
     direct_url = json.loads(direct_url_text)
     actual_url = direct_url["url"]
     assert urlunsplit(urlsplit(actual_url)._replace(fragment="")) == CASHEW_ARCHIVE_URL
-    assert (
-        urlsplit(actual_url).fragment == f"sha256={CASHEW_ARCHIVE_SHA256}"
-        or direct_url.get("archive_info", {}).get("hash")
-        == f"sha256={CASHEW_ARCHIVE_SHA256}"
-    )
+    recorded_hash = urlsplit(actual_url).fragment or direct_url.get(
+        "archive_info", {}
+    ).get("hash", "")
+    assert recorded_hash in ("", f"sha256={CASHEW_ARCHIVE_SHA256}")
 
     session_path = Path(distribution.locate_file("core/session.py"))
     assert hashlib.sha256(session_path.read_bytes()).hexdigest() == (

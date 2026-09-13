@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -100,19 +101,53 @@ def main() -> int:
         env["PYTHONPATH"] = os.pathsep.join(
             [str(repo_root), str(shim), env.get("PYTHONPATH", "")]
         )
-        return subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pytest",
-                "-q",
-                "-rs",
-                "tests/test_sleep_cron_lifecycle.py",
-            ],
+        pytest_args = [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-rs",
+            "tests/test_sleep_cron_lifecycle.py",
+        ]
+        collected = subprocess.run(
+            [*pytest_args, "--collect-only"],
             cwd=repo_root,
             env=env,
+            capture_output=True,
+            text=True,
             check=False,
-        ).returncode
+        )
+        print(collected.stdout, end="")
+        print(collected.stderr, end="", file=sys.stderr)
+        collection_match = re.search(r"(\d+) tests? collected", collected.stdout)
+        if collected.returncode != 0 or not collection_match:
+            print("host contract collection failed", file=sys.stderr)
+            return collected.returncode or 1
+        if int(collection_match.group(1)) < 14:
+            print(
+                f"host contract collected too few tests: {collection_match.group(1)}",
+                file=sys.stderr,
+            )
+            return 1
+
+        completed = subprocess.run(
+            pytest_args,
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        output = completed.stdout + completed.stderr
+        print(output, end="")
+        summary = re.search(r"(\d+) passed(?:, (\d+) skipped)?", output)
+        if completed.returncode != 0 or not summary:
+            print("host contract execution failed", file=sys.stderr)
+            return completed.returncode or 1
+        if int(summary.group(2) or 0) != 0:
+            print("host contract unexpectedly skipped tests", file=sys.stderr)
+            return 1
+        return 0
 
 
 if __name__ == "__main__":

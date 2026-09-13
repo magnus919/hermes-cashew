@@ -23,7 +23,15 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("cron.jobs", reason="Hermes Agent cron module not available")
+if os.environ.get("HERMES_CASHEW_REAL_HERMES") == "1":
+    try:
+        import cron.jobs  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "pinned Hermes host lane could not import cron.jobs"
+        ) from exc
+else:
+    pytest.importorskip("cron.jobs", reason="Hermes Agent cron module not available")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

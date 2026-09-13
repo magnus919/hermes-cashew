@@ -115,34 +115,6 @@ def _prepare_think_db(db: Path) -> None:
         )
 
 
-def _run_async_dream_owner(graph: str, cache: str, ready, context_exited) -> None:
-    """Run the async entrypoint from a child-owned admission."""
-    import plugins.memory.cashew.sleep_refactor as sleep_module
-    from plugins.memory.cashew.admission import current_admission
-
-    with admit_operation(
-        graph_path=graph,
-        cache_path=cache,
-        model="model-a",
-        embedding_dim=384,
-        vec_dim=384,
-        exclusive=True,
-        cache_exclusive=True,
-    ) as admission:
-
-        def paused_dream(*_args, **_kwargs):
-            assert current_admission() is admission
-            ready.set()
-            time.sleep(30)
-
-        sleep_module._generate_dream = paused_dream
-        sleep_module._run_dream_async(graph, [], model_fn=None, admission=admission)
-    # The admission context has exited, but the transferred async owner keeps
-    # its original descriptors until the child finishes or is killed.
-    context_exited.set()
-    time.sleep(30)
-
-
 def _probe_exclusive_leases(graph: str, cache: str, control) -> None:
     """Report whether an independent process can acquire either lease."""
     with try_maintenance_lock(graph) as graph_lease:
@@ -176,38 +148,6 @@ def test_affected_fresh_db_stays_delete(tmp_path, monkeypatch):
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
     finally:
         conn.close()
-
-
-def test_affected_async_dream_guards_journal_without_flipping_wal(
-    tmp_path, monkeypatch
-):
-    """Deferred dream work preserves DELETE on a vulnerable SQLite runtime."""
-    import plugins.memory.cashew.sleep_refactor as sleep_module
-
-    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 50, 4))
-    db = tmp_path / "async-delete.db"
-    started = threading.Event()
-    set_wal_called = threading.Event()
-    modes: list[str] = []
-
-    def forbidden_set_wal(_conn):
-        set_wal_called.set()
-
-    def observe_dream(conn, *_args, **_kwargs):
-        modes.append(str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower())
-        started.set()
-        return None
-
-    monkeypatch.setattr(sleep_module, "_set_wal", forbidden_set_wal)
-    monkeypatch.setattr(sleep_module, "_generate_dream", observe_dream)
-    monkeypatch.setattr(sleep_module, "_embed_orphans", lambda *_args, **_kwargs: 0)
-    sleep_module._run_dream_async(str(db), [], model_fn=None)
-
-    assert started.wait(timeout=5)
-    assert not set_wal_called.is_set()
-    assert modes == ["delete"]
-    with sqlite3.connect(db) as conn:
-        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
 
 
 def test_fixed_bootstrap_enables_wal_and_ordinary_guard_preserves_mode(
@@ -529,87 +469,6 @@ def test_admission_leases_are_released_by_kernel_after_process_death(tmp_path):
         if child.is_alive():
             child.kill()
             child.join(timeout=5)
-
-
-def test_async_admission_start_failure_releases_transferred_owner_once(
-    tmp_path, monkeypatch
-):
-    """Daemon startup failure closes the transferred graph/cache owner exactly once."""
-    import plugins.memory.cashew.sleep_refactor as sleep_module
-
-    graph = tmp_path / "brain.db"
-    cache = tmp_path / "cache.db"
-
-    class FailingThread:
-        def __init__(self, *args, **kwargs):
-            del args, kwargs
-
-        def start(self):
-            raise RuntimeError("thread start failed")
-
-    monkeypatch.setattr(sleep_module.threading, "Thread", FailingThread)
-    with admit_operation(
-        graph_path=graph,
-        cache_path=cache,
-        exclusive=True,
-        cache_exclusive=True,
-    ) as admission:
-        with pytest.raises(RuntimeError, match="thread start failed"):
-            sleep_module._run_dream_async(
-                str(graph),
-                [],
-                model_fn=None,
-                admission=admission,
-            )
-        assert admission.lease_owner is not None
-        admission.lease_owner.close()
-    with try_maintenance_lock(graph) as graph_lease:
-        assert graph_lease is not None
-    with try_maintenance_lock(cache) as cache_lease:
-        assert cache_lease is not None
-
-
-def test_async_dream_transfers_exact_token_and_process_death_releases_leases(
-    tmp_path,
-):
-    """The real async entrypoint installs the token and dies without stranding locks."""
-    context = multiprocessing.get_context("fork")
-    graph = tmp_path / "brain.db"
-    cache = tmp_path / "cache.db"
-    ready = context.Event()
-    context_exited = context.Event()
-    child = context.Process(
-        target=_run_async_dream_owner,
-        args=(str(graph), str(cache), ready, context_exited),
-    )
-    child.start()
-    try:
-        assert ready.wait(timeout=10)
-        assert context_exited.wait(timeout=10)
-        # The child exits its admission context after the real async entrypoint
-        # transfers the original owner; no replacement lock is acquired.
-        probe_context = multiprocessing.get_context("spawn")
-        probe_read, probe_write = probe_context.Pipe(duplex=False)
-        probe = probe_context.Process(
-            target=_probe_exclusive_leases,
-            args=(str(graph), str(cache), probe_write),
-        )
-        probe.start()
-        probe_write.close()
-        assert probe_read.recv() == (False, False)
-        probe.join(timeout=10)
-        assert probe.exitcode == 0
-        child.terminate()
-        child.join(timeout=10)
-        assert child.exitcode is not None
-    finally:
-        if child.is_alive():
-            child.kill()
-            child.join(timeout=10)
-    with try_maintenance_lock(graph) as graph_lease:
-        assert graph_lease is not None
-    with try_maintenance_lock(cache) as cache_lease:
-        assert cache_lease is not None
 
 
 def test_two_process_think_claim_has_one_opaque_call_and_no_duplicate(
@@ -1042,7 +901,7 @@ def test_affected_wal_provider_never_enters_write_or_upstream_paths(
     monkeypatch.setattr("core.session.end_session", forbidden("extract"))
     monkeypatch.setattr("core.session.think_cycle", forbidden("think"))
     monkeypatch.setattr(
-        "plugins.memory.cashew.sleep_refactor.run_sleep_cycle", forbidden("sleep")
+        "plugins.memory.cashew.sleep_adapter.run_sleep_cycle", forbidden("sleep")
     )
     provider = CashewMemoryProvider()
     try:

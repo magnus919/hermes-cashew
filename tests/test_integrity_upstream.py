@@ -22,14 +22,22 @@ _EXPECTED_HEAD = "cb940f34c15460b87831748b2e702334c1c5fbd0"
 _EXPECTED_SOURCE_SHA256 = (
     "80e928c4a073aadb9340095a27b65f03512393d9c1e03cfd025e9aa70d99b9ba"
 )
+_EXPECTED_TREE = "6cdfe80080cacbb8e3a654e37102e15149b26637"
+_EXPECTED_BLOB_SHA1 = "aca174033e7a81c33d991e9d3f8516f392c9fb38"
 
 
 def test_fixture_records_immutable_upstream_provenance() -> None:
     provenance = json.loads((_FIXTURE / "PROVENANCE.json").read_text())
     assert provenance["commit"] == _EXPECTED_HEAD
+    assert provenance["tree"] == _EXPECTED_TREE
     assert provenance["source"] == "core/integrity.py"
+    assert provenance["git_blob_sha1"] == _EXPECTED_BLOB_SHA1
     assert provenance["sha256"] == _EXPECTED_SOURCE_SHA256
-    assert hashlib.sha256(_UPSTREAM_SOURCE.read_bytes()).hexdigest() == (
+    source_bytes = _UPSTREAM_SOURCE.read_bytes()
+    assert hashlib.sha1(
+        b"blob " + str(len(source_bytes)).encode() + b"\0" + source_bytes
+    ).hexdigest() == _EXPECTED_BLOB_SHA1
+    assert hashlib.sha256(source_bytes).hexdigest() == (
         _EXPECTED_SOURCE_SHA256
     )
 

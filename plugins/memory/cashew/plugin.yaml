@@ -8,7 +8,6 @@ description: "Cashew — persistent thought-graph memory with local embeddings, 
 pip_dependencies:
   - "cashew-brain @ https://github.com/rajkripal/cashew/archive/ac090ce75ffd2e97dac257cee9430628c68aa241.tar.gz#sha256=0777dcb89bde8e0d6103786358c93c0ad3fd4ffb7f8a210194c37b211ae4c28b"
   - "numpy"
-  - "scikit-learn"
   - "sentence-transformers"
   - "sqlite-vec"
 requires_env: []

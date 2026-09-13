@@ -70,7 +70,7 @@ def test_source_install_docs_require_reinstall_and_provenance_check() -> None:
     assert "scripts/verify-cashew-baseline.py" in integration_readme
 
 
-def test_sleep_cycle_dependencies_are_direct_project_requirements() -> None:
+def test_embedding_runtime_dependencies_are_direct_project_requirements() -> None:
     root = Path(__file__).parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text())
     dependency_names = {
@@ -78,4 +78,5 @@ def test_sleep_cycle_dependencies_are_direct_project_requirements() -> None:
         for dependency in project["project"]["dependencies"]
     }
 
-    assert {"numpy", "scikit-learn", "sentence-transformers"} <= dependency_names
+    assert {"numpy", "sentence-transformers"} <= dependency_names
+    assert "scikit-learn" not in dependency_names

@@ -34,7 +34,7 @@ def _write_installation(implementation: Path, identity: str) -> None:
     implementation.mkdir(parents=True)
     source_template = Path(provider_module.__file__).parent / "sleep_cron_script.py"
     (implementation / "sleep_cron_script.py").write_text(source_template.read_text())
-    source_root = Path(provider_module.__file__).parent
+    source_root = Path(__file__).parents[1] / "plugins" / "memory" / "cashew"
     # The generated entry point must exercise the same admission and journal
     # modules as a profile install, rather than a test-only replacement.
     (implementation / "admission.py").write_text(
@@ -201,6 +201,47 @@ def test_generated_cron_script_runs_from_registered_installation(
     assert result["embedding_device"] == "mps"
     assert result["embedding_client"] == "EmbeddingSupervisor"
     assert events.read_text().splitlines() == ["start", "run", "close"]
+
+
+@pytest.mark.parametrize("kind", ["flat", "development"])
+def test_generated_script_executes_real_upstream_sleep_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """Both installed layouts must execute the pinned public upstream call."""
+    hermes_home, script, implementation = _generate_script(tmp_path, monkeypatch, kind)
+    source_root = Path(__file__).parents[1] / "plugins" / "memory" / "cashew"
+    config_path = implementation / "config.py"
+    config_path.write_text(config_path.read_text().replace("'384'", "'1024'"))
+    (implementation / "sleep_adapter.py").write_text(
+        (source_root / "sleep_adapter.py").read_text()
+    )
+    (implementation / "embedding_process.py").write_text(
+        "import numpy as np\n"
+        "class EmbeddingSupervisor:\n"
+        "    dimension = 1024\n"
+        "    generation = 'candidate-test'\n"
+        "    def __init__(self, **kwargs): pass\n"
+        "    def start(self): return self.dimension\n"
+        "    def encode(self, texts): return np.zeros((len(texts), self.dimension), dtype=np.float32)\n"
+        "    def close(self): pass\n"
+    )
+    (hermes_home / "cashew.json").write_text(
+        json.dumps({"embedding_model": "thenlper/gte-large"})
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        cwd=tmp_path,
+        env={"HERMES_HOME": str(hermes_home), "PATH": os.defpath, "PYTHONPATH": ""},
+    )
+
+    result = json.loads(completed.stdout)
+    assert result["status"] == "unavailable"
+    assert result["error"] == "no_embeddings_table"
 
 
 def test_generated_cron_script_closes_owned_child_after_sleep_failure(

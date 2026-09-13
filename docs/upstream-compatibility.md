@@ -33,8 +33,9 @@ tree `29d97fb93c7998c97be0da8f19b90c6523f9d1e9`, combining PR 136
 (`ac090ce75ffd2e97dac257cee9430628c68aa241`) and PR 137
 (`cb940f34c15460b87831748b2e702334c1c5fbd0`). Production installs use the
 exact source archive and digest below rather than floating on Cashew `main`.
-Replace this temporary fork with the canonical upstream release once both
-changes are merged upstream:
+The composite is the tested production baseline while those upstream pull
+requests remain open. A later dependency PR may replace it with a canonical
+upstream commit after independently verifying the same contracts:
 
 ```text
 https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz
@@ -178,24 +179,21 @@ The final #187 verification target is the full offline suite:
 uv run --frozen --extra dev pytest
 ```
 
-### Integrity repair staging
+### Integrity repair delegation
 
-The production Cashew source remains pinned to the reviewed PR #136 archive.
-This branch therefore keeps the adapter fail-closed when the installed package
-does not expose `core.integrity`: `apply_integrity_repairs` returns the
-structured `stable_targeted_repair_api_unavailable` result without opening a
-database path. A staged subprocess fixture copies only
-`core/integrity.py` from upstream PR #137 commit
-`cb940f34c15460b87831748b2e702334c1c5fbd0` and records its SHA-256 provenance
-in `tests/fixtures/cashew-pr137/PROVENANCE.json`.
+The selected composite includes the connection-aware `core.integrity` contract
+from upstream PR #137. The adapter delegates `inspect_integrity(conn, ...)`
+and explicitly confirmed `apply_integrity_repairs(conn=conn, ...)` to that
+module. The caller supplies an open connection inside its outer transaction and
+retains ownership of locking, backup, commit, rollback, post-repair inspection,
+and close. Path-only CLI calls are rejected without opening a database, and
+older installations without `core.integrity` remain fail-closed.
 
-When, and only when, canonical upstream contains that contract plus the
-required #193/#236 immutable provenance updates, the adapter can delegate
-`inspect_integrity(conn, ...)` and explicitly confirmed
-`apply_integrity_repairs(conn=conn, ...)`. The caller supplies an open
-connection inside its outer transaction and retains ownership of locking,
-backup, commit, rollback, post-repair inspection, and close. No production pin
-or mutable fork reference is changed by this staging work.
+The subprocess fixture in `tests/fixtures/cashew-pr137/` is test evidence only.
+Its `core/integrity.py` bytes and SHA-256 are checked against upstream PR #137;
+the installed composite is checked separately by the selected-source baseline
+tests. No production code is copied from the fixture and no upstream maintainer
+merge is required for this baseline.
 
 This document does not claim that a local source build, a static import, or a
 passing component test proves production compatibility. A future baseline must

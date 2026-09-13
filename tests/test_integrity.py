@@ -549,7 +549,7 @@ def test_audit_rejects_incomplete_schema_without_mutating(tmp_path: Path) -> Non
     assert "schema_table_missing" in report["reasons"]
 
 
-def test_apply_is_explicitly_unavailable_and_does_not_open_database(
+def test_apply_requires_caller_connection_and_does_not_open_database(
     tmp_path: Path, monkeypatch
 ) -> None:
     path = tmp_path / "does-not-exist.db"
@@ -566,34 +566,24 @@ def test_apply_is_explicitly_unavailable_and_does_not_open_database(
 
     assert report == {
         "schema_version": 1,
-        "status": "unavailable",
+        "status": "rejected",
         "mutated": False,
         "confirmed": True,
-        "reason": "stable_targeted_repair_api_unavailable",
-        "message": (
-            "Cashew repair remains unavailable until upstream provides a "
-            "connection-aware targeted repair API with atomic ordinary/vec writes."
-        ),
-        "repairs": [],
+        "reason": "caller_connection_required",
     }
     assert not path.exists()
 
 
-def test_legacy_apply_without_confirmation_preserves_unavailable_envelope(
+def test_path_apply_without_confirmation_is_rejected_before_opening_database(
     tmp_path: Path,
 ) -> None:
-    """The pre-contract pin stays unavailable for every legacy path call."""
+    """Path-based CLI calls cannot satisfy the caller-owned API contract."""
     report = apply_integrity_repairs(tmp_path / "does-not-exist.db")
 
     assert report == {
         "schema_version": 1,
-        "status": "unavailable",
+        "status": "rejected",
         "mutated": False,
         "confirmed": False,
-        "reason": "stable_targeted_repair_api_unavailable",
-        "message": (
-            "Cashew repair remains unavailable until upstream provides a "
-            "connection-aware targeted repair API with atomic ordinary/vec writes."
-        ),
-        "repairs": [],
+        "reason": "explicit_confirmation_required",
     }

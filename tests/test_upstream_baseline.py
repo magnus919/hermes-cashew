@@ -24,7 +24,6 @@ if importlib.machinery.PathFinder.find_spec("core", sys.path) is None:
 from core import integrity  # noqa: E402
 from core.db import NODE_COLUMNS, ensure_schema, schema_version  # noqa: E402, I001
 
-
 CASHEW_ARCHIVE_URL = (
     "https://github.com/magnus919/true/archive/"
     "fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz"

@@ -9,6 +9,7 @@ import json
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 ARCHIVE_URL = (
     "https://github.com/magnus919/true/archive/"
@@ -29,13 +30,15 @@ def main() -> None:
         )
     direct_url = json.loads(direct_url_text)
     actual_url = direct_url["url"]
-    if actual_url != ARCHIVE_URL:
+    if urlunsplit(urlsplit(actual_url)._replace(fragment="")) != ARCHIVE_URL:
         raise SystemExit(f"unexpected cashew-brain source: {actual_url}")
+    expected_hash = f"sha256={ARCHIVE_SHA256}"
+    url_hash = urlsplit(actual_url).fragment
     archive_hash = direct_url.get("archive_info", {}).get("hash", "")
-    if archive_hash != f"sha256={ARCHIVE_SHA256}":
+    if expected_hash not in (url_hash, archive_hash):
         raise SystemExit(
-            f"unexpected cashew-brain archive hash: {archive_hash}; "
-            f"expected sha256={ARCHIVE_SHA256}"
+            f"unexpected cashew-brain archive hash: {url_hash or archive_hash}; "
+            f"expected {expected_hash}"
         )
 
     session_path = Path(distribution.locate_file("core/session.py"))

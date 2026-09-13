@@ -986,6 +986,9 @@ def apply_integrity_repairs(
     ``backup_dir`` remain metadata-only compatibility arguments.
     """
     del db_path, backup_dir
+    api = _upstream_integrity_api()
+    if api is None:
+        return _repair_unavailable(confirm=confirm)
     if not confirm:
         return {
             "schema_version": 1,
@@ -994,9 +997,6 @@ def apply_integrity_repairs(
             "confirmed": False,
             "reason": "explicit_confirmation_required",
         }
-    api = _upstream_integrity_api()
-    if api is None:
-        return _repair_unavailable(confirm=True)
     if not isinstance(conn, sqlite3.Connection):
         return {
             "schema_version": 1,

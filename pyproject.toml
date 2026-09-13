@@ -60,6 +60,10 @@ allow-direct-references = true
 # Doing so would shadow Hermes's bundled memory providers when both are on sys.path.
 packages = ["plugins"]
 
+[tool.hatch.build.targets.sdist]
+# The upstream source fixture is immutable test evidence, not a release input.
+exclude = ["/tests/fixtures/cashew-pr137"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

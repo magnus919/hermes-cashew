@@ -274,7 +274,7 @@ def test_cron_script_is_installed(tmp_path, monkeypatch):
     assert script_path.exists(), f"Cron script not found at {script_path}"
     content = script_path.read_text()
     assert "run_sleep_cycle" in content
-    assert "plugins.memory.cashew.sleep_refactor" in content
+    assert "plugins.memory.cashew.sleep_adapter" in content
 
     provider.shutdown()
 

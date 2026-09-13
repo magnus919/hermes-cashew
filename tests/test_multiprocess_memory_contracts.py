@@ -239,17 +239,17 @@ elif action == "sync":
     emit("result", result={"drained": True})
 
 elif action == "sleep":
-    import plugins.memory.cashew.sleep_refactor as sleep
-    original_set_wal = sleep._set_wal
-    def paused_set_wal(conn):
-        original_set_wal(conn)
+    import plugins.memory.cashew.sleep_adapter as sleep
+    original_guard = sleep.guard_sqlite_journal
+    def paused_guard(conn):
+        original_guard(conn)
         emit("maintenance_locked")
         if command() != "release":
             raise RuntimeError("expected release command")
         assert overlap is not None
         (overlap / "phase_started").write_text("sleep")
         wait_for(overlap / "writer_started")
-    sleep._set_wal = paused_set_wal
+    sleep.guard_sqlite_journal = paused_guard
     emit("ready")
     if command() != "start":
         raise RuntimeError("expected start command")
@@ -779,7 +779,7 @@ def test_sleep_lock_contention_has_bounded_named_skip(tmp_path: Path) -> None:
         _send(holder, "hold")
         _event(holder, "maintenance_locked")
         started = time.monotonic()
-        from plugins.memory.cashew.sleep_refactor import run_sleep_cycle
+        from plugins.memory.cashew.sleep_adapter import run_sleep_cycle
 
         assert run_sleep_cycle(str(home / "brain.db"), model_fn=None) == {}
         assert time.monotonic() - started < 3
@@ -807,7 +807,7 @@ def test_real_extract_overlaps_sleep_and_preserves_its_marker(tmp_path: Path) ->
         (overlap / "writer_started").write_text("rejected")
         _send(sleeper, "release")
         sleep_result = _result(sleeper)
-        assert "error" not in sleep_result
+        assert sleep_result.get("error") is None
         assert sleep_result["nodes_selected"] >= 2
     finally:
         _terminate(sleeper)

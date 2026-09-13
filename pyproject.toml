@@ -111,7 +111,7 @@ module = "plugins.memory.cashew"
 disable_error_code = ["type-arg", "index"]
 
 [[tool.mypy.overrides]]
-module = "plugins.memory.cashew.sleep_refactor"
+module = "plugins.memory.cashew.sleep_adapter"
 disable_error_code = ["type-arg"]
 
 [tool.deptry]

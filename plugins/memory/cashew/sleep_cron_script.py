@@ -76,7 +76,7 @@ def _load_profile_modules(hermes_home: Path):
         )
     if (
         not (implementation / "config.py").is_file()
-        or not (implementation / "sleep_refactor.py").is_file()
+        or not (implementation / "sleep_adapter.py").is_file()
         or not (implementation / "embedding_process.py").is_file()
         or not (implementation / "embedding_worker.py").is_file()
         or not (implementation / "admission.py").is_file()
@@ -92,12 +92,12 @@ def _load_profile_modules(hermes_home: Path):
     sys.modules[package_name] = package
     try:
         config_module = importlib.import_module(f"{package_name}.config")
-        sleep_module = importlib.import_module(f"{package_name}.sleep_refactor")
+        sleep_module = importlib.import_module(f"{package_name}.sleep_adapter")
     except ImportError as exc:
         for module_name in (
             package_name,
             f"{package_name}.config",
-            f"{package_name}.sleep_refactor",
+            f"{package_name}.sleep_adapter",
         ):
             sys.modules.pop(module_name, None)
         raise RuntimeError(
@@ -148,7 +148,7 @@ def _runtime_epoch(db_path: str, model: str, dimension: int) -> int:
 
 
 def main() -> None:
-    """Discover config, import sleep_refactor, run one cycle, print JSON."""
+    """Discover config, import the upstream adapter, run one cycle, print JSON."""
     hermes_home = _find_hermes_home()
     config_module, sleep_module = _load_profile_modules(hermes_home)
     log_filter_module = importlib.import_module(

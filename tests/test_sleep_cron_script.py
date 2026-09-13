@@ -82,7 +82,7 @@ def _write_installation(implementation: Path, identity: str) -> None:
     (implementation / "log_filter.py").write_text(
         (Path(provider_module.__file__).parent / "log_filter.py").read_text()
     )
-    (implementation / "sleep_refactor.py").write_text(
+    (implementation / "sleep_adapter.py").write_text(
         "import logging\n"
         "import os\n"
         "from pathlib import Path\n"
@@ -318,7 +318,7 @@ def test_copied_generated_script_rejects_different_hermes_profile(
     assert "no longer matches this cron registration" in completed.stderr
 
 
-@pytest.mark.parametrize("missing_file", ["config.py", "sleep_refactor.py"])
+@pytest.mark.parametrize("missing_file", ["config.py", "sleep_adapter.py"])
 def test_generated_script_rejects_incomplete_installation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_file: str
 ) -> None:

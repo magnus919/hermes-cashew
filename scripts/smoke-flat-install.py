@@ -64,7 +64,7 @@ def _install_bounded_runtime_fakes(implementation: Path, marker: Path) -> None:
         "    def close(self):\n"
         "        Path(os.environ['CASHEW_CRON_SMOKE_MARKER']).write_text('closed')\n"
     )
-    (implementation / "sleep_refactor.py").write_text(
+    (implementation / "sleep_adapter.py").write_text(
         "from pathlib import Path\n"
         "import json\n"
         "import os\n"

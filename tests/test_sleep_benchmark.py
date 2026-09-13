@@ -37,7 +37,9 @@ def test_benchmark_is_deterministic_and_records_phase_and_contention_evidence() 
     }
     assert report["summary"]["nodes_selected"] == 4
     assert report["summary"]["orphans_embedded"] == 2
-    assert report["embedding_calls"] == 2
+    # The pinned upstream pipeline batches the two eligible orphans into one
+    # encode call; this is the transaction-boundary behavior being measured.
+    assert report["embedding_calls"] == 1
     assert report["orphan_rows_with_embeddings"] == 2
     assert report["bounded_integrity"] is True
     assert report["participating_writer"]["observed"] is True

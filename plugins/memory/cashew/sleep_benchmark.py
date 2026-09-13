@@ -1,14 +1,10 @@
-"""Deterministic, opt-in measurements for the local sleep adapter.
+"""Deterministic, opt-in measurements for the pinned upstream sleep adapter.
 
-This module is deliberately diagnostic.  It runs the existing
-``sleep_refactor.run_sleep_cycle`` against a temporary SQLite database and
-reports the work selected by each phase, phase wall time, edge-cap commit
-integrity, and writer contention.  It does not change the production sleep
-pipeline or provide a second consolidation engine.
-
-The benchmark is useful while the upstream bounded sleep contract is being
-reviewed.  Once that contract is pinned, the same probe can be run against
-the replacement boundary to compare measurements at the same fixture sizes.
+This module is deliberately diagnostic. It runs the production
+``sleep_adapter.run_sleep_cycle`` against a temporary SQLite database and
+reports phase wall time, edge-cap commit integrity, and writer contention.
+Phase probes wrap the selected upstream implementation; this module does not
+provide a second consolidation engine.
 """
 
 from __future__ import annotations
@@ -26,7 +22,9 @@ from typing import Any
 
 import numpy as np
 
-from . import sleep_refactor
+from core import sleep as upstream_sleep
+
+from . import sleep_adapter
 from .locking import try_shared_lock
 
 DEFAULT_DIMENSION = 64
@@ -58,8 +56,8 @@ class _SlowEmbeddingClient:
         return np.asarray(vectors, dtype=np.float32)
 
 
-def _create_schema(conn: sqlite3.Connection) -> None:
-    """Create the subset of the Cashew schema used by the local adapter."""
+def _create_schema(conn: sqlite3.Connection, dimension: int) -> None:
+    """Create the subset of the Cashew schema used by upstream sleep."""
     conn.executescript(
         """
         CREATE TABLE thought_nodes (
@@ -93,6 +91,24 @@ def _create_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    try:
+        import sqlite_vec
+
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.execute(
+            "CREATE VIRTUAL TABLE vec_embeddings USING vec0("
+            f"node_id TEXT PRIMARY KEY, embedding float[{dimension}])"
+        )
+    except (ImportError, OSError, sqlite3.Error):
+        # The report records ordinary-write results when sqlite-vec is absent;
+        # production still treats the extension as a required dependency.
+        conn.rollback()
+    finally:
+        try:
+            conn.enable_load_extension(False)
+        except sqlite3.Error:
+            pass
 
 
 def _seed_database(
@@ -114,7 +130,7 @@ def _seed_database(
 
     conn = sqlite3.connect(db_path)
     try:
-        _create_schema(conn)
+        _create_schema(conn, dimension)
         for index in range(node_count):
             node_id = f"node-{index}"
             conn.execute(
@@ -126,7 +142,7 @@ def _seed_database(
                 vector = np.zeros(dimension, dtype=np.float32)
                 vector[index % dimension] = 1.0
             else:
-                vector = np.zeros(node_count + 1, dtype=np.float32)
+                vector = np.zeros(dimension, dtype=np.float32)
                 vector[0] = np.sqrt(pair_similarity)
                 vector[index + 1] = np.sqrt(1.0 - pair_similarity)
             conn.execute(
@@ -164,9 +180,9 @@ def _timed_phases(
     timings: dict[str, float],
     lock_probe_complete: threading.Event,
 ) -> Iterator[None]:
-    """Instrument the existing phase functions for one benchmark call."""
+    """Instrument phase functions in the selected upstream implementation."""
     names = (
-        "_find_candidates",
+        "_find_pairs",
         "_batch_cross_links",
         "_run_dedup",
         "_compute_metrics",
@@ -175,6 +191,7 @@ def _timed_phases(
         "_promote_core_memories",
         "_embed_orphans",
     )
+    labels = {"_find_pairs": "find_candidates"}
     originals: dict[str, Callable[..., Any]] = {}
     for name in names:
         timings.setdefault(name.removeprefix("_"), 0.0)
@@ -182,7 +199,7 @@ def _timed_phases(
     def wrap(name: str, original: Callable[..., Any]) -> Callable[..., Any]:
         def measured(*args: Any, **kwargs: Any) -> Any:
             start = time.perf_counter()
-            if name == "_find_candidates":
+            if name == "_find_pairs":
                 event.set()
                 # Do not let a fast candidate pass release the maintenance
                 # lease before the competing participant has sampled it.
@@ -190,7 +207,7 @@ def _timed_phases(
             try:
                 return original(*args, **kwargs)
             finally:
-                timings[name.removeprefix("_")] = round(
+                timings[labels.get(name, name.removeprefix("_"))] = round(
                     (time.perf_counter() - start) * 1000, 3
                 )
 
@@ -198,13 +215,13 @@ def _timed_phases(
 
     try:
         for name in names:
-            original = getattr(sleep_refactor, name)
+            original = getattr(upstream_sleep, name)
             originals[name] = original
-            setattr(sleep_refactor, name, wrap(name, original))
+            setattr(upstream_sleep, name, wrap(name, original))
         yield
     finally:
         for name, original in originals.items():
-            setattr(sleep_refactor, name, original)
+            setattr(upstream_sleep, name, original)
 
 
 def _measure_sleep_cycle(
@@ -231,11 +248,9 @@ def _measure_sleep_cycle(
         raise ValueError("limit must be at least 2")
     if max_edges < 0:
         raise ValueError("max_edges must be non-negative")
-    effective_dimension = (
-        node_count + 1
-        if pair_similarity is not None
-        else max(dimension, node_count)
-    )
+    # The pinned candidate's calibrated gte-large profile is 1024-dimensional;
+    # use that real profile even for the small deterministic fixture.
+    effective_dimension = max(1024, dimension, node_count + 1)
     _seed_database(
         db_path,
         node_count=node_count,
@@ -302,13 +317,13 @@ def _measure_sleep_cycle(
         sqlite_thread.start()
     cycle_started = time.perf_counter()
     with _timed_phases(phase_started, timings, lock_probe_complete):
-        summary = sleep_refactor.run_sleep_cycle(
+        summary = sleep_adapter.run_sleep_cycle(
             str(db_path),
             limit=effective_limit,
             max_edges=max_edges,
             model_fn=None,
             background_dream=False,
-            embedding_model="benchmark",
+            embedding_model="thenlper/gte-large",
             embedding_device="cpu",
             embedding_client=client,
         )

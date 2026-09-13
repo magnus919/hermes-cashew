@@ -1,11 +1,11 @@
-"""Tests for the sleep cycle cron job lifecycle (v0.11.0).
+"""Tests for persistent profile-owned sleep-cron lifecycle behavior.
 
 The sleep cycle was migrated from ``on_session_end()`` to a Hermes ``no_agent``
 cron job. These tests verify that:
 1. ``initialize()`` registers the cron job when sleeping is enabled
 2. ``initialize()`` skips cron registration when sleeping is disabled
-3. ``shutdown()`` removes the cron job
-4. The cron script is installed correctly
+3. ordinary ``shutdown()`` preserves the profile-owned job for adoption
+4. the cron script is installed correctly
 
 All tests in this file require the Hermes ``cron`` module, which is only
 available in a full Hermes Agent environment — not in CI or standalone
@@ -88,6 +88,7 @@ def test_initialize_skips_cron_when_sleep_disabled(tmp_path, monkeypatch):
     )
     # Monkeypatch cron.jobs.create_job at the module level
     import cron.jobs as cron_jobs
+
     monkeypatch.setattr(cron_jobs, "create_job", fake_create_job)
 
     from plugins.memory.cashew import CashewMemoryProvider
@@ -113,11 +114,15 @@ def test_initialize_registers_cron_when_sleep_enabled(tmp_path, monkeypatch):
     cfg = hermes_home / "cashew.json"
     config_yaml = hermes_home / "config.yaml"
     config_yaml.write_text("model:\n  provider: test\n  default: test\n")
-    cfg.write_text(json.dumps(_make_config(
-        hermes_home,
-        sleep_cycles=True,
-        sleep_schedule="every 6h",
-    )))
+    cfg.write_text(
+        json.dumps(
+            _make_config(
+                hermes_home,
+                sleep_cycles=True,
+                sleep_schedule="every 6h",
+            )
+        )
+    )
 
     (hermes_home / "cashew").mkdir(parents=True)
     conn = sqlite3.connect(str(hermes_home / "cashew" / "brain.db"))
@@ -135,6 +140,7 @@ def test_initialize_registers_cron_when_sleep_enabled(tmp_path, monkeypatch):
         lambda *a: None,
     )
     import cron.jobs as cron_jobs
+
     monkeypatch.setattr(cron_jobs, "create_job", fake_create_job)
 
     from plugins.memory.cashew import CashewMemoryProvider
@@ -154,11 +160,15 @@ def test_initialize_skips_cron_when_no_schedule(tmp_path, monkeypatch):
     hermes_home = tmp_path / "h3"
     hermes_home.mkdir()
     cfg = hermes_home / "cashew.json"
-    cfg.write_text(json.dumps(_make_config(
-        hermes_home,
-        sleep_cycles=True,
-        sleep_schedule="",
-    )))
+    cfg.write_text(
+        json.dumps(
+            _make_config(
+                hermes_home,
+                sleep_cycles=True,
+                sleep_schedule="",
+            )
+        )
+    )
 
     (hermes_home / "cashew").mkdir(parents=True)
     conn = sqlite3.connect(str(hermes_home / "cashew" / "brain.db"))
@@ -176,6 +186,7 @@ def test_initialize_skips_cron_when_no_schedule(tmp_path, monkeypatch):
         lambda *a: None,
     )
     import cron.jobs as cron_jobs
+
     monkeypatch.setattr(cron_jobs, "create_job", fake_create_job)
 
     from plugins.memory.cashew import CashewMemoryProvider
@@ -192,8 +203,8 @@ def test_initialize_skips_cron_when_no_schedule(tmp_path, monkeypatch):
     provider.shutdown()
 
 
-def test_shutdown_removes_cron_job(tmp_path, monkeypatch):
-    """shutdown() removes the registered cron job."""
+def test_shutdown_preserves_profile_owned_cron_job(tmp_path, monkeypatch):
+    """Ordinary session shutdown leaves scheduled profile maintenance intact."""
     hermes_home = tmp_path / "h4"
     hermes_home.mkdir()
     cfg = hermes_home / "cashew.json"
@@ -219,8 +230,10 @@ def test_shutdown_removes_cron_job(tmp_path, monkeypatch):
         lambda *a: None,
     )
     import cron.jobs as cron_jobs
+
     monkeypatch.setattr(cron_jobs, "create_job", fake_create_job)
     monkeypatch.setattr(cron_jobs, "remove_job", fake_remove_job)
+    monkeypatch.setattr(cron_jobs, "list_jobs", lambda: [])
 
     from plugins.memory.cashew import CashewMemoryProvider
 
@@ -233,9 +246,8 @@ def test_shutdown_removes_cron_job(tmp_path, monkeypatch):
 
     provider.shutdown()
 
-    assert len(remove_calls) == 1
-    assert remove_calls[0] == "cron-job-789"
-    assert provider._sleep_cron_job_id is None  # cleared after removal
+    assert remove_calls == []
+    assert provider._sleep_cron_job_id is None  # instance tracking is cleared
 
 
 def test_cron_script_is_installed(tmp_path, monkeypatch):
@@ -296,15 +308,22 @@ def test_cron_script_imports_resolve_model_fn(tmp_path):
     # Install the cron script
     script_path = hermes_home / "scripts" / "cashew-sleep-cycle.py"
     script_path.parent.mkdir(parents=True)
-    script_source = (Path(__file__).parent.parent / "plugins" / "memory"
-                     / "cashew" / "sleep_cron_script.py").read_text()
+    script_source = (
+        Path(__file__).parent.parent
+        / "plugins"
+        / "memory"
+        / "cashew"
+        / "sleep_cron_script.py"
+    ).read_text()
     script_path.write_text(script_source)
     script_path.chmod(0o755)
 
     # Verify the script contains the resolve_model_fn import
     assert "resolve_model_fn" in script_source
-    assert "model_fn = _resolve_model_fn" in script_source or \
-           "resolve_model_fn(hermes_home" in script_source
+    assert (
+        "model_fn = _resolve_model_fn" in script_source
+        or "resolve_model_fn(hermes_home" in script_source
+    )
     assert "model_fn=model_fn" in script_source
     # No longer hardcoded None
     assert "model_fn=None" not in script_source.replace(

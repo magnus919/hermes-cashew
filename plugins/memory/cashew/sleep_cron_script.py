@@ -4,11 +4,13 @@ Installed at ``$HERMES_HOME/scripts/cashew-sleep-cycle.py`` during provider
 initialize(). Runs as a ``no_agent=True`` cron job — the Hermes scheduler
 executes this script on a schedule with zero LLM overhead per tick.
 
-Reads ``cashew.json`` at runtime. Registration embeds the selected profile
-installation identity, so reinitialize the provider after moving or
-reinstalling it to refresh the generated script.
+Registration embeds a validated effective configuration and the selected
+profile installation identity. Reinitialize the provider after changing
+``cashew.json`` or ``CASHEW_*`` overrides, or after moving/reinstalling it, to
+reconcile the scheduled work.
 """
 
+import hashlib
 import importlib
 import json
 import os
@@ -22,6 +24,16 @@ _INSTALLATION_MARKER = None
 
 class _CronAdmissionError(RuntimeError):
     """The standalone job cannot safely establish its profile identity."""
+
+
+def _profile_identity(hermes_home: Path) -> str:
+    """Match registration's opaque per-profile scheduler identity."""
+    return hashlib.sha256(str(hermes_home.resolve()).encode("utf-8")).hexdigest()[:16]
+
+
+def _snapshot_identity(snapshot: dict) -> str:
+    encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
 
 
 def _find_hermes_home() -> Path:
@@ -60,7 +72,16 @@ def _load_profile_modules(hermes_home: Path):
     }
     anchor = marker.get("anchor")
     expected = marker.get("implementation")
-    if kind not in anchors or anchor != anchors[kind] or not isinstance(expected, str):
+    snapshot = marker.get("config")
+    if (
+        kind not in anchors
+        or anchor != anchors[kind]
+        or not isinstance(expected, str)
+        or marker.get("version") != 2
+        or marker.get("profile_id") != _profile_identity(hermes_home)
+        or not isinstance(snapshot, dict)
+        or marker.get("config_id") != _snapshot_identity(snapshot)
+    ):
         raise RuntimeError(
             "Cashew cron installation marker is malformed; reinitialize Cashew "
             "to refresh the generated script."
@@ -104,7 +125,7 @@ def _load_profile_modules(hermes_home: Path):
             "Cashew installation could not load cron dependencies; reinstall or "
             "reinitialize Cashew."
         ) from exc
-    return config_module, sleep_module
+    return config_module, sleep_module, marker
 
 
 def _resolve_db_path(hermes_home: Path, db_path_value: str, config_module=None) -> str:
@@ -150,13 +171,21 @@ def _runtime_epoch(db_path: str, model: str, dimension: int) -> int:
 def main() -> None:
     """Discover config, import sleep_refactor, run one cycle, print JSON."""
     hermes_home = _find_hermes_home()
-    config_module, sleep_module = _load_profile_modules(hermes_home)
+    config_module, sleep_module, marker = _load_profile_modules(hermes_home)
     log_filter_module = importlib.import_module(
         f"{sleep_module.__package__}.log_filter"
     )
     log_filter_module.acquire_provider_scrub_filters()
     try:
-        config = config_module.load_config(hermes_home)
+        # Do not reload ambient JSON/environment state here. The cron daemon
+        # must run the exact validated configuration selected by the provider
+        # that reconciled this job; another provider initialize refreshes it.
+        config = config_module.load_effective_config_snapshot(
+            hermes_home, marker["config"]
+        )
+        if not config.sleep_cycles or not config.sleep_schedule:
+            print(json.dumps({}))
+            return
         db_path = _resolve_db_path(hermes_home, config.cashew_db_path, config_module)
 
         # Resolve the LLM callable from auxiliary config for dream generation.

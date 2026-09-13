@@ -349,20 +349,25 @@ when **all** of the following are true:
 | Provider init succeeds | — | — | Exception caught, ``_config`` set to ``None``, cron never reached |
 | Hermes cron module available | — | — | ``ImportError`` caught, WARNING logged |
 | ``create_job()`` succeeds | — | — | Exception caught, WARNING logged |
-| No job already registered for this provider instance | — | — | No-op dedup guard |
+| Matching profile-owned job already registered | — | — | Existing job is adopted without changing its schedule |
 
-The cron job is **removed** on plugin shutdown (``shutdown()``). A dedup
-helper scans for existing ``cashew-sleep-cycle`` jobs by name on each
-registration to prevent N jobs accumulating across N restarts.
+The job persists across ordinary provider shutdown and is adopted by a later
+initialize for the same Hermes profile. Reconciliation serializes concurrent
+initializers, tags ownership with an opaque profile token, and only replaces or
+disables a job carrying that token. It never deletes a similarly named job that
+does not prove it belongs to this profile.
 
 ### When the cron job runs
 
 On the configured schedule (default ``every 12h``), the Hermes scheduler
 executes ``$HERMES_HOME/scripts/cashew-sleep-cycle.py`` as a ``no_agent``
-script. It reads ``cashew.json`` at runtime to discover its database path and
-``sleep_max_nodes`` setting. The cycle uses LLM dream synthesis only when the
-profile has an explicit configured auxiliary role; otherwise it runs with no
-LLM overhead.
+script. Registration embeds the complete validated effective configuration,
+including JSON/default values and any valid ``CASHEW_*`` overrides, so a cron
+daemon cannot drift from its provider's DB, model, device, limits, or auxiliary
+role. Changes to JSON or environment settings take effect on the next provider
+initialize, which atomically refreshes the script and reconciles the job. The
+cycle uses LLM dream synthesis only when that embedded configuration has an
+explicit configured auxiliary role; otherwise it runs with no LLM overhead.
 
 The generated script is pinned to the Cashew installation that registered the
 job. This keeps one Hermes profile from loading another profile's provider.
@@ -373,11 +378,13 @@ to an external checkout.
 
 ### What happens during a cron tick
 
-1. Reads ``cashew.json`` to get ``cashew_db_path`` and ``sleep_max_nodes``
-2. Selects up to ``sleep_max_nodes`` (default 2,000) oldest-unprocessed nodes
+1. Uses the validated effective configuration embedded when the job was
+   registered; it does not reread ``cashew.json`` or ambient ``CASHEW_*``
+   values during a tick
+2. Selects up to ``sleep_max_nodes`` (default 2,000) eligible nodes
 3. Computes pairwise cosine similarity (vectorized numpy)
-4. Creates cross-links between similar node pairs (threshold: 0.78)
-5. Deduplicates near-identical nodes (threshold: 0.82) via BFS clustering
+4. Creates and repairs cross-links using the configured model-profile thresholds
+5. Deduplicates near-identical nodes through maximal-clique consolidation
 6. Runs garbage collection on low-fitness isolated nodes
 7. Promotes frequently-accessed nodes to permanent / core memory status
 8. Prints a JSON summary (captured by the cron scheduler's output log)
@@ -407,7 +414,7 @@ shared-brain writer-coordination policy; broader coordination is tracked in
 | Key | Default | Description |
 |-----|---------|-------------|
 | ``sleep_schedule`` | ``\"every 12h\"`` | Cron expression or interval string. Set to ``\"\"`` to disable cron-based scheduling entirely. Examples: ``\"every 30m\"``, ``\"0 */2 * * *\"``, ``\"0 3 * * *\"`` (daily at 3am). |
-| ``sleep_max_nodes`` | ``2000`` | Maximum number of nodes to cross-link in a single sleep cycle. Higher values converge faster but take longer per tick. |
+| ``sleep_max_nodes`` | ``2000`` | Maximum number of eligible nodes considered in one sleep cycle. Higher values can increase consolidation work and tick time. |
 
 ## Semantic Search
 
@@ -419,6 +426,12 @@ but less precise.
 sqlite-vec is a standard dependency and will always be loaded at startup.
 
 ## Uninstall
+
+Normal provider shutdown intentionally preserves the profile-owned cron job.
+Before removing the plugin, disable sleep in Cashew setup (set
+``sleep_cycles`` to ``false`` or ``sleep_schedule`` to ``""``) and initialize
+the provider once. Reconciliation then removes only the job whose ownership
+matches that Hermes profile. Afterwards use the host-supported removal flow:
 
 ```bash
 hermes plugins remove cashew

@@ -23,10 +23,12 @@ from plugins.memory.cashew.config import (
     REMOVED_LEGACY_CONFIG_KEYS,
     CashewConfig,
     _env_var_name,
+    effective_config_snapshot,
     get_ai_domain,
     get_config_schema,
     get_user_domain,
     load_config,
+    load_effective_config_snapshot,
     resolve_config_path,
     resolve_db_path,
     save_config,
@@ -187,6 +189,31 @@ def test_load_config_returns_defaults_when_file_absent(tmp_path):
     """No cashew.json returns all runtime defaults without error."""
     cfg = load_config(tmp_path)
     assert cfg == CashewConfig(**DEFAULTS)
+
+
+def test_effective_snapshot_preserves_validated_environment_override(
+    tmp_path, monkeypatch
+):
+    """A cron registration carries the provider's effective, not raw, config."""
+    monkeypatch.setenv("CASHEW_RECALL_K", "12")
+    config = load_config(tmp_path)
+    snapshot = effective_config_snapshot(config)
+    monkeypatch.setenv("CASHEW_RECALL_K", "3")
+
+    restored = load_effective_config_snapshot(tmp_path, snapshot)
+
+    assert restored == config
+    assert restored.recall_k == 12
+
+
+def test_effective_snapshot_rejects_partial_or_invalid_values(tmp_path):
+    with pytest.raises(ValueError, match="configuration snapshot is malformed"):
+        load_effective_config_snapshot(tmp_path, {"recall_k": 5})
+
+    snapshot = effective_config_snapshot(CashewConfig())
+    snapshot["recall_k"] = 0
+    with pytest.raises(ValueError, match="recall_k must be an integer"):
+        load_effective_config_snapshot(tmp_path, snapshot)
 
 
 def test_load_config_merges_partial_file_over_defaults(tmp_path):

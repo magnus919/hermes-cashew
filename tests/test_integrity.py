@@ -577,3 +577,23 @@ def test_apply_is_explicitly_unavailable_and_does_not_open_database(
         "repairs": [],
     }
     assert not path.exists()
+
+
+def test_legacy_apply_without_confirmation_preserves_unavailable_envelope(
+    tmp_path: Path,
+) -> None:
+    """The pre-contract pin stays unavailable for every legacy path call."""
+    report = apply_integrity_repairs(tmp_path / "does-not-exist.db")
+
+    assert report == {
+        "schema_version": 1,
+        "status": "unavailable",
+        "mutated": False,
+        "confirmed": False,
+        "reason": "stable_targeted_repair_api_unavailable",
+        "message": (
+            "Cashew repair remains unavailable until upstream provides a "
+            "connection-aware targeted repair API with atomic ordinary/vec writes."
+        ),
+        "repairs": [],
+    }

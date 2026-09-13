@@ -10,7 +10,14 @@ from pathlib import PurePosixPath
 
 REQUIRED = PurePosixPath("plugins/memory/cashew/__init__.py")
 FORBIDDEN_PARTS = frozenset(
-    {".git", ".venv", "__pycache__", "droid-wiki", "graphify-out"}
+    {
+        ".git",
+        ".venv",
+        "__pycache__",
+        "droid-wiki",
+        "graphify-out",
+        "cashew-pr137",
+    }
 )
 FORBIDDEN_SUFFIXES = (".db", ".db-journal", ".db-shm", ".db-wal")
 

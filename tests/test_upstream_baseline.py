@@ -11,6 +11,7 @@ import sys
 import time
 from contextlib import closing
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 
@@ -24,11 +25,14 @@ from core.db import NODE_COLUMNS, ensure_schema, schema_version  # noqa: E402, I
 
 
 CASHEW_ARCHIVE_URL = (
-    "https://github.com/rajkripal/cashew/archive/"
-    "dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz"
+    "https://github.com/magnus919/true/archive/"
+    "fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz"
 )
 CASHEW_SESSION_SHA256 = (
     "0ce60cc63adf4fb7136581aee722bb10e9a344e556b6fb98f4d46855d53c36cd"
+)
+CASHEW_ARCHIVE_SHA256 = (
+    "23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3"
 )
 MINIMUM_SQLITE = (3, 35, 0)
 
@@ -43,7 +47,13 @@ def test_installed_cashew_has_selected_source_provenance() -> None:
     assert direct_url_text is not None, (
         "cashew-brain 1.2.1 is version-ambiguous; a direct source URL is required"
     )
-    assert json.loads(direct_url_text)["url"] == CASHEW_ARCHIVE_URL
+    direct_url = json.loads(direct_url_text)
+    actual_url = direct_url["url"]
+    assert urlunsplit(urlsplit(actual_url)._replace(fragment="")) == CASHEW_ARCHIVE_URL
+    recorded_hash = urlsplit(actual_url).fragment or direct_url.get(
+        "archive_info", {}
+    ).get("hash", "")
+    assert recorded_hash in ("", f"sha256={CASHEW_ARCHIVE_SHA256}")
 
     session_path = Path(distribution.locate_file("core/session.py"))
     assert hashlib.sha256(session_path.read_bytes()).hexdigest() == (

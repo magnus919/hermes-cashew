@@ -25,18 +25,20 @@ Issue #188 tested this candidate baseline:
 | Component | Exact reference | Availability and provenance |
 | --- | --- | --- |
 | hermes-cashew | `cc1e31c66b1f0cf72079d91497e21c7347c47c99` plus the issue #188 dependency, test, workflow, and documentation change | This was `origin/main` when the final candidate was refreshed and tested. It includes the merged #199 real-Hermes integration lane. |
-| cashew-brain | `dd57ef029cf9a6dce0b8145d335a55202dd1bac4` | Immutable [upstream source archive](https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz), locked with archive SHA-256 `38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab`. The installed `core/session.py` SHA-256 is `0ce60cc63adf4fb7136581aee722bb10e9a344e556b6fb98f4d46855d53c36cd`. |
+| cashew-brain | `fcb4919ac37144bfbeb822eaafc668a4bdceb791` | Immutable [composite fork archive](https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz), locked with archive SHA-256 `23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3`. Tree `29d97fb93c7998c97be0da8f19b90c6523f9d1e9` combines PR 136 (`ac090ce75ffd2e97dac257cee9430628c68aa241`) and PR 137 (`cb940f34c15460b87831748b2e702334c1c5fbd0`). The installed `core/session.py` SHA-256 is `0ce60cc63adf4fb7136581aee722bb10e9a344e556b6fb98f4d46855d53c36cd`. |
 | Hermes Agent loader/lifecycle evidence | `990473a79c6b0396b0a648fdd85ee8f7a5c267d3` | The #199 lane merged in wrapper commit `cc1e31c66b1f0cf72079d91497e21c7347c47c99`. Its flat and development loader, auxiliary routing, lifecycle, and cron contracts also passed in a fresh environment containing the exact #188 source pin. The embedding model and external client were deterministic fakes; Hermes, SQLite 3.47.1, and the Cashew package boundary were real. This is bounded compatibility evidence, not a published Hermes minimum-version promise or native embedding-crash proof. |
 
-The selected commit was the upstream `main` tip at the audit date and is 22
-commits ahead of `v1.2.1` (`894637ba76b059347af3fe2142201521d9484fb4`).
-The [upstream comparison](https://github.com/rajkripal/cashew/compare/v1.2.1...dd57ef029cf9a6dce0b8145d335a55202dd1bac4)
-contains the schema-contention fix. Production installs use the exact source
-archive and digest below rather than floating on Cashew `main`:
+The selected source is a composite fork at `fcb4919ac37144bfbeb822eaafc668a4bdceb791`,
+tree `29d97fb93c7998c97be0da8f19b90c6523f9d1e9`, combining PR 136
+(`ac090ce75ffd2e97dac257cee9430628c68aa241`) and PR 137
+(`cb940f34c15460b87831748b2e702334c1c5fbd0`). Production installs use the
+exact source archive and digest below rather than floating on Cashew `main`.
+Replace this temporary fork with the canonical upstream release once both
+changes are merged upstream:
 
 ```text
-https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz
-sha256=38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab
+https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz
+sha256=23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3
 ```
 
 The source archive builds normally, but its metadata still says `1.2.1`, the

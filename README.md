@@ -29,7 +29,7 @@ current Hermes dependency installer intentionally rejects. Install the exact
 source archive into the Hermes environment before setup:
 
 ```bash
-CASHEW_PIN='cashew-brain @ https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz#sha256=38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab'
+CASHEW_PIN='cashew-brain @ https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz#sha256=23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3'
 uv pip install \
   --python ~/.hermes/hermes-agent/venv/bin/python3 \
   --reinstall "$CASHEW_PIN" sqlite-vec
@@ -37,7 +37,17 @@ uv pip install \
   ~/.hermes/plugins/cashew/scripts/verify-cashew-baseline.py
 ```
 
-The verification step is required because the selected source and the older
+This archive is a temporary composite fork of upstream Cashew. It combines PR
+136 (`ac090ce75ffd2e97dac257cee9430628c68aa241`) and PR 137
+(`cb940f34c15460b87831748b2e702334c1c5fbd0`) at tree
+`29d97fb93c7998c97be0da8f19b90c6523f9d1e9`. The fork preserves provenance while
+those changes are reviewed upstream; replace this pin with the canonical
+upstream release once both changes are available there.
+
+The lockfile enforces the archive digest during installation; uv may omit that
+digest from the installed PEP 610 metadata, so verification requires the exact
+source URL and validates a recorded digest when one is present. The verification
+step is required because the selected source and the older
 PyPI release both report version `1.2.1`. A version-only check cannot tell them
 apart. It also checks the linked SQLite version and source ID. Both the selected
 source and the existing PyPI `1.2.1` code require SQLite 3.35 or newer to
@@ -447,7 +457,7 @@ rm -rf ~/.hermes/cashew   # optional: remove the local graph data
    source baseline from [Install](#install). If `uv` is unavailable, bootstrap
    pip in the Hermes environment and pass the same quoted `CASHEW_PIN` value:
    ```bash
-   CASHEW_PIN='cashew-brain @ https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz#sha256=38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab'
+   CASHEW_PIN='cashew-brain @ https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz#sha256=23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3'
    ~/.hermes/hermes-agent/venv/bin/python3 -m ensurepip
    ~/.hermes/hermes-agent/venv/bin/python3 -m pip install \
      --force-reinstall "$CASHEW_PIN" sqlite-vec

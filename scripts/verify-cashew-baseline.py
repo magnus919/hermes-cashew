@@ -9,11 +9,13 @@ import json
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 ARCHIVE_URL = (
-    "https://github.com/rajkripal/cashew/archive/"
-    "dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz"
+    "https://github.com/magnus919/true/archive/"
+    "fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz"
 )
+ARCHIVE_SHA256 = "23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3"
 SESSION_SHA256 = "0ce60cc63adf4fb7136581aee722bb10e9a344e556b6fb98f4d46855d53c36cd"
 MINIMUM_SQLITE = (3, 35, 0)
 
@@ -26,9 +28,19 @@ def main() -> None:
             "cashew-brain has no direct_url.json; version 1.2.1 does not prove "
             "the selected source is installed"
         )
-    actual_url = json.loads(direct_url_text)["url"]
-    if actual_url != ARCHIVE_URL:
+    direct_url = json.loads(direct_url_text)
+    actual_url = direct_url["url"]
+    if urlunsplit(urlsplit(actual_url)._replace(fragment="")) != ARCHIVE_URL:
         raise SystemExit(f"unexpected cashew-brain source: {actual_url}")
+    expected_hash = f"sha256={ARCHIVE_SHA256}"
+    url_hash = urlsplit(actual_url).fragment
+    archive_hash = direct_url.get("archive_info", {}).get("hash", "")
+    if url_hash or archive_hash:
+        if expected_hash not in (url_hash, archive_hash):
+            raise SystemExit(
+                f"unexpected cashew-brain archive hash: {url_hash or archive_hash}; "
+                f"expected {expected_hash}"
+            )
 
     session_path = Path(distribution.locate_file("core/session.py"))
     actual_hash = hashlib.sha256(session_path.read_bytes()).hexdigest()

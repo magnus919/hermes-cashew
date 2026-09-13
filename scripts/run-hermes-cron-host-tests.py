@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,10 +25,12 @@ def _link(source: Path, destination: Path) -> None:
 def _make_shim(hermes_root: Path, shim: Path) -> None:
     _link(hermes_root / "cron" / "jobs.py", shim / "cron" / "jobs.py")
     _link(hermes_root / "cron" / "env_settings.py", shim / "cron" / "env_settings.py")
+    _link(hermes_root / "cron" / "lifecycle_guard.py", shim / "cron" / "lifecycle_guard.py")
     _link(hermes_root / "hermes_constants.py", shim / "hermes_constants.py")
     _link(hermes_root / "hermes_time.py", shim / "hermes_time.py")
     _link(hermes_root / "utils.py", shim / "utils.py")
     _link(hermes_root / "agent", shim / "agent")
+    _link(hermes_root / "tools", shim / "tools")
     (shim / "cron" / "__init__.py").write_text(
         "from .jobs import JOBS_FILE, create_job, get_job, list_jobs, remove_job, update_job\n",
         encoding="utf-8",
@@ -39,6 +40,10 @@ def _make_shim(hermes_root: Path, shim: Path) -> None:
     # lane, so keep the security boundary deterministic and minimal.
     (shim / "hermes_cli").mkdir(parents=True)
     (shim / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    _link(
+        hermes_root / "hermes_cli" / "sqlite_safe_read.py",
+        shim / "hermes_cli" / "sqlite_safe_read.py",
+    )
     (shim / "hermes_cli" / "config.py").write_text(
         "from pathlib import Path\n"
         "\n"
@@ -61,11 +66,34 @@ def main() -> int:
         parser.error(f"not an Hermes source checkout: {hermes_root}")
 
     repo_root = Path(__file__).resolve().parents[1]
-    shim = Path(tempfile.mkdtemp(prefix="hermes-cashew-host-shim-"))
-    try:
+    with tempfile.TemporaryDirectory(prefix="hermes-cashew-host-") as sandbox_text:
+        sandbox = Path(sandbox_text)
+        shim = sandbox / "shim"
         _make_shim(hermes_root, shim)
         env = os.environ.copy()
         env["HERMES_CASHEW_REAL_HERMES"] = "1"
+        env["HERMES_CASHEW_HERMES_ROOT"] = str(hermes_root)
+        env["HERMES_CASHEW_HOST_SANDBOX"] = str(sandbox)
+        env["HERMES_HOME"] = str(sandbox / "hermes-home")
+        env["HOME"] = str(sandbox / "home")
+        for name in (
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "HF_HOME",
+            "TRANSFORMERS_CACHE",
+            "HF_DATASETS_CACHE",
+            "SENTENCE_TRANSFORMERS_HOME",
+            "MPLCONFIGDIR",
+        ):
+            path = sandbox / name.lower()
+            path.mkdir(parents=True, exist_ok=True)
+            env[name] = str(path)
+        env["TMPDIR"] = str(sandbox / "tmp")
+        Path(env["TMPDIR"]).mkdir(parents=True, exist_ok=True)
+        Path(env["HERMES_HOME"]).mkdir(parents=True, exist_ok=True)
+        Path(env["HOME"]).mkdir(parents=True, exist_ok=True)
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"
         env["HF_DATASETS_OFFLINE"] = "1"
@@ -85,8 +113,6 @@ def main() -> int:
             env=env,
             check=False,
         ).returncode
-    finally:
-        shutil.rmtree(shim, ignore_errors=True)
 
 
 if __name__ == "__main__":

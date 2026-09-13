@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -69,7 +70,74 @@ def _install_provider_layout(hermes_home: Path, layout: str) -> None:
     target.symlink_to(source, target_is_directory=True)
 
 
+def _prepare_real_cron_home(hermes_home: Path, layout: str) -> None:
+    hermes_home.mkdir(parents=True)
+    (hermes_home / "config.yaml").write_text(
+        "model:\n  provider: test\n  default: test\n"
+    )
+    (hermes_home / "cashew.json").write_text(
+        json.dumps(_make_config(hermes_home, sleep_schedule="every 6h"))
+    )
+    _install_provider_layout(hermes_home, layout)
+    (hermes_home / "cashew").mkdir(parents=True)
+    with sqlite3.connect(str(hermes_home / "cashew" / "brain.db")) as conn:
+        _ensure_schema(conn)
+
+
 # ── Cron registration tests ─────────────────────────────────────────────────
+
+
+def test_pinned_host_provenance_and_isolated_environment():
+    """The host subprocess uses only the requested Hermes checkout and sandbox."""
+    cron_jobs = pytest.importorskip("cron.jobs")
+    expected_root = os.environ.get("HERMES_CASHEW_HERMES_ROOT")
+    sandbox = os.environ.get("HERMES_CASHEW_HOST_SANDBOX")
+    assert expected_root and sandbox
+    assert Path(cron_jobs.__file__).resolve().is_relative_to(
+        Path(expected_root).resolve() / "cron"
+    )
+    sandbox_path = Path(sandbox).resolve()
+    for name in (
+        "HOME",
+        "HERMES_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "HF_HOME",
+        "TRANSFORMERS_CACHE",
+        "HF_DATASETS_CACHE",
+        "SENTENCE_TRANSFORMERS_HOME",
+        "MPLCONFIGDIR",
+        "TMPDIR",
+    ):
+        assert Path(os.environ[name]).resolve().is_relative_to(sandbox_path)
+
+
+@pytest.mark.parametrize("layout", ["flat", "development"])
+def test_real_cron_store_persists_create_list_update_remove(tmp_path, layout):
+    """The real pinned Hermes store persists the complete CRUD lifecycle."""
+    cron_jobs = pytest.importorskip("cron.jobs")
+    hermes_home = tmp_path / layout
+    _prepare_real_cron_home(hermes_home, layout)
+    from plugins.memory.cashew import CashewMemoryProvider
+
+    provider = CashewMemoryProvider()
+    provider.initialize(session_id="real-crud", hermes_home=str(hermes_home))
+    try:
+        job_id = provider._sleep_cron_job_id
+        assert isinstance(job_id, str)
+        with cron_jobs.use_cron_store(hermes_home):
+            persisted = cron_jobs.list_jobs(include_disabled=True)
+            assert [job["id"] for job in persisted] == [job_id]
+            assert cron_jobs.update_job(job_id, {"enabled": False})["enabled"] is False
+            assert cron_jobs.list_jobs() == []
+            paused = cron_jobs.list_jobs(include_disabled=True)
+            assert paused[0]["id"] == job_id
+            assert cron_jobs.remove_job(job_id) is True
+            assert cron_jobs.list_jobs(include_disabled=True) == []
+    finally:
+        provider.shutdown()
 
 
 @pytest.mark.parametrize("layout", ["flat", "development"])

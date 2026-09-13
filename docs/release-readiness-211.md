@@ -37,9 +37,10 @@ algorithm was not carried forward.
 ## Evidence collected
 
 - The focused integration boundary suites pass: `137 passed, 2 skipped`.
-  The separate pinned-host lane passes `11 passed` against the real Hermes
+  The separate pinned-host lane passes `14 passed` against the real Hermes
   `cron.jobs` implementation for both flat and development installation
-  anchors. The lane uses a minimal security-helper shim for an unrelated CLI
+  anchors, real job-store CRUD, module provenance, and isolated HOME/XDG/cache
+  paths. The lane uses a minimal security-helper shim for an unrelated CLI
   import and runs as a dedicated CI job; it does not replace the real scheduler
   module.
 - The full locked test suite passes after the final benchmark update:

@@ -183,10 +183,19 @@ def test_ci_covers_declared_minimum_and_current_python() -> None:
         workflow["jobs"]["test-python"]["name"] == "Test (Python ${{ matrix.python }})"
     )
     assert workflow["jobs"]["test"]["name"] == "test"
-    assert workflow["jobs"]["test"]["needs"] == "test-python"
+    assert workflow["jobs"]["test"]["needs"] == ["test-python", "hermes-cron-host"]
     assert workflow["jobs"]["test"]["if"] == "always()"
     assert workflow["jobs"]["test"]["steps"][0]["env"]["MATRIX_RESULT"] == (
         "${{ needs['test-python'].result }}"
+    )
+    assert workflow["jobs"]["test"]["steps"][0]["env"]["HERMES_HOST_RESULT"] == (
+        "${{ needs['hermes-cron-host'].result }}"
+    )
+    assert workflow["jobs"]["hermes-cron-host"]["needs"] == "test-python"
+    host_steps = workflow["jobs"]["hermes-cron-host"]["steps"]
+    assert any(
+        "scripts/run-hermes-cron-host-tests.py" in step.get("run", "")
+        for step in host_steps
     )
     assert workflow["jobs"]["wheel-smoke"]["needs"] == "test"
 

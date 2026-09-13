@@ -74,6 +74,9 @@ markers = [
 
 [tool.ruff]
 target-version = "py310"
+# This file is a byte-identical upstream source fixture; formatting it changes
+# the immutable provenance used by the subprocess compatibility proof.
+exclude = ["tests/fixtures/cashew-pr137/core/integrity.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "N", "W", "I", "TD", "C90"]

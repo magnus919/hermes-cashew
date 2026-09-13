@@ -9,7 +9,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
+    import tomli as tomllib
+
+
 _FIXTURE = Path(__file__).parent / "fixtures" / "cashew-pr137"
+_PROJECT_ROOT = Path(__file__).parents[1]
 _UPSTREAM_SOURCE = _FIXTURE / "core" / "integrity.py"
 _EXPECTED_HEAD = "cb940f34c15460b87831748b2e702334c1c5fbd0"
 _EXPECTED_SOURCE_SHA256 = (
@@ -24,6 +31,14 @@ def test_fixture_records_immutable_upstream_provenance() -> None:
     assert provenance["sha256"] == _EXPECTED_SOURCE_SHA256
     assert hashlib.sha256(_UPSTREAM_SOURCE.read_bytes()).hexdigest() == (
         _EXPECTED_SOURCE_SHA256
+    )
+
+
+def test_fixture_is_excluded_from_project_ruff_configuration() -> None:
+    config = tomllib.loads((_PROJECT_ROOT / "pyproject.toml").read_text())
+    assert (
+        "tests/fixtures/cashew-pr137/core/integrity.py"
+        in config["tool"]["ruff"]["exclude"]
     )
 
 

@@ -34,6 +34,9 @@ CASHEW_SESSION_SHA256 = (
 CASHEW_ARCHIVE_SHA256 = (
     "0777dcb89bde8e0d6103786358c93c0ad3fd4ffb7f8a210194c37b211ae4c28b"
 )
+CASHEW_SLEEP_SHA256 = (
+    "2d8cd35ee2ce45f6b2eb3eb4dc1396ab6e157711c0a7eadfbf5e4afe6823b7db"
+)
 MINIMUM_SQLITE = (3, 35, 0)
 
 _VERIFY_SCRIPT = runpy.run_path(
@@ -56,6 +59,10 @@ def test_installed_cashew_has_selected_source_provenance() -> None:
     session_path = Path(distribution.locate_file("core/session.py"))
     assert hashlib.sha256(session_path.read_bytes()).hexdigest() == (
         CASHEW_SESSION_SHA256
+    )
+    sleep_path = Path(distribution.locate_file("core/sleep.py"))
+    assert hashlib.sha256(sleep_path.read_bytes()).hexdigest() == (
+        CASHEW_SLEEP_SHA256
     )
 
 

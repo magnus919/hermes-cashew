@@ -17,6 +17,7 @@ ARCHIVE_URL = (
 )
 ARCHIVE_SHA256 = "0777dcb89bde8e0d6103786358c93c0ad3fd4ffb7f8a210194c37b211ae4c28b"
 SESSION_SHA256 = "0ce60cc63adf4fb7136581aee722bb10e9a344e556b6fb98f4d46855d53c36cd"
+SLEEP_SHA256 = "2d8cd35ee2ce45f6b2eb3eb4dc1396ab6e157711c0a7eadfbf5e4afe6823b7db"
 MINIMUM_SQLITE = (3, 35, 0)
 _SHA256_RE = re.compile(r"^(?:sha256[=:])?([0-9a-fA-F]{64})$")
 
@@ -115,8 +116,9 @@ def main() -> None:
                 "uv.lock does not record the expected digest"
             )
         print(
-            "cashew-brain archive SHA-256 verified from uv.lock; "
-            "uv omitted archive_info.hash"
+            "cashew-brain archive SHA-256 matches uv.lock; "
+            "uv omitted archive_info.hash (installer-time lock evidence; "
+            "the archive was not rehashed post-install)"
         )
 
     session_path = Path(distribution.locate_file("core/session.py"))
@@ -126,8 +128,16 @@ def main() -> None:
             f"unexpected core/session.py SHA-256: {actual_hash}; "
             f"expected {SESSION_SHA256}"
         )
+    sleep_path = Path(distribution.locate_file("core/sleep.py"))
+    actual_sleep_hash = hashlib.sha256(sleep_path.read_bytes()).hexdigest()
+    if actual_sleep_hash != SLEEP_SHA256:
+        raise SystemExit(
+            f"unexpected core/sleep.py SHA-256: {actual_sleep_hash}; "
+            f"expected {SLEEP_SHA256}"
+        )
     print(f"cashew-brain source verified: {actual_url}")
     print(f"core/session.py SHA-256: {actual_hash}")
+    print(f"core/sleep.py SHA-256: {actual_sleep_hash}")
 
     with closing(sqlite3.connect(":memory:")) as connection:
         source_id = connection.execute("SELECT sqlite_source_id()").fetchone()[0]

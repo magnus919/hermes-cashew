@@ -40,7 +40,7 @@ algorithm was not carried forward.
   The separate pinned-host lane passes `11 passed` against the real Hermes
   `cron.jobs` implementation for both flat and development installation
   anchors. The lane uses a minimal security-helper shim for an unrelated CLI
-  import and runs as a required CI job; it does not replace the real scheduler
+  import and runs as a dedicated CI job; it does not replace the real scheduler
   module.
 - The full locked test suite passes after the final benchmark update:
   `539 passed, 3 skipped, 2 warnings` in 69.89 seconds. The skips require the

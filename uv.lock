@@ -490,8 +490,6 @@ dependencies = [
     { name = "cashew-brain" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "scikit-learn", version = "1.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "sentence-transformers" },
     { name = "sqlite-vec" },
 ]
@@ -536,7 +534,6 @@ requires-dist = [
     { name = "pytest-mock", marker = "extra == 'dev'", specifier = ">=3.15" },
     { name = "pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4,<1" },
-    { name = "scikit-learn" },
     { name = "sentence-transformers" },
     { name = "sentry-sdk", marker = "extra == 'dev'", specifier = ">=1.40,<3" },
     { name = "sentry-sdk", marker = "extra == 'tracing'", specifier = ">=1.40,<3" },

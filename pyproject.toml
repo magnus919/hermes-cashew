@@ -13,7 +13,6 @@ authors = [{ name = "Magnus Hedemark", email = "magnus919@pm.me" }]
 dependencies = [
     "cashew-brain @ https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz#sha256=23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3",
     "numpy",
-    "scikit-learn",
     "sentence-transformers",
     "sqlite-vec",
 ]
@@ -111,7 +110,7 @@ module = "plugins.memory.cashew"
 disable_error_code = ["type-arg", "index"]
 
 [[tool.mypy.overrides]]
-module = "plugins.memory.cashew.sleep_refactor"
+module = "plugins.memory.cashew.sleep_adapter"
 disable_error_code = ["type-arg"]
 
 [tool.deptry]

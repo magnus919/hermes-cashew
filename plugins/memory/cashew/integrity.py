@@ -1,10 +1,10 @@
-"""Read-only integrity inspection for existing Cashew profiles.
+"""Read-only integrity inspection and explicit upstream repair delegation.
 
-This module deliberately stops at an audit boundary.  Cashew's currently
-available repair helpers are broad, default-service based, and do not expose a
-stable connection-aware transaction contract.  ``apply_integrity_repairs``
-therefore returns a structured unavailable result until upstream provides that
-contract; it never mutates a profile as a side effect of inspection.
+Inspection remains query-only.  When the installed Cashew exposes the stable
+connection-aware contract, ``inspect_integrity`` and the explicitly confirmed
+``apply_integrity_repairs`` delegate to it without taking connection or
+transaction ownership.  Older pins continue to return the structured
+unavailable result; no local repair algorithm is maintained here.
 """
 
 from __future__ import annotations
@@ -880,18 +880,27 @@ def audit_integrity(
     return report
 
 
-def apply_integrity_repairs(
-    db_path: str | pathlib.Path,
-    *,
-    confirm: bool = False,
-    backup_dir: str | pathlib.Path | None = None,
-) -> dict[str, Any]:
-    """Return a structured refusal until upstream exposes safe targeted repair.
+def _upstream_integrity_api() -> tuple[Any, Any] | None:
+    """Load the optional upstream API without making it a production import.
 
-    ``db_path`` and ``backup_dir`` are accepted to make the future operator
-    contract explicit.  They are intentionally not opened or created here.
+    The selected production pin predates ``core.integrity``.  Keeping this
+    lookup lazy lets the adapter remain installable on that pin while an exact
+    newer checkout can exercise the delegation in an isolated subprocess.
     """
-    del db_path, backup_dir
+    try:
+        from core import integrity as upstream_integrity
+
+        inspect_fn = getattr(upstream_integrity, "inspect_integrity", None)
+        repair_fn = getattr(upstream_integrity, "repair_integrity", None)
+    except (ImportError, AttributeError):
+        return None
+    if not callable(inspect_fn) or not callable(repair_fn):
+        return None
+    return inspect_fn, repair_fn
+
+
+def _repair_unavailable(*, confirm: bool) -> dict[str, Any]:
+    """Preserve the fail-closed response for pins without the upstream API."""
     return {
         "schema_version": 1,
         "status": "unavailable",
@@ -904,6 +913,135 @@ def apply_integrity_repairs(
         ),
         "repairs": [],
     }
+
+
+def inspect_integrity(
+    conn: sqlite3.Connection,
+    *,
+    expected_model: str | None = None,
+    expected_dimension: int | None = None,
+) -> dict[str, Any]:
+    """Delegate a connection-owned audit to upstream when available.
+
+    This function never opens, closes, commits, rolls back, or changes journal
+    mode on ``conn``.  Model names are adapter-sensitive configuration and are
+    removed from the returned upstream report before it crosses this boundary.
+    """
+    api = _upstream_integrity_api()
+    if api is None:
+        return {
+            "schema_version": 1,
+            "status": "unavailable",
+            "read_only": True,
+            "mutated": False,
+            "reason": "stable_targeted_integrity_api_unavailable",
+        }
+    inspect_fn, _repair_fn = api
+    try:
+        report = dict(
+            inspect_fn(
+                conn,
+                expected_model=expected_model,
+                expected_dimension=expected_dimension,
+            )
+        )
+    except Exception:
+        logger.warning("Cashew upstream integrity inspection failed")
+        return {
+            "schema_version": 1,
+            "status": "unavailable",
+            "read_only": True,
+            "mutated": False,
+            "reason": "upstream_integrity_inspection_failed",
+        }
+    report.pop("expected_model", None)
+    report["read_only"] = True
+    report["mutated"] = False
+    report["adapter"] = {"delegated_to": "core.integrity.inspect_integrity"}
+    return report
+
+
+def apply_integrity_repairs(
+    db_path: str | pathlib.Path | None = None,
+    *,
+    confirm: bool = False,
+    backup_dir: str | pathlib.Path | None = None,
+    conn: sqlite3.Connection | None = None,
+    expected_model: str | None = None,
+    expected_dimension: int | None = None,
+    embedding_fn: Any = None,
+    embedding_model: str | None = None,
+    require_vec_parity: bool = True,
+    actions: Iterable[str] | None = None,
+    permanence_policy: str = "report",
+    batch_size: int = 100,
+    max_items: int = 1000,
+) -> dict[str, Any]:
+    """Apply only an explicit, caller-owned upstream repair operation.
+
+    ``conn`` must already be open inside the caller's outer transaction.  The
+    adapter never opens a path, creates a backup, acquires a lock, commits,
+    rolls back, or closes the connection.  ``confirm`` is required so audit
+    and initialization paths can never repair implicitly.  ``db_path`` and
+    ``backup_dir`` remain metadata-only compatibility arguments.
+    """
+    del db_path, backup_dir
+    if not confirm:
+        return {
+            "schema_version": 1,
+            "status": "rejected",
+            "mutated": False,
+            "confirmed": False,
+            "reason": "explicit_confirmation_required",
+        }
+    api = _upstream_integrity_api()
+    if api is None:
+        return _repair_unavailable(confirm=True)
+    if not isinstance(conn, sqlite3.Connection):
+        return {
+            "schema_version": 1,
+            "status": "rejected",
+            "mutated": False,
+            "confirmed": True,
+            "reason": "caller_connection_required",
+        }
+    if not conn.in_transaction:
+        return {
+            "schema_version": 1,
+            "status": "rejected",
+            "mutated": False,
+            "confirmed": True,
+            "reason": "outer_transaction_required",
+        }
+    if embedding_model is None:
+        embedding_model = expected_model
+    _inspect_fn, repair_fn = api
+    try:
+        result = dict(
+            repair_fn(
+                conn,
+                embedding_fn=embedding_fn,
+                embedding_model=embedding_model,
+                expected_dimension=expected_dimension,
+                require_vec_parity=require_vec_parity,
+                actions=actions,
+                permanence_policy=permanence_policy,
+                batch_size=batch_size,
+                max_items=max_items,
+            )
+        )
+    except Exception:
+        logger.warning("Cashew upstream integrity repair failed")
+        return {
+            "schema_version": 1,
+            "status": "unavailable",
+            "mutated": False,
+            "confirmed": True,
+            "reason": "upstream_integrity_repair_failed",
+        }
+    result["confirmed"] = True
+    result["adapter"] = {"delegated_to": "core.integrity.repair_integrity"}
+    return result
 
 
 # Short operator-friendly names; the explicit names remain canonical for callers.

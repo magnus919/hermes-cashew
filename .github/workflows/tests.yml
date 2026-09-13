@@ -145,6 +145,45 @@ jobs:
             exit 1
           }
 
+  hermes-cron-host:
+    name: Hermes cron host contract
+    runs-on: ubuntu-latest
+    needs: test
+    env:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_DATASETS_OFFLINE: "1"
+      HERMES_COMMIT: e440bf35472c30c2ee5527e884a866c12ad15b91
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install locked test environment
+        env:
+          UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/uv-python
+          UV_PYTHON_BIN_DIR: ${{ runner.temp }}/uv-python-bin
+        run: |
+          python -m pip install "uv==0.11.18"
+          uv python install --managed-python "3.12.11"
+          uv sync --frozen --extra dev --managed-python --python "3.12.11"
+        timeout-minutes: 5
+
+      - name: Fetch immutable Hermes host source
+        run: |
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/NousResearch/hermes-agent.git \
+            "$RUNNER_TEMP/hermes-agent"
+          git -C "$RUNNER_TEMP/hermes-agent" checkout --detach "$HERMES_COMMIT"
+          test "$(git -C "$RUNNER_TEMP/hermes-agent" rev-parse HEAD)" = "$HERMES_COMMIT"
+
+      - name: Exercise real Hermes cron.jobs against both installation layouts
+        run: |
+          .venv/bin/python scripts/run-hermes-cron-host-tests.py \
+            --hermes-root "$RUNNER_TEMP/hermes-agent"
+
   wheel-smoke:
     # Same fork-conditional as test job above
     runs-on: ${{ fromJSON(github.event.pull_request.head.repo.fork && '["ubuntu-latest"]' || '["self-hosted","linux","x64","hermes-cashew","docker"]') }}

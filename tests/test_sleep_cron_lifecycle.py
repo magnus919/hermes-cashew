@@ -14,6 +14,7 @@ test runs. The module-level skip handles this automatically.
 
 from __future__ import annotations
 
+import ast
 import json
 import sqlite3
 import time
@@ -55,13 +56,28 @@ def _make_config(hermes_home: Path, **overrides: str | bool | int) -> dict:
     return cfg
 
 
+def _install_provider_layout(hermes_home: Path, layout: str) -> None:
+    """Install a valid flat or development anchor for the real host lane."""
+    source = Path(__file__).parents[1] / "plugins" / "memory" / "cashew"
+    if layout == "flat":
+        target = hermes_home / "plugins" / "cashew" / "plugins" / "memory" / "cashew"
+    elif layout == "development":
+        target = hermes_home / "hermes-agent" / "plugins" / "memory" / "cashew"
+    else:
+        raise ValueError(f"unknown provider layout: {layout}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.symlink_to(source, target_is_directory=True)
+
+
 # ── Cron registration tests ─────────────────────────────────────────────────
 
 
-def test_initialize_skips_cron_when_sleep_disabled(tmp_path, monkeypatch):
+@pytest.mark.parametrize("layout", ["flat", "development"])
+def test_initialize_skips_cron_when_sleep_disabled(tmp_path, monkeypatch, layout):
     """When sleep_cycles=false, initialize() does NOT register a cron job."""
     hermes_home = tmp_path / "h1"
     hermes_home.mkdir()
+    _install_provider_layout(hermes_home, layout)
     cfg = hermes_home / "cashew.json"
     cfg.write_text(json.dumps(_make_config(hermes_home, sleep_cycles=False)))
 
@@ -77,15 +93,6 @@ def test_initialize_skips_cron_when_sleep_disabled(tmp_path, monkeypatch):
         calls.append(kwargs)
         return {"id": "fake-job-id"}
 
-    monkeypatch.setattr(
-        "plugins.memory.cashew._remove_existing_sleep_job",
-        lambda *a: None,
-    )
-    monkeypatch.setattr(
-        "plugins.memory.cashew.CashewMemoryProvider._hermes_home",
-        hermes_home,
-        raising=False,
-    )
     # Monkeypatch cron.jobs.create_job at the module level
     import cron.jobs as cron_jobs
 
@@ -107,10 +114,12 @@ def test_initialize_skips_cron_when_sleep_disabled(tmp_path, monkeypatch):
     provider.shutdown()
 
 
-def test_initialize_registers_cron_when_sleep_enabled(tmp_path, monkeypatch):
+@pytest.mark.parametrize("layout", ["flat", "development"])
+def test_initialize_registers_cron_when_sleep_enabled(tmp_path, monkeypatch, layout):
     """When sleep_cycles=true and sleep_schedule is set, initialize() registers a cron job."""
     hermes_home = tmp_path / "h2"
     hermes_home.mkdir()
+    _install_provider_layout(hermes_home, layout)
     cfg = hermes_home / "cashew.json"
     config_yaml = hermes_home / "config.yaml"
     config_yaml.write_text("model:\n  provider: test\n  default: test\n")
@@ -135,10 +144,6 @@ def test_initialize_registers_cron_when_sleep_enabled(tmp_path, monkeypatch):
         calls.append(kwargs)
         return {"id": "cron-job-123"}
 
-    monkeypatch.setattr(
-        "plugins.memory.cashew._remove_existing_sleep_job",
-        lambda *a: None,
-    )
     import cron.jobs as cron_jobs
 
     monkeypatch.setattr(cron_jobs, "create_job", fake_create_job)
@@ -155,10 +160,12 @@ def test_initialize_registers_cron_when_sleep_enabled(tmp_path, monkeypatch):
     provider.shutdown()
 
 
-def test_initialize_skips_cron_when_no_schedule(tmp_path, monkeypatch):
+@pytest.mark.parametrize("layout", ["flat", "development"])
+def test_initialize_skips_cron_when_no_schedule(tmp_path, monkeypatch, layout):
     """When sleep_schedule is empty, initialize() does NOT register a cron job."""
     hermes_home = tmp_path / "h3"
     hermes_home.mkdir()
+    _install_provider_layout(hermes_home, layout)
     cfg = hermes_home / "cashew.json"
     cfg.write_text(
         json.dumps(
@@ -181,10 +188,6 @@ def test_initialize_skips_cron_when_no_schedule(tmp_path, monkeypatch):
         calls.append(kwargs)
         return {"id": "cron-job-456"}
 
-    monkeypatch.setattr(
-        "plugins.memory.cashew._remove_existing_sleep_job",
-        lambda *a: None,
-    )
     import cron.jobs as cron_jobs
 
     monkeypatch.setattr(cron_jobs, "create_job", fake_create_job)
@@ -203,10 +206,12 @@ def test_initialize_skips_cron_when_no_schedule(tmp_path, monkeypatch):
     provider.shutdown()
 
 
-def test_shutdown_preserves_profile_owned_cron_job(tmp_path, monkeypatch):
+@pytest.mark.parametrize("layout", ["flat", "development"])
+def test_shutdown_preserves_profile_owned_cron_job(tmp_path, monkeypatch, layout):
     """Ordinary session shutdown leaves scheduled profile maintenance intact."""
     hermes_home = tmp_path / "h4"
     hermes_home.mkdir()
+    _install_provider_layout(hermes_home, layout)
     cfg = hermes_home / "cashew.json"
     config_yaml = hermes_home / "config.yaml"
     config_yaml.write_text("model:\n  provider: test\n  default: test\n")
@@ -225,15 +230,11 @@ def test_shutdown_preserves_profile_owned_cron_job(tmp_path, monkeypatch):
     def fake_create_job(**kwargs):
         return {"id": "cron-job-789"}
 
-    monkeypatch.setattr(
-        "plugins.memory.cashew._remove_existing_sleep_job",
-        lambda *a: None,
-    )
     import cron.jobs as cron_jobs
 
     monkeypatch.setattr(cron_jobs, "create_job", fake_create_job)
     monkeypatch.setattr(cron_jobs, "remove_job", fake_remove_job)
-    monkeypatch.setattr(cron_jobs, "list_jobs", lambda: [])
+    monkeypatch.setattr(cron_jobs, "list_jobs", lambda *, include_disabled=False: [])
 
     from plugins.memory.cashew import CashewMemoryProvider
 
@@ -250,10 +251,12 @@ def test_shutdown_preserves_profile_owned_cron_job(tmp_path, monkeypatch):
     assert provider._sleep_cron_job_id is None  # instance tracking is cleared
 
 
-def test_cron_script_is_installed(tmp_path, monkeypatch):
+@pytest.mark.parametrize("layout", ["flat", "development"])
+def test_cron_script_is_installed(tmp_path, monkeypatch, layout):
     """initialize() writes the cron script to $HERMES_HOME/scripts/."""
     hermes_home = tmp_path / "h5"
     hermes_home.mkdir()
+    _install_provider_layout(hermes_home, layout)
     cfg = hermes_home / "cashew.json"
     config_yaml = hermes_home / "config.yaml"
     config_yaml.write_text("model:\n  provider: test\n  default: test\n")
@@ -264,10 +267,6 @@ def test_cron_script_is_installed(tmp_path, monkeypatch):
     _ensure_schema(conn)
     conn.close()
 
-    monkeypatch.setattr(
-        "plugins.memory.cashew._remove_existing_sleep_job",
-        lambda *a: None,
-    )
     import cron.jobs as cron_jobs
 
     def fake_create_job(**kwargs):
@@ -286,7 +285,8 @@ def test_cron_script_is_installed(tmp_path, monkeypatch):
     assert script_path.exists(), f"Cron script not found at {script_path}"
     content = script_path.read_text()
     assert "run_sleep_cycle" in content
-    assert "plugins.memory.cashew.sleep_adapter" in content
+    assert "_hermes_cashew_cron_impl" in content
+    assert "sleep_adapter" in content
 
     provider.shutdown()
 
@@ -318,14 +318,36 @@ def test_cron_script_imports_resolve_model_fn(tmp_path):
     script_path.write_text(script_source)
     script_path.chmod(0o755)
 
-    # Verify the script contains the resolve_model_fn import
-    assert "resolve_model_fn" in script_source
-    assert (
-        "model_fn = _resolve_model_fn" in script_source
-        or "resolve_model_fn(hermes_home" in script_source
-    )
-    assert "model_fn=model_fn" in script_source
-    # No longer hardcoded None
-    assert "model_fn=None" not in script_source.replace(
-        "# model_fn=None (fallback)", ""
+    # Verify the generated entry point resolves the configured auxiliary model
+    # and passes that callable to upstream's cycle boundary.  Keep this as an
+    # AST contract so harmless formatting or local variable names do not break
+    # the test while a hard-coded ``None`` still fails it.
+    tree = ast.parse(script_source)
+    resolve_calls = []
+    cycle_calls = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            function_name = (
+                node.func.id
+                if isinstance(node.func, ast.Name)
+                else node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else ""
+            )
+            if function_name == "resolve_model_fn":
+                resolve_calls.append(node)
+            if function_name == "run_sleep_cycle":
+                cycle_calls.append(node)
+    assert resolve_calls
+    assert cycle_calls
+    model_fn_arguments = [
+        keyword.value
+        for call in cycle_calls
+        for keyword in call.keywords
+        if keyword.arg == "model_fn"
+    ]
+    assert model_fn_arguments
+    assert all(
+        not (isinstance(value, ast.Constant) and value.value is None)
+        for value in model_fn_arguments
     )

@@ -31,10 +31,13 @@ def _clear_cashew_env_vars(monkeypatch: pytest.MonkeyPatch):
         pass
 
 
-# Synthesize agent.memory_provider if hermes-agent is not installed.
+# Synthesize agent.memory_provider if hermes-agent is not installed. The pinned
+# real-Hermes host lane opts out with HERMES_CASHEW_REAL_HERMES=1 so cron.jobs
+# can import the host's actual agent package and provider contract.
 # Verified minimal contract: MemoryProvider has `name` property and a set of abstract methods.
 # We only need the ABC to be importable — actual method signatures are exercised by Hermes at runtime.
-if "agent.memory_provider" not in sys.modules:
+_real_hermes_host = os.environ.get("HERMES_CASHEW_REAL_HERMES") == "1"
+if not _real_hermes_host and "agent.memory_provider" not in sys.modules:
     _agent_pkg = types.ModuleType("agent")
     _agent_pkg.__path__ = []  # mark as package
     _mp_mod = types.ModuleType("agent.memory_provider")
@@ -98,7 +101,8 @@ if "core.session" not in sys.modules and _cashew_spec is None:
 # but Hermes ABC ordering conventions keep memory_provider ahead of memory_manager.
 from tests._memory_manager_stub import inject_into_sys_modules  # noqa: E402
 
-inject_into_sys_modules()
+if not _real_hermes_host:
+    inject_into_sys_modules()
 
 import pytest  # noqa: E402
 

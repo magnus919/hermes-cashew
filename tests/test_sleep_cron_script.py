@@ -231,7 +231,36 @@ def test_generated_script_executes_real_upstream_sleep_candidate(
     hermes_home, script, implementation = _generate_script(tmp_path, monkeypatch, kind)
     source_root = Path(__file__).parents[1] / "plugins" / "memory" / "cashew"
     config_path = implementation / "config.py"
-    config_path.write_text(config_path.read_text().replace("'384'", "'1024'"))
+    # Use Cashew's real schema initializer and seed valid candidate input. The
+    # generated package still owns only the Hermes config/path bridge; the
+    # sleep call below must enter the installed upstream core.sleep module.
+    config_path.write_text(
+        "import sqlite3\n"
+        "import struct\n"
+        "from pathlib import Path\n"
+        "from core.db import ensure_schema\n"
+        "class Config:\n"
+        "    cashew_db_path = 'cashew/brain.db'\n"
+        "    sleep_max_nodes = 2\n"
+        "    embedding_model = 'thenlper/gte-large'\n"
+        "    embedding_device = 'cpu'\n"
+        "    sleep_cycles = True\n"
+        "    sleep_schedule = 'every 1h'\n"
+        "def load_effective_config_snapshot(home, values):\n"
+        "    db = Path(home) / 'cashew/brain.db'\n"
+        "    db.parent.mkdir(parents=True, exist_ok=True)\n"
+        "    ensure_schema(str(db))\n"
+        "    vector_a = struct.pack('<1024f', *([1.0] + [0.0] * 1023))\n"
+        "    vector_b = struct.pack('<1024f', *([0.0, 1.0] + [0.0] * 1022))\n"
+        "    with sqlite3.connect(db) as conn:\n"
+        "        conn.execute('CREATE TABLE IF NOT EXISTS hermes_provider_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)')\n"
+        "        conn.executemany('INSERT OR REPLACE INTO hermes_provider_meta VALUES (?, ?)', [('embedding_model', 'thenlper/gte-large'), ('embedding_dim', '1024'), ('vec_dim', '1024'), ('maintenance_epoch', '1')])\n"
+        "        conn.executemany('INSERT OR IGNORE INTO thought_nodes (id, content, node_type, timestamp, source_file) VALUES (?, ?, ?, ?, ?)', [('cron-a', 'candidate memory a', 'observation', '2020-01-01', 'cron-a'), ('cron-b', 'candidate memory b', 'observation', '2020-01-02', 'cron-b')])\n"
+        "        conn.executemany('INSERT OR IGNORE INTO embeddings (node_id, vector, model, updated_at) VALUES (?, ?, ?, ?)', [('cron-a', vector_a, 'thenlper/gte-large', '2020-01-01'), ('cron-b', vector_b, 'thenlper/gte-large', '2020-01-02')])\n"
+        "    return Config()\n"
+        "def resolve_db_path(home, raw): return Path(home) / raw\n"
+        "def resolve_model_fn(*, hermes_home, config): return None\n"
+    )
     (implementation / "sleep_adapter.py").write_text(
         (source_root / "sleep_adapter.py").read_text()
     )
@@ -260,8 +289,9 @@ def test_generated_script_executes_real_upstream_sleep_candidate(
     )
 
     result = json.loads(completed.stdout)
-    assert result["status"] == "unavailable"
-    assert result["error"] == "no_embeddings_table"
+    assert result["status"] in {"completed", "partial", "unavailable"}
+    assert result["nodes_selected"] == 2
+    assert result["nodes_with_embeddings"] == 2
 
 
 def test_generated_cron_script_closes_owned_child_after_sleep_failure(

@@ -13,6 +13,9 @@ Cashew PR #136 head `ac090ce75ffd2e97dac257cee9430628c68aa241`, archive
 SHA-256 `0777dcb89bde8e0d6103786358c93c0ad3fd4ffb7f8a210194c37b211ae4c28b`.
 The source still reports package version `1.2.1`; the commit, archive digest,
 and installed `core/sleep.py` digest are the provenance signals.
+The host scheduler contract is exercised against immutable Hermes Agent commit
+`e440bf35472c30c2ee5527e884a866c12ad15b91`; that source is fetched only by the
+test harness and is not a production dependency.
 
 The reviewed draft ranges were integrated in dependency order, preserving
 their signed commits where possible:
@@ -34,8 +37,11 @@ algorithm was not carried forward.
 ## Evidence collected
 
 - The focused integration boundary suites pass: `137 passed, 2 skipped`.
-  The skips require the optional Hermes `cron.jobs` host module, which is not
-  installed in this local test environment.
+  The separate pinned-host lane passes `11 passed` against the real Hermes
+  `cron.jobs` implementation for both flat and development installation
+  anchors. The lane uses a minimal security-helper shim for an unrelated CLI
+  import and runs as a required CI job; it does not replace the real scheduler
+  module.
 - The full locked test suite passes after the final benchmark update:
   `539 passed, 3 skipped, 2 warnings` in 69.89 seconds. The skips require the
   optional Hermes `cron.jobs` host module; the warnings are the existing Sentry
@@ -77,10 +83,10 @@ stacked provenance gates are reviewed:
    version does not expose a stable connection-aware repair contract. This
    candidate does not claim opt-in repair, rollback, or automatic reconstruction
    of merged facts.
-3. The optional real Hermes `cron.jobs` host lane must run in CI or a pinned
-   Hermes environment before #203/#211 can claim the host scheduler acceptance
-   criteria. The local flat smoke is packaging evidence, not a substitute for
-   that host module.
+3. The required Hermes host lane must remain green against the pinned commit
+   above. The local flat smoke is packaging evidence, not a substitute for the
+   real host module, and the lane does not change the production dependency
+   model.
 
 No release tag, PyPI publication, live profile migration, or automatic memory
 provider re-enablement is part of this candidate.

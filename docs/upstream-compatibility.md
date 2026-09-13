@@ -178,6 +178,25 @@ The final #187 verification target is the full offline suite:
 uv run --frozen --extra dev pytest
 ```
 
+### Integrity repair staging
+
+The production Cashew source remains pinned to the reviewed PR #136 archive.
+This branch therefore keeps the adapter fail-closed when the installed package
+does not expose `core.integrity`: `apply_integrity_repairs` returns the
+structured `stable_targeted_repair_api_unavailable` result without opening a
+database path. A staged subprocess fixture copies only
+`core/integrity.py` from upstream PR #137 commit
+`cb940f34c15460b87831748b2e702334c1c5fbd0` and records its SHA-256 provenance
+in `tests/fixtures/cashew-pr137/PROVENANCE.json`.
+
+When, and only when, canonical upstream contains that contract plus the
+required #193/#236 immutable provenance updates, the adapter can delegate
+`inspect_integrity(conn, ...)` and explicitly confirmed
+`apply_integrity_repairs(conn=conn, ...)`. The caller supplies an open
+connection inside its outer transaction and retains ownership of locking,
+backup, commit, rollback, post-repair inspection, and close. No production pin
+or mutable fork reference is changed by this staging work.
+
 This document does not claim that a local source build, a static import, or a
 passing component test proves production compatibility. A future baseline must
 record the exact dependency artifact, Hermes revision, CI result, and boundary

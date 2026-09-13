@@ -21,6 +21,7 @@ def test_fixture_records_immutable_upstream_provenance() -> None:
     provenance = json.loads((_FIXTURE / "PROVENANCE.json").read_text())
     assert provenance["commit"] == _EXPECTED_HEAD
     assert provenance["source"] == "core/integrity.py"
+    assert provenance["sha256"] == _EXPECTED_SOURCE_SHA256
     assert hashlib.sha256(_UPSTREAM_SOURCE.read_bytes()).hexdigest() == (
         _EXPECTED_SOURCE_SHA256
     )

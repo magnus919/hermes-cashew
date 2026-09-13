@@ -132,23 +132,28 @@ jobs:
   # skipped, or failed matrix result into a visible failure for branch policy.
   test:
     name: test
-    needs: test-python
+    needs: [test-python, hermes-cron-host]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Require all supported Python workers to pass
+      - name: Require all supported workers to pass
         env:
           MATRIX_RESULT: ${{ needs['test-python'].result }}
+          HERMES_HOST_RESULT: ${{ needs['hermes-cron-host'].result }}
         run: |
           test "$MATRIX_RESULT" = "success" || {
             echo "::error::supported Python matrix result: $MATRIX_RESULT"
+            exit 1
+          }
+          test "$HERMES_HOST_RESULT" = "success" || {
+            echo "::error::Hermes host contract result: $HERMES_HOST_RESULT"
             exit 1
           }
 
   hermes-cron-host:
     name: Hermes cron host contract
     runs-on: ubuntu-latest
-    needs: test
+    needs: test-python
     env:
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"

@@ -14,6 +14,7 @@ ARCHIVE_URL = (
     "https://github.com/magnus919/true/archive/"
     "fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz"
 )
+ARCHIVE_SHA256 = "23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3"
 SESSION_SHA256 = "0ce60cc63adf4fb7136581aee722bb10e9a344e556b6fb98f4d46855d53c36cd"
 MINIMUM_SQLITE = (3, 35, 0)
 
@@ -26,9 +27,16 @@ def main() -> None:
             "cashew-brain has no direct_url.json; version 1.2.1 does not prove "
             "the selected source is installed"
         )
-    actual_url = json.loads(direct_url_text)["url"]
+    direct_url = json.loads(direct_url_text)
+    actual_url = direct_url["url"]
     if actual_url != ARCHIVE_URL:
         raise SystemExit(f"unexpected cashew-brain source: {actual_url}")
+    archive_hash = direct_url.get("archive_info", {}).get("hash", "")
+    if archive_hash != f"sha256={ARCHIVE_SHA256}":
+        raise SystemExit(
+            f"unexpected cashew-brain archive hash: {archive_hash}; "
+            f"expected sha256={ARCHIVE_SHA256}"
+        )
 
     session_path = Path(distribution.locate_file("core/session.py"))
     actual_hash = hashlib.sha256(session_path.read_bytes()).hexdigest()

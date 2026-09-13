@@ -29,17 +29,25 @@ effect. Reports include only bounded counts and reason codes; historical merge
 intent remains an explicit manual-review item because it cannot be reconstructed
 from the stored graph safely.
 
-The explicit operator apply surface is currently fail-closed:
+The explicit operator apply surface remains fail-closed on the production
+Cashew pin:
 
 ```bash
 python -m plugins.memory.cashew.integrity --apply --confirm /path/to/brain.db
 ```
 
 It returns a structured `stable_targeted_repair_api_unavailable` result and
-does not open or create the profile. Deterministic repair will be enabled only
-after Cashew exposes a connection-aware API with atomic ordinary/vector writes,
-verified backups, and repeatable post-repair checks. Do not use broad sleep or
-whole-database re-embedding as an integrity repair substitute.
+does not open or create the profile. A staged adapter is available for testing
+against the exact upstream PR #137 contract: callers may use
+`inspect_integrity(conn, ...)` and, only after an explicit `confirm=True`,
+`apply_integrity_repairs(conn=conn, ...)`. The caller must provide an open
+connection inside its outer transaction and owns backup, locking, commit,
+post-repair inspection, rollback, and close. The adapter never opens a path,
+touches `HOME`, changes journal mode, or repairs automatically. It is not
+activated by this production pin and cannot be enabled until the canonical
+upstream tree contains PR #137 together with the required #193/#236 immutable
+provenance updates. Do not use broad sleep or whole-database re-embedding as
+an integrity repair substitute.
 
 ## Prerequisites
 

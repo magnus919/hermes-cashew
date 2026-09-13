@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/rajkripal/cashew",
+  "commit": "cb940f34c15460b87831748b2e702334c1c5fbd0",
+  "source": "core/integrity.py",
+  "purpose": "offline subprocess boundary fixture; never a production dependency"
+}

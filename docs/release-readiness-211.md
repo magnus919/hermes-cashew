@@ -79,11 +79,16 @@ stacked provenance gates are reviewed:
    by a later tested pin. PR #236 must then pass its immutable provenance and
    archive verification checks, followed by PR #237's thin-adapter review.
 2. #206's read-only audit is implemented and tested against synthetic
-   corruption. Its `apply_integrity_repairs` entry point deliberately returns a
-   structured `repair_unavailable` result because the selected upstream
-   version does not expose a stable connection-aware repair contract. This
-   candidate does not claim opt-in repair, rollback, or automatic reconstruction
-   of merged facts.
+   corruption. A stacked draft also contains a thin adapter for the exact
+   connection-aware contract proposed by upstream PR #137, proven in a
+   subprocess against immutable fixture commit
+   `cb940f34c15460b87831748b2e702334c1c5fbd0`. The production dependency pin
+   remains unchanged, so the installed package continues to return the
+   structured `repair_unavailable` result. This adapter cannot be activated or
+   merged until canonical upstream contains PR #137 and the #193/#236
+   immutable-provenance updates. The caller still owns the outer transaction,
+   backup, lock, commit, post-repair inspection, rollback, and close; no
+   automatic repair or reconstruction of merged facts is claimed.
 3. The required Hermes host lane must remain green against the pinned commit
    above. The local flat smoke is packaging evidence, not a substitute for the
    real host module, and the lane does not change the production dependency

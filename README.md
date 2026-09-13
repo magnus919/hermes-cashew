@@ -10,6 +10,43 @@ explicit Hermes `auxiliary.memory` mapping for LLM-powered extraction, adds
 forest-level insight extraction via `on_pre_compress`, and runs graph
 consolidation on a persistent Hermes cron schedule.
 
+## Integrity audit
+
+Existing profiles can be inspected without opening a writable database:
+
+```bash
+python -m plugins.memory.cashew.integrity /path/to/brain.db
+```
+
+The audit uses a canonical shared maintenance lease and SQLite URI read-only
+mode. It reports schema and privacy-safe provider fingerprints, ordinary
+embedding validity, vector-index parity when the installed extension can be
+verified, orphan rows, referential graph defects, and permanence contradictions.
+Large scans use fixed row, byte, and deadline budgets; a cutoff is reported as
+`audit_incomplete` rather than presented as a complete audit. It never runs schema
+migrations, decay, consolidation, embedding services, or repair as a side
+effect. Reports include only bounded counts and reason codes; historical merge
+intent remains an explicit manual-review item because it cannot be reconstructed
+from the stored graph safely.
+
+The explicit operator apply surface is connection-owned and remains fail-closed
+for path-only CLI calls:
+
+```bash
+python -m plugins.memory.cashew.integrity --apply --confirm /path/to/brain.db
+```
+
+It returns a structured `caller_connection_required` result and does not open
+or create the profile. The selected immutable Cashew composite provides the
+connection-aware API: callers may use `inspect_integrity(conn, ...)` and, only
+after an explicit `confirm=True`,
+`apply_integrity_repairs(conn=conn, ...)`. The caller must provide an open
+connection inside its outer transaction and owns backup, locking, commit,
+post-repair inspection, rollback, and close. The adapter never opens a path,
+touches `HOME`, changes journal mode, or repairs automatically. Older Cashew
+installations without the API remain fail-closed. Do not use broad sleep or
+whole-database re-embedding as an integrity repair substitute.
+
 ## Prerequisites
 
 - [Hermes Agent](https://github.com/nousresearch/hermes-agent) installed
@@ -37,12 +74,13 @@ uv pip install \
   ~/.hermes/plugins/cashew/scripts/verify-cashew-baseline.py
 ```
 
-This archive is a temporary composite fork of upstream Cashew. It combines PR
+This archive is an immutable composite fork of upstream Cashew. It combines PR
 136 (`ac090ce75ffd2e97dac257cee9430628c68aa241`) and PR 137
 (`cb940f34c15460b87831748b2e702334c1c5fbd0`) at tree
-`29d97fb93c7998c97be0da8f19b90c6523f9d1e9`. The fork preserves provenance while
-those changes are reviewed upstream; replace this pin with the canonical
-upstream release once both changes are available there.
+`29d97fb93c7998c97be0da8f19b90c6523f9d1e9`. The composite lets the plugin use
+both reviewed fixes immediately while the upstream pull requests remain open.
+If canonical upstream later contains both changes, a separate tested
+dependency update can replace this archive.
 
 The lockfile enforces the archive digest during installation; uv may omit that
 digest from the installed PEP 610 metadata, so verification requires the exact

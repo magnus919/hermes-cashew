@@ -17,6 +17,7 @@ ARCHIVE_URL = (
 )
 ARCHIVE_SHA256 = "23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3"
 SESSION_SHA256 = "0ce60cc63adf4fb7136581aee722bb10e9a344e556b6fb98f4d46855d53c36cd"
+INTEGRITY_SHA256 = "80e928c4a073aadb9340095a27b65f03512393d9c1e03cfd025e9aa70d99b9ba"
 MINIMUM_SQLITE = (3, 35, 0)
 
 
@@ -49,8 +50,16 @@ def main() -> None:
             f"unexpected core/session.py SHA-256: {actual_hash}; "
             f"expected {SESSION_SHA256}"
         )
+    integrity_path = Path(distribution.locate_file("core/integrity.py"))
+    actual_integrity_hash = hashlib.sha256(integrity_path.read_bytes()).hexdigest()
+    if actual_integrity_hash != INTEGRITY_SHA256:
+        raise SystemExit(
+            f"unexpected core/integrity.py SHA-256: {actual_integrity_hash}; "
+            f"expected {INTEGRITY_SHA256}"
+        )
     print(f"cashew-brain source verified: {actual_url}")
     print(f"core/session.py SHA-256: {actual_hash}")
+    print(f"core/integrity.py SHA-256: {actual_integrity_hash}")
 
     with closing(sqlite3.connect(":memory:")) as connection:
         source_id = connection.execute("SELECT sqlite_source_id()").fetchone()[0]

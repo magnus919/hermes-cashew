@@ -24,8 +24,8 @@ from core.db import NODE_COLUMNS, ensure_schema, schema_version  # noqa: E402, I
 
 
 CASHEW_ARCHIVE_URL = (
-    "https://github.com/rajkripal/cashew/archive/"
-    "dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz"
+    "https://github.com/magnus919/true/archive/"
+    "fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz"
 )
 CASHEW_SESSION_SHA256 = (
     "0ce60cc63adf4fb7136581aee722bb10e9a344e556b6fb98f4d46855d53c36cd"

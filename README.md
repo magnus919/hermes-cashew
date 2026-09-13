@@ -29,7 +29,7 @@ current Hermes dependency installer intentionally rejects. Install the exact
 source archive into the Hermes environment before setup:
 
 ```bash
-CASHEW_PIN='cashew-brain @ https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz#sha256=38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab'
+CASHEW_PIN='cashew-brain @ https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz#sha256=23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3'
 uv pip install \
   --python ~/.hermes/hermes-agent/venv/bin/python3 \
   --reinstall "$CASHEW_PIN" sqlite-vec
@@ -447,7 +447,7 @@ rm -rf ~/.hermes/cashew   # optional: remove the local graph data
    source baseline from [Install](#install). If `uv` is unavailable, bootstrap
    pip in the Hermes environment and pass the same quoted `CASHEW_PIN` value:
    ```bash
-   CASHEW_PIN='cashew-brain @ https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz#sha256=38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab'
+   CASHEW_PIN='cashew-brain @ https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz#sha256=23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3'
    ~/.hermes/hermes-agent/venv/bin/python3 -m ensurepip
    ~/.hermes/hermes-agent/venv/bin/python3 -m pip install \
      --force-reinstall "$CASHEW_PIN" sqlite-vec

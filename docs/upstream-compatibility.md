@@ -28,11 +28,26 @@ Issue #188 tested this candidate baseline:
 | cashew-brain | `dd57ef029cf9a6dce0b8145d335a55202dd1bac4` | Immutable [upstream source archive](https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz), locked with archive SHA-256 `38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab`. The installed `core/session.py` SHA-256 is `0ce60cc63adf4fb7136581aee722bb10e9a344e556b6fb98f4d46855d53c36cd`. |
 | Hermes Agent loader/lifecycle evidence | `990473a79c6b0396b0a648fdd85ee8f7a5c267d3` | The #199 lane merged in wrapper commit `cc1e31c66b1f0cf72079d91497e21c7347c47c99`. Its flat and development loader, auxiliary routing, lifecycle, and cron contracts also passed in a fresh environment containing the exact #188 source pin. The embedding model and external client were deterministic fakes; Hermes, SQLite 3.47.1, and the Cashew package boundary were real. This is bounded compatibility evidence, not a published Hermes minimum-version promise or native embedding-crash proof. |
 
-The selected commit was the upstream `main` tip at the audit date and is 22
-commits ahead of `v1.2.1` (`894637ba76b059347af3fe2142201521d9484fb4`).
+The #188 source above is retained as historical provenance. The current
+immutable candidate for the consolidation replacement work is the published
+fork composite below:
+
+| Component | Exact reference | Availability and provenance |
+| --- | --- | --- |
+| cashew-brain | `fcb4919ac37144bfbeb822eaafc668a4bdceb791` | Immutable [fork source archive](https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz), locked with archive SHA-256 `23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3`. This composite merge has reviewed PR #136 parent `ac090ce75ffd2e97dac257cee9430628c68aa241` and PR #137 parent `cb940f34c15460b87831748b2e702334c1c5fbd0`. |
+
+The fork branch `hermes-cashew-composite-211` is a packaging bridge while the
+upstream PRs are reviewed and merged. It is pinned by the full merge commit
+and archive digest; no mutable branch or floating source is used by the
+package. The installed `core/session.py` SHA-256 remains
+`0ce60cc63adf4fb7136581aee722bb10e9a344e556b6fb98f4d46855d53c36cd`.
+
+The historical #188 selected commit was the upstream `main` tip at that audit
+date and is 22 commits ahead of `v1.2.1`
+(`894637ba76b059347af3fe2142201521d9484fb4`).
 The [upstream comparison](https://github.com/rajkripal/cashew/compare/v1.2.1...dd57ef029cf9a6dce0b8145d335a55202dd1bac4)
-contains the schema-contention fix. Production installs use the exact source
-archive and digest below rather than floating on Cashew `main`:
+contains the schema-contention fix. The historical #188 installation used the
+exact source archive and digest below rather than floating on Cashew `main`:
 
 ```text
 https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz

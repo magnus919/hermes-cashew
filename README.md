@@ -29,25 +29,23 @@ effect. Reports include only bounded counts and reason codes; historical merge
 intent remains an explicit manual-review item because it cannot be reconstructed
 from the stored graph safely.
 
-The explicit operator apply surface remains fail-closed on the production
-Cashew pin:
+The explicit operator apply surface is connection-owned and remains fail-closed
+for path-only CLI calls:
 
 ```bash
 python -m plugins.memory.cashew.integrity --apply --confirm /path/to/brain.db
 ```
 
-It returns a structured `stable_targeted_repair_api_unavailable` result and
-does not open or create the profile. A staged adapter is available for testing
-against the exact upstream PR #137 contract: callers may use
-`inspect_integrity(conn, ...)` and, only after an explicit `confirm=True`,
+It returns a structured `caller_connection_required` result and does not open
+or create the profile. The selected immutable Cashew composite provides the
+connection-aware API: callers may use `inspect_integrity(conn, ...)` and, only
+after an explicit `confirm=True`,
 `apply_integrity_repairs(conn=conn, ...)`. The caller must provide an open
 connection inside its outer transaction and owns backup, locking, commit,
 post-repair inspection, rollback, and close. The adapter never opens a path,
-touches `HOME`, changes journal mode, or repairs automatically. It is not
-activated by this production pin and cannot be enabled until the canonical
-upstream tree contains PR #137 together with the required #193/#236 immutable
-provenance updates. Do not use broad sleep or whole-database re-embedding as
-an integrity repair substitute.
+touches `HOME`, changes journal mode, or repairs automatically. Older Cashew
+installations without the API remain fail-closed. Do not use broad sleep or
+whole-database re-embedding as an integrity repair substitute.
 
 ## Prerequisites
 
@@ -76,12 +74,13 @@ uv pip install \
   ~/.hermes/plugins/cashew/scripts/verify-cashew-baseline.py
 ```
 
-This archive is a temporary composite fork of upstream Cashew. It combines PR
+This archive is an immutable composite fork of upstream Cashew. It combines PR
 136 (`ac090ce75ffd2e97dac257cee9430628c68aa241`) and PR 137
 (`cb940f34c15460b87831748b2e702334c1c5fbd0`) at tree
-`29d97fb93c7998c97be0da8f19b90c6523f9d1e9`. The fork preserves provenance while
-those changes are reviewed upstream; replace this pin with the canonical
-upstream release once both changes are available there.
+`29d97fb93c7998c97be0da8f19b90c6523f9d1e9`. The composite lets the plugin use
+both reviewed fixes immediately while the upstream pull requests remain open.
+If canonical upstream later contains both changes, a separate tested
+dependency update can replace this archive.
 
 The lockfile enforces the archive digest during installation; uv may omit that
 digest from the installed PEP 610 metadata, so verification requires the exact

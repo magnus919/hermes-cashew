@@ -1,10 +1,11 @@
 """Read-only integrity inspection and explicit upstream repair delegation.
 
-Inspection remains query-only.  When the installed Cashew exposes the stable
-connection-aware contract, ``inspect_integrity`` and the explicitly confirmed
-``apply_integrity_repairs`` delegate to it without taking connection or
-transaction ownership.  Older pins continue to return the structured
-unavailable result; no local repair algorithm is maintained here.
+Inspection remains query-only.  The selected immutable Cashew composite exposes
+the stable connection-aware contract, so ``inspect_integrity`` and the
+explicitly confirmed ``apply_integrity_repairs`` delegate to it without taking
+connection or transaction ownership.  Older installations continue to return
+the structured unavailable result; no local repair algorithm is maintained
+here.
 """
 
 from __future__ import annotations
@@ -883,9 +884,9 @@ def audit_integrity(
 def _upstream_integrity_api() -> tuple[Any, Any] | None:
     """Load the optional upstream API without making it a production import.
 
-    The selected production pin predates ``core.integrity``.  Keeping this
-    lookup lazy lets the adapter remain installable on that pin while an exact
-    newer checkout can exercise the delegation in an isolated subprocess.
+    The selected composite pin includes ``core.integrity``.  Keeping this
+    lookup lazy preserves compatibility with older installations and keeps the
+    provider importable when Cashew is absent from a test environment.
     """
     try:
         from core import integrity as upstream_integrity
@@ -900,7 +901,7 @@ def _upstream_integrity_api() -> tuple[Any, Any] | None:
 
 
 def _repair_unavailable(*, confirm: bool) -> dict[str, Any]:
-    """Preserve the fail-closed response for pins without the upstream API."""
+    """Preserve the fail-closed response for installations without the API."""
     return {
         "schema_version": 1,
         "status": "unavailable",
@@ -908,8 +909,8 @@ def _repair_unavailable(*, confirm: bool) -> dict[str, Any]:
         "confirmed": bool(confirm),
         "reason": "stable_targeted_repair_api_unavailable",
         "message": (
-            "Cashew repair remains unavailable until upstream provides a "
-            "connection-aware targeted repair API with atomic ordinary/vec writes."
+            "Cashew repair remains unavailable because this installed Cashew "
+            "does not provide the connection-aware targeted repair API."
         ),
         "repairs": [],
     }
@@ -986,9 +987,6 @@ def apply_integrity_repairs(
     ``backup_dir`` remain metadata-only compatibility arguments.
     """
     del db_path, backup_dir
-    api = _upstream_integrity_api()
-    if api is None:
-        return _repair_unavailable(confirm=confirm)
     if not confirm:
         return {
             "schema_version": 1,
@@ -1013,6 +1011,9 @@ def apply_integrity_repairs(
             "confirmed": True,
             "reason": "outer_transaction_required",
         }
+    api = _upstream_integrity_api()
+    if api is None:
+        return _repair_unavailable(confirm=True)
     if embedding_model is None:
         embedding_model = expected_model
     _inspect_fn, repair_fn = api

@@ -6,6 +6,7 @@ import hashlib
 import importlib.machinery
 import importlib.metadata
 import json
+import runpy
 import sqlite3
 import sys
 import time
@@ -30,7 +31,14 @@ CASHEW_ARCHIVE_URL = (
 CASHEW_SESSION_SHA256 = (
     "0ce60cc63adf4fb7136581aee722bb10e9a344e556b6fb98f4d46855d53c36cd"
 )
+CASHEW_ARCHIVE_SHA256 = (
+    "0777dcb89bde8e0d6103786358c93c0ad3fd4ffb7f8a210194c37b211ae4c28b"
+)
 MINIMUM_SQLITE = (3, 35, 0)
+
+_VERIFY_SCRIPT = runpy.run_path(
+    str(Path(__file__).parents[1] / "scripts/verify-cashew-baseline.py")
+)
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -49,6 +57,37 @@ def test_installed_cashew_has_selected_source_provenance() -> None:
     assert hashlib.sha256(session_path.read_bytes()).hexdigest() == (
         CASHEW_SESSION_SHA256
     )
+
+
+def test_pep610_archive_hash_shapes_match_selected_digest() -> None:
+    extract = _VERIFY_SCRIPT["_direct_url_sha256"]
+    for archive_info in (
+        {"hash": f"sha256={CASHEW_ARCHIVE_SHA256}"},
+        {"hash": f"sha256:{CASHEW_ARCHIVE_SHA256}"},
+        {"hashes": {"sha256": CASHEW_ARCHIVE_SHA256}},
+    ):
+        assert extract({"url": CASHEW_ARCHIVE_URL, "archive_info": archive_info}) == (
+            CASHEW_ARCHIVE_SHA256
+        )
+
+
+def test_pep610_conflicting_archive_hashes_are_rejected() -> None:
+    extract = _VERIFY_SCRIPT["_direct_url_sha256"]
+    with pytest.raises(ValueError, match="conflicting SHA-256"):
+        extract(
+            {
+                "archive_info": {
+                    "hash": f"sha256={CASHEW_ARCHIVE_SHA256}",
+                    "hashes": {"sha256": "0" * 64},
+                }
+            }
+        )
+
+
+def test_pep610_invalid_archive_hash_is_rejected() -> None:
+    extract = _VERIFY_SCRIPT["_direct_url_sha256"]
+    with pytest.raises(ValueError, match="not a SHA-256"):
+        extract({"archive_info": {"hash": "md5=not-allowed"}})
 
 
 def test_sqlite_supports_selected_upstream_legacy_migrations() -> None:

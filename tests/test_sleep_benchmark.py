@@ -50,19 +50,17 @@ def test_benchmark_is_deterministic_and_records_phase_and_contention_evidence() 
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="#193 upstream replacement must flush pending edges at the cap",
-)
 def test_benchmark_catches_edge_cap_commit_gap() -> None:
     report = run_benchmark(
         node_count=4,
         orphan_count=0,
         delay_s=0,
         max_edges=1,
-        pair_similarity=0.8,
+        # gte-large's calibrated cross-link threshold is 0.90; 0.92 creates
+        # real candidates without crossing its 0.94 dedup threshold.
+        pair_similarity=0.92,
     )
 
     assert report["summary"]["cross_link_capped"] is True
+    assert report["cross_link_rows"] == 2
     assert report["bounded_integrity"] is True

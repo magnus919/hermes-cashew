@@ -21,7 +21,6 @@ from collections.abc import Callable, Iterator
 from typing import Any
 
 import numpy as np
-
 from core import sleep as upstream_sleep
 
 from . import sleep_adapter

@@ -61,14 +61,15 @@ plugins update cashew`, `hermes update`, or a Hermes environment rebuild. This
 is an approved interim delivery constraint, not an automatic-healing claim.
 
 The historical #188 source includes the schema fast path but does not resolve
-every upstream gap. In particular, its capped cross-link loop could stop before
-flushing its pending batch. The reviewed #136 candidate at `ac090ce` includes
-the bounded flush fix and its regression coverage; this draft exercises that
-candidate, but it remains unmerged upstream and has not replaced the wrapper's
-local consolidation engine. The candidate still has no supported
-device-injection contract, and several wrapper calls still target private
-upstream functions. None of those adapter safeguards may be retired until the
-candidate is merged and the downstream replacement gates pass.
+every upstream gap. Its capped cross-link loop could stop before flushing its
+pending batch, which is the historical baseline defect tracked by #193. The
+reviewed #136 candidate at `ac090ce` includes the bounded flush fix and its
+regression coverage; the integrated draft exercises that exact candidate at the
+real adapter boundary, including a capped run that commits both directed rows.
+The candidate remains unmerged upstream and still has no supported
+device-injection contract; several wrapper calls also target private upstream
+functions. None of those adapter safeguards may be retired until the candidate
+is merged and the downstream replacement gates pass.
 
 The selected source requires SQLite 3.35 or newer for legacy v1 migrations
 because upstream uses `ALTER TABLE ... DROP COLUMN`. The published PyPI

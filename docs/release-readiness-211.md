@@ -44,7 +44,7 @@ algorithm was not carried forward.
   import and runs as a dedicated CI job; it does not replace the real scheduler
   module.
 - The full locked test suite passes after the final benchmark update:
-  `539 passed, 3 skipped, 2 warnings` in 69.89 seconds. The skips require the
+  `547 passed, 3 skipped, 2 warnings` in 69.58 seconds. The skips require the
   optional Hermes `cron.jobs` host module; the warnings are the existing Sentry
   SDK deprecation warning.
 - `ruff`, `mypy`, `vulture`, duplicate detection, dead-flag detection,

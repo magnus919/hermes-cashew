@@ -58,6 +58,37 @@ def _make_shim(hermes_root: Path, shim: Path) -> None:
     )
 
 
+def _validate_host_results(collected: int, output: str, minimum: int = 14) -> None:
+    """Require every collected host test to pass without pytest outcome drift."""
+    if collected < minimum:
+        raise ValueError(f"host contract collected too few tests: {collected}")
+    passed_match = re.search(r"(?<!\w)(\d+) passed\b", output)
+    if passed_match is None:
+        raise ValueError("host contract has no passing-test summary")
+    passed = int(passed_match.group(1))
+    if passed != collected:
+        raise ValueError(
+            f"host contract pass/collection mismatch: {passed} passed, "
+            f"{collected} collected"
+        )
+    outcome_patterns = {
+        "failed": r"(?<!\w)(\d+) failed\b",
+        "error": r"(?<!\w)(\d+) errors?\b",
+        "skipped": r"(?<!\w)(\d+) skipped\b",
+        "xfailed": r"(?<!\w)(\d+) xfailed\b",
+        "xpassed": r"(?<!\w)(\d+) xpassed\b",
+        "deselected": r"(?<!\w)(\d+) deselected\b",
+    }
+    outcomes = {
+        name: int(match.group(1))
+        for name, pattern in outcome_patterns.items()
+        if (match := re.search(pattern, output))
+    }
+    if outcomes:
+        details = ", ".join(f"{name}={count}" for name, count in outcomes.items())
+        raise ValueError(f"host contract has non-pass outcomes: {details}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hermes-root", type=Path, required=True)
@@ -123,12 +154,7 @@ def main() -> int:
         if collected.returncode != 0 or not collection_match:
             print("host contract collection failed", file=sys.stderr)
             return collected.returncode or 1
-        if int(collection_match.group(1)) < 14:
-            print(
-                f"host contract collected too few tests: {collection_match.group(1)}",
-                file=sys.stderr,
-            )
-            return 1
+        collected_count = int(collection_match.group(1))
 
         completed = subprocess.run(
             pytest_args,
@@ -140,12 +166,13 @@ def main() -> int:
         )
         output = completed.stdout + completed.stderr
         print(output, end="")
-        summary = re.search(r"(\d+) passed(?:, (\d+) skipped)?", output)
-        if completed.returncode != 0 or not summary:
+        if completed.returncode != 0:
             print("host contract execution failed", file=sys.stderr)
             return completed.returncode or 1
-        if int(summary.group(2) or 0) != 0:
-            print("host contract unexpectedly skipped tests", file=sys.stderr)
+        try:
+            _validate_host_results(collected_count, output)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
             return 1
         return 0
 

@@ -41,6 +41,10 @@ ENV/
 htmlcov/
 .tox/
 
+# Local agent tooling (settings and node_modules must not enter sdists)
+.opencode/
+.claude/
+
 # Editor / OS
 .vscode/
 .idea/

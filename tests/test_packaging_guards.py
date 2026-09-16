@@ -131,9 +131,14 @@ def test_distribution_guard_rejects_runtime_and_link_contamination(
 def test_clean_flat_smoke_executes_generated_cron_runtime(tmp_path: Path) -> None:
     """The smoke runs the generated subprocess, not merely its registration."""
     flat_root = tmp_path / "profile" / "plugins" / "cashew"
+    # Copy symlinks as links: a persistent self-hosted workspace can carry
+    # stray development symlinks (the dedicated recursive-symlink CI guard
+    # reports those without deleting them), and dereferencing them here makes
+    # the smoke fail on workspace state the test does not own.
     shutil.copytree(
         ROOT,
         flat_root,
+        symlinks=True,
         ignore=shutil.ignore_patterns(
             ".git", ".venv", "__pycache__", "dist", "build", "graphify-out"
         ),

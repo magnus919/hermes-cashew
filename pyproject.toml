@@ -11,9 +11,8 @@ license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [{ name = "Magnus Hedemark", email = "magnus919@pm.me" }]
 dependencies = [
-    "cashew-brain @ https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz#sha256=38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab",
+    "cashew-brain @ https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz#sha256=23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3",
     "numpy",
-    "scikit-learn",
     "sentence-transformers",
     "sqlite-vec",
 ]
@@ -61,6 +60,10 @@ allow-direct-references = true
 # Doing so would shadow Hermes's bundled memory providers when both are on sys.path.
 packages = ["plugins"]
 
+[tool.hatch.build.targets.sdist]
+# The upstream source fixture is immutable test evidence, not a release input.
+exclude = ["/tests/fixtures/cashew-pr137"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
@@ -71,6 +74,9 @@ markers = [
 
 [tool.ruff]
 target-version = "py310"
+# This file is a byte-identical upstream source fixture; formatting it changes
+# the immutable provenance used by the subprocess compatibility proof.
+exclude = ["tests/fixtures/cashew-pr137/core/integrity.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "N", "W", "I", "TD", "C90"]
@@ -111,7 +117,7 @@ module = "plugins.memory.cashew"
 disable_error_code = ["type-arg", "index"]
 
 [[tool.mypy.overrides]]
-module = "plugins.memory.cashew.sleep_refactor"
+module = "plugins.memory.cashew.sleep_adapter"
 disable_error_code = ["type-arg"]
 
 [tool.deptry]

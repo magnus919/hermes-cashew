@@ -6,7 +6,7 @@ Persistent thought-graph memory for Hermes Agent, backed by [cashew-brain](https
 
 ```bash
 hermes plugins install cashew
-CASHEW_PIN='cashew-brain @ https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz#sha256=38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab'
+CASHEW_PIN='cashew-brain @ https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz#sha256=23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3'
 uv pip install --python ~/.hermes/hermes-agent/venv/bin/python3 \
   --reinstall "$CASHEW_PIN" sqlite-vec
 ~/.hermes/hermes-agent/venv/bin/python3 \
@@ -117,12 +117,13 @@ This enables:
 
 Without LLM, Cashew falls back to heuristic extraction.
 
-The local sleep implementation and adapter migration guards remain the shipped
-compatibility boundary. Upstream sleep replacement (#193), cron lifecycle
-reconciliation (#203), bounded consolidation and shorter embedding write
-transactions (#205), integrity repair (#206), and loader cleanup (#208) are
-pending tracked work; draft PRs #231 and #232 are not included in the current
-`main` installation.
+Consolidation delegates to the pinned upstream `core.sleep` pipeline through
+`sleep_adapter.py`; `sleep_refactor.py` survives only as a transition shim for
+the historical import path. The adapter's migration guards remain the shipped
+compatibility boundary. Read-only integrity inspection with explicit repair
+delegation ([PR #241](https://github.com/magnus919/hermes-cashew/pull/241)) is
+included in current `main`; integrity coverage (#206) and loader cleanup (#208)
+remain open tracked work.
 
 ## Logs
 

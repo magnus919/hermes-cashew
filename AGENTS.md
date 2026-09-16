@@ -106,11 +106,15 @@ done
 
 - **No `~/.hermes` writes.** All paths scope under `hermes_home`. Tests use `tmp_path` fixture.
 - **`sync_turn` must return <10 ms.** Bounded queue + daemon worker; shutdown gives already-accepted turns a bounded opportunity to drain.
-- **Cashew dependency**: source archive at upstream commit
-  `dd57ef029cf9a6dce0b8145d335a55202dd1bac4`, pinned by its full commit and
+- **Cashew dependency**: source archive at composite fork commit
+  `fcb4919ac37144bfbeb822eaafc668a4bdceb791` (tree
+  `29d97fb93c7998c97be0da8f19b90c6523f9d1e9`, combining PR 136
+  `ac090ce75ffd2e97dac257cee9430628c68aa241` and PR 137
+  `cb940f34c15460b87831748b2e702334c1c5fbd0`), pinned by its full commit and
   SHA-256 in `pyproject.toml`, both manifests, and `uv.lock`. The upstream
   package still reports version `1.2.1`, so version metadata alone does not
-  identify the selected code.
+  identify the selected code. Replace the fork with the canonical upstream
+  release once both parent changes are merged upstream.
 - **SQLite baseline**: SQLite `>=3.35` is required because the upstream legacy
   v1 migration uses `ALTER TABLE ... DROP COLUMN`. The PyPI `1.2.1` artifact
   has the same requirement even though its package metadata does not declare
@@ -124,26 +128,25 @@ done
 - **`CASHEW_*` env vars stripped** in `conftest.py` to prevent Hermes session leak into tests.
 - **Silent degrade** on all Cashew failures — log WARNING, return empty, never raise into Hermes.
 
-### Pending replacement work
+### Reconciliation status
 
-These are current adapter responsibilities until the tracked replacement is
-merged and verified:
+Tracked replacement work has landed incrementally. Verify on `main` before
+relying on any claim below:
 
-- [#193](https://github.com/magnus919/hermes-cashew/issues/193): upstream
-  sleep-engine replacement; the local `sleep_refactor.py` remains active.
-- [#203](https://github.com/magnus919/hermes-cashew/issues/203): safe cron
-  reconciliation; draft [PR #232](https://github.com/magnus919/hermes-cashew/pull/232)
-  is not part of `main`.
-- [#205](https://github.com/magnus919/hermes-cashew/issues/205): bounded
-  consolidation and shorter embedding write transactions.
-- [#206](https://github.com/magnus919/hermes-cashew/issues/206): integrity
-  audit and targeted repair; draft [PR #231](https://github.com/magnus919/hermes-cashew/pull/231)
-  currently supplies audit-only behavior.
-- [#208](https://github.com/magnus919/hermes-cashew/issues/208): structural
-  cleanup and loader consolidation.
+- Upstream sleep delegation, safe cron reconciliation, and consolidation
+  bounding (#193, #203, #205) are merged to `main`. The local consolidation
+  engine is gone: `sleep_refactor.py` survives only as a transition shim, and
+  [sleep_adapter.py](plugins/memory/cashew/sleep_adapter.py) is the Hermes
+  boundary for the pinned upstream `core.sleep.run_sleep_cycle`.
+- Read-only integrity inspection with explicitly confirmed upstream repair
+  delegation is merged ([PR #241](https://github.com/magnus919/hermes-cashew/pull/241));
+  [#206](https://github.com/magnus919/hermes-cashew/issues/206) remains open
+  for the remaining repair-path coverage.
+- [#208](https://github.com/magnus919/hermes-cashew/issues/208) (structural
+  cleanup and loader consolidation) remains open.
 
-Do not describe these replacements as shipped until they are merged to `main`
-and validated at the runtime boundary.
+Do not describe remaining work as shipped until it is merged to `main` and
+validated at the runtime boundary.
 
 ## Developer Commands
 

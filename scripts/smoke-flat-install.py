@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import types
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -37,8 +38,11 @@ def _install_cron_stub() -> list[dict[str, Any]]:
     cron = types.ModuleType("cron")
     cron.__path__ = []  # type: ignore[attr-defined]
     cron_jobs = types.ModuleType("cron.jobs")
-    cron_jobs.list_jobs = lambda: []
+    cron_jobs.list_jobs = lambda *, include_disabled=False: []
     cron_jobs.remove_job = lambda _job_id: None
+    cron_jobs.parse_schedule = lambda schedule: schedule
+    cron_jobs.update_job = lambda _job_id, _updates: None
+    cron_jobs.use_cron_store = lambda _home: nullcontext()
 
     def create_job(**kwargs: Any) -> dict[str, str]:
         jobs.append(kwargs)
@@ -64,7 +68,7 @@ def _install_bounded_runtime_fakes(implementation: Path, marker: Path) -> None:
         "    def close(self):\n"
         "        Path(os.environ['CASHEW_CRON_SMOKE_MARKER']).write_text('closed')\n"
     )
-    (implementation / "sleep_refactor.py").write_text(
+    (implementation / "sleep_adapter.py").write_text(
         "from pathlib import Path\n"
         "import json\n"
         "import os\n"

@@ -10,6 +10,43 @@ explicit Hermes `auxiliary.memory` mapping for LLM-powered extraction, adds
 forest-level insight extraction via `on_pre_compress`, and runs graph
 consolidation on a persistent Hermes cron schedule.
 
+## Integrity audit
+
+Existing profiles can be inspected without opening a writable database:
+
+```bash
+python -m plugins.memory.cashew.integrity /path/to/brain.db
+```
+
+The audit uses a canonical shared maintenance lease and SQLite URI read-only
+mode. It reports schema and privacy-safe provider fingerprints, ordinary
+embedding validity, vector-index parity when the installed extension can be
+verified, orphan rows, referential graph defects, and permanence contradictions.
+Large scans use fixed row, byte, and deadline budgets; a cutoff is reported as
+`audit_incomplete` rather than presented as a complete audit. It never runs schema
+migrations, decay, consolidation, embedding services, or repair as a side
+effect. Reports include only bounded counts and reason codes; historical merge
+intent remains an explicit manual-review item because it cannot be reconstructed
+from the stored graph safely.
+
+The explicit operator apply surface is connection-owned and remains fail-closed
+for path-only CLI calls:
+
+```bash
+python -m plugins.memory.cashew.integrity --apply --confirm /path/to/brain.db
+```
+
+It returns a structured `caller_connection_required` result and does not open
+or create the profile. The selected immutable Cashew composite provides the
+connection-aware API: callers may use `inspect_integrity(conn, ...)` and, only
+after an explicit `confirm=True`,
+`apply_integrity_repairs(conn=conn, ...)`. The caller must provide an open
+connection inside its outer transaction and owns backup, locking, commit,
+post-repair inspection, rollback, and close. The adapter never opens a path,
+touches `HOME`, changes journal mode, or repairs automatically. Older Cashew
+installations without the API remain fail-closed. Do not use broad sleep or
+whole-database re-embedding as an integrity repair substitute.
+
 ## Prerequisites
 
 - [Hermes Agent](https://github.com/nousresearch/hermes-agent) installed
@@ -29,7 +66,7 @@ current Hermes dependency installer intentionally rejects. Install the exact
 source archive into the Hermes environment before setup:
 
 ```bash
-CASHEW_PIN='cashew-brain @ https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz#sha256=38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab'
+CASHEW_PIN='cashew-brain @ https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz#sha256=23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3'
 uv pip install \
   --python ~/.hermes/hermes-agent/venv/bin/python3 \
   --reinstall "$CASHEW_PIN" sqlite-vec
@@ -37,7 +74,18 @@ uv pip install \
   ~/.hermes/plugins/cashew/scripts/verify-cashew-baseline.py
 ```
 
-The verification step is required because the selected source and the older
+This archive is an immutable composite fork of upstream Cashew. It combines PR
+136 (`ac090ce75ffd2e97dac257cee9430628c68aa241`) and PR 137
+(`cb940f34c15460b87831748b2e702334c1c5fbd0`) at tree
+`29d97fb93c7998c97be0da8f19b90c6523f9d1e9`. The composite lets the plugin use
+both reviewed fixes immediately while the upstream pull requests remain open.
+If canonical upstream later contains both changes, a separate tested
+dependency update can replace this archive.
+
+The lockfile enforces the archive digest during installation; uv may omit that
+digest from the installed PEP 610 metadata, so verification requires the exact
+source URL and validates a recorded digest when one is present. The verification
+step is required because the selected source and the older
 PyPI release both report version `1.2.1`. A version-only check cannot tell them
 apart. It also checks the linked SQLite version and source ID. Both the selected
 source and the existing PyPI `1.2.1` code require SQLite 3.35 or newer to
@@ -349,32 +397,25 @@ when **all** of the following are true:
 | Provider init succeeds | — | — | Exception caught, ``_config`` set to ``None``, cron never reached |
 | Hermes cron module available | — | — | ``ImportError`` caught, WARNING logged |
 | ``create_job()`` succeeds | — | — | Exception caught, WARNING logged |
-| No job already registered for this provider instance | — | — | No-op dedup guard |
+| Matching profile-owned job already registered | — | — | Existing job is adopted without changing its schedule |
 
-The cron job is persistent: provider ``shutdown()`` clears only this instance's
-tracking and leaves the profile-owned job scheduled across restarts. Before
-uninstalling, list the active profile's jobs and remove the exact
-``cashew-sleep-cycle`` entry, then remove the plugin:
-
-```bash
-hermes cron list
-hermes cron remove <cashew-sleep-cycle-job-id>
-hermes plugins remove cashew
-```
-
-A dedup helper scans for existing ``cashew-sleep-cycle`` jobs by name on each
-registration to prevent N jobs accumulating across N restarts. The lifecycle
-reconciliation improvements in draft [PR #232](https://github.com/magnus919/hermes-cashew/pull/232)
-remain pending and are not part of current `main`.
+The job persists across ordinary provider shutdown and is adopted by a later
+initialize for the same Hermes profile. Reconciliation serializes concurrent
+initializers, tags ownership with an opaque profile token, and only replaces or
+disables a job carrying that token. It never deletes a similarly named job that
+does not prove it belongs to this profile.
 
 ### When the cron job runs
 
 On the configured schedule (default ``every 12h``), the Hermes scheduler
 executes ``$HERMES_HOME/scripts/cashew-sleep-cycle.py`` as a ``no_agent``
-script. It reads ``cashew.json`` at runtime to discover its database path and
-``sleep_max_nodes`` setting. The cycle uses LLM dream synthesis only when the
-profile has an explicit configured auxiliary role; otherwise it runs with no
-LLM overhead.
+script. Registration embeds the complete validated effective configuration,
+including JSON/default values and any valid ``CASHEW_*`` overrides, so a cron
+daemon cannot drift from its provider's DB, model, device, limits, or auxiliary
+role. Changes to JSON or environment settings take effect on the next provider
+initialize, which atomically refreshes the script and reconciles the job. The
+cycle uses LLM dream synthesis only when that embedded configuration has an
+explicit configured auxiliary role; otherwise it runs with no LLM overhead.
 
 The generated script is pinned to the Cashew installation that registered the
 job. This keeps one Hermes profile from loading another profile's provider.
@@ -385,11 +426,13 @@ to an external checkout.
 
 ### What happens during a cron tick
 
-1. Reads ``cashew.json`` to get ``cashew_db_path`` and ``sleep_max_nodes``
-2. Selects up to ``sleep_max_nodes`` (default 2,000) oldest-unprocessed nodes
+1. Uses the validated effective configuration embedded when the job was
+   registered; it does not reread ``cashew.json`` or ambient ``CASHEW_*``
+   values during a tick
+2. Selects up to ``sleep_max_nodes`` (default 2,000) eligible nodes
 3. Computes pairwise cosine similarity (vectorized numpy)
-4. Creates cross-links between similar node pairs (threshold: 0.78)
-5. Deduplicates near-identical nodes (threshold: 0.82) via BFS clustering
+4. Creates and repairs cross-links using the configured model-profile thresholds
+5. Deduplicates near-identical nodes through maximal-clique consolidation
 6. Runs garbage collection on low-fitness isolated nodes
 7. Promotes frequently-accessed nodes to permanent / core memory status
 8. Prints a JSON summary (captured by the cron scheduler's output log)
@@ -410,9 +453,7 @@ original process still holds the lock.
 
 When an API caller enables ``background_dream=True``, the returned cycle
 summary records ``dream_pending`` and the daemon uses its own connection; it is
-not guarded by the synchronous maintenance lock. The cron integration uses
-``background_dream=False`` so its LLM and orphan-embedding work finish before
-the script exits. This advisory lock is not a complete
+not guarded by the synchronous maintenance lock. This advisory lock is not a complete
 shared-brain writer-coordination policy; broader coordination is tracked in
 [#191](https://github.com/magnus919/hermes-cashew/issues/191).
 
@@ -421,7 +462,7 @@ shared-brain writer-coordination policy; broader coordination is tracked in
 | Key | Default | Description |
 |-----|---------|-------------|
 | ``sleep_schedule`` | ``\"every 12h\"`` | Cron expression or interval string. Set to ``\"\"`` to disable cron-based scheduling entirely. Examples: ``\"every 30m\"``, ``\"0 */2 * * *\"``, ``\"0 3 * * *\"`` (daily at 3am). |
-| ``sleep_max_nodes`` | ``2000`` | Maximum number of nodes to cross-link in a single sleep cycle. Higher values converge faster but take longer per tick. |
+| ``sleep_max_nodes`` | ``2000`` | Maximum number of eligible nodes considered in one sleep cycle. Higher values can increase consolidation work and tick time. |
 
 ## Semantic Search
 
@@ -433,6 +474,12 @@ but less precise.
 sqlite-vec is a standard dependency and will always be loaded at startup.
 
 ## Uninstall
+
+Normal provider shutdown intentionally preserves the profile-owned cron job.
+Before removing the plugin, disable sleep in Cashew setup (set
+``sleep_cycles`` to ``false`` or ``sleep_schedule`` to ``""``) and initialize
+the provider once. Reconciliation then removes only the job whose ownership
+matches that Hermes profile. Afterwards use the host-supported removal flow:
 
 ```bash
 hermes plugins remove cashew
@@ -448,7 +495,7 @@ rm -rf ~/.hermes/cashew   # optional: remove the local graph data
    source baseline from [Install](#install). If `uv` is unavailable, bootstrap
    pip in the Hermes environment and pass the same quoted `CASHEW_PIN` value:
    ```bash
-   CASHEW_PIN='cashew-brain @ https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz#sha256=38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab'
+   CASHEW_PIN='cashew-brain @ https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz#sha256=23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3'
    ~/.hermes/hermes-agent/venv/bin/python3 -m ensurepip
    ~/.hermes/hermes-agent/venv/bin/python3 -m pip install \
      --force-reinstall "$CASHEW_PIN" sqlite-vec
@@ -503,15 +550,9 @@ initialization. A mismatch is repaired before background workers start:
 3. the provider validates the new dimensions before enabling retrieval.
 
 If backup, migration, or validation fails, the provider logs a warning and
-attempts to restore the backup. Preserve the backup and inspect the warning
-before retrying. Stop other Hermes or Cashew processes before deliberately
-changing `embedding_model`, then restart Hermes and allow the one-time
-migration to finish before issuing queries. Bounded consolidation and shorter
-embedding write transactions tracked by
-[#205](https://github.com/magnus919/hermes-cashew/issues/205), plus integrity
-repair tracked by [#206](https://github.com/magnus919/hermes-cashew/issues/206),
-are pending;
-the current adapter migration and audit safeguards remain in force.
+restores the backup. Thought nodes are not discarded. Stop other Hermes or
+Cashew processes before deliberately changing `embedding_model`, then restart
+Hermes and allow the one-time migration to finish before issuing queries.
 
 ## Development
 

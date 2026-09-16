@@ -909,6 +909,32 @@ def load_config(hermes_home: str | os.PathLike[str]) -> CashewConfig:
     return CashewConfig(**_validate_config_values(known_values, home))
 
 
+def effective_config_snapshot(config: CashewConfig) -> dict[str, Any]:
+    """Return a JSON-safe copy of an already validated effective config.
+
+    Cron jobs run in a separate process whose environment is not necessarily
+    the one that initialized the provider.  Registration persists this complete
+    snapshot in the generated script so the job cannot silently fall back to
+    raw JSON defaults or a different set of ``CASHEW_*`` overrides.
+    """
+    return dataclasses.asdict(config)
+
+
+def load_effective_config_snapshot(
+    hermes_home: str | os.PathLike[str], snapshot: Any
+) -> CashewConfig:
+    """Validate a complete effective-config snapshot embedded by registration.
+
+    The snapshot is deliberately strict: accepting a partial or expanded
+    mapping would make an old or hand-edited generated cron script silently
+    acquire defaults that its registering provider did not use.
+    """
+    if not isinstance(snapshot, dict) or set(snapshot) != set(DEFAULTS):
+        raise ValueError("Cashew cron configuration snapshot is malformed")
+    values = {key: snapshot[key] for key in DEFAULTS}
+    return CashewConfig(**_validate_config_values(values, pathlib.Path(hermes_home)))
+
+
 def generate_default_config(hermes_home: str | os.PathLike[str]) -> pathlib.Path:
     """Write a default cashew.json if none exists.
 

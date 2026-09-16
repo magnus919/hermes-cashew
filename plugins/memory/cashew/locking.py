@@ -28,6 +28,43 @@ class SQLiteWALUnsupportedError(RuntimeError):
     """An affected SQLite runtime cannot safely write an existing WAL DB."""
 
 
+_READONLY_SCAN_ROW_CAP = 100_000
+_READONLY_SCAN_BATCH = 256
+_VEC_DDL_RE = re.compile(
+    r"^\s*CREATE\s+VIRTUAL\s+TABLE\s+"
+    r"(?:(?:IF\s+NOT\s+EXISTS)\s+)?"
+    r"(?:vec_embeddings|\"vec_embeddings\"|`vec_embeddings`|\[vec_embeddings\])\s+"
+    r"USING\s+vec0(?:\s|\()",
+    re.IGNORECASE,
+)
+
+
+def is_supported_vec_ddl(sql: object) -> bool:
+    """Accept only the known sqlite-vec virtual-table declaration."""
+    return isinstance(sql, str) and _VEC_DDL_RE.match(sql) is not None
+
+
+def _bounded_rows(
+    cursor: object, budget: object | None = None
+) -> list[tuple[object, ...]]:
+    """Materialize only a fixed-size validation result, never an unbounded scan."""
+    rows: list[tuple[object, ...]] = []
+    while True:
+        batch = cursor.fetchmany(_READONLY_SCAN_BATCH)  # type: ignore[attr-defined]
+        if not batch:
+            return rows
+        for row in batch:
+            if budget is not None:
+                consume = getattr(budget, "consume", None)
+                if callable(consume) and not consume():
+                    return rows
+            rows.append(tuple(row))
+        if budget is None and len(rows) > _READONLY_SCAN_ROW_CAP:
+            raise SQLiteWALUnsupportedError(
+                "read-only profile exceeds validation bound"
+            )
+
+
 def lock_path_for_db(db_path: str | pathlib.Path) -> pathlib.Path:
     """Return the canonical, stable advisory-lock path for a configured DB."""
     canonical_db = pathlib.Path(db_path).resolve(strict=False)
@@ -104,7 +141,9 @@ def open_readonly_verified(
     return conn, mode
 
 
-def verify_readonly_profile(conn: object) -> dict[str, str]:  # noqa: C901
+def verify_readonly_profile(  # noqa: C901
+    conn: object, *, budget: object | None = None
+) -> dict[str, str]:
     """Validate an affected WAL profile without executing an application write."""
 
     if not hasattr(conn, "execute"):
@@ -122,9 +161,10 @@ def verify_readonly_profile(conn: object) -> dict[str, str]:  # noqa: C901
         raise SQLiteWALUnsupportedError("read-only integrity check failed")
     tables = {
         str(row[0])
-        for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()
+        for row in _bounded_rows(
+            conn.execute("SELECT name FROM sqlite_master WHERE type='table'"),
+            budget=budget,
+        )
     }
     required = {
         "thought_nodes",
@@ -136,7 +176,9 @@ def verify_readonly_profile(conn: object) -> dict[str, str]:  # noqa: C901
         raise SQLiteWALUnsupportedError("read-only Cashew schema is incomplete")
     columns = {
         str(row[1])
-        for row in conn.execute("PRAGMA table_info(thought_nodes)").fetchall()
+        for row in _bounded_rows(
+            conn.execute("PRAGMA table_info(thought_nodes)"), budget=budget
+        )
     }
     required_keyword_columns = {
         "id",
@@ -158,13 +200,18 @@ def verify_readonly_profile(conn: object) -> dict[str, str]:  # noqa: C901
     if not required_keyword_columns.issubset(columns):
         raise SQLiteWALUnsupportedError("read-only keyword columns are incomplete")
     embedding_columns = {
-        str(row[1]) for row in conn.execute("PRAGMA table_info(embeddings)").fetchall()
+        str(row[1])
+        for row in _bounded_rows(
+            conn.execute("PRAGMA table_info(embeddings)"), budget=budget
+        )
     }
     if not {"node_id", "vector", "model", "updated_at"}.issubset(embedding_columns):
         raise SQLiteWALUnsupportedError("read-only embedding columns are incomplete")
     edge_columns = {
         str(row[1])
-        for row in conn.execute("PRAGMA table_info(derivation_edges)").fetchall()
+        for row in _bounded_rows(
+            conn.execute("PRAGMA table_info(derivation_edges)"), budget=budget
+        )
     }
     if not {
         "parent_id",
@@ -175,19 +222,24 @@ def verify_readonly_profile(conn: object) -> dict[str, str]:  # noqa: C901
     }.issubset(edge_columns):
         raise SQLiteWALUnsupportedError("read-only derivation columns are incomplete")
 
-    meta = dict(
-        conn.execute(
-            "SELECT key, value FROM hermes_provider_meta WHERE key IN "
-            "('embedding_model','embedding_dim','vec_dim','maintenance_epoch')"
-        ).fetchall()
-    )
+    meta: dict[str, object] = {
+        str(row[0]): row[1]
+        for row in _bounded_rows(
+            conn.execute(
+                "SELECT key, value FROM hermes_provider_meta WHERE key IN "
+                "('embedding_model','embedding_dim','vec_dim','maintenance_epoch')"
+            ),
+            budget=budget,
+        )
+        if len(row) >= 2
+    }
     required_meta = {"embedding_model", "embedding_dim", "vec_dim", "maintenance_epoch"}
     if not required_meta.issubset(meta):
         raise SQLiteWALUnsupportedError("read-only provider identity is incomplete")
     try:
-        expected_dim = int(meta["embedding_dim"])
-        expected_vec_dim = int(meta["vec_dim"])
-        int(meta["maintenance_epoch"])
+        expected_dim = int(str(meta["embedding_dim"]))
+        expected_vec_dim = int(str(meta["vec_dim"]))
+        int(str(meta["maintenance_epoch"]))
     except (TypeError, ValueError) as exc:
         raise SQLiteWALUnsupportedError(
             "read-only provider identity is invalid"
@@ -199,15 +251,19 @@ def verify_readonly_profile(conn: object) -> dict[str, str]:  # noqa: C901
         or not meta["embedding_model"]
     ):
         raise SQLiteWALUnsupportedError("read-only provider identity is invalid")
-    rows = conn.execute(
-        "SELECT node_id, model, LENGTH(vector) FROM embeddings"
-    ).fetchall()
+    rows = _bounded_rows(
+        conn.execute(
+            "SELECT node_id, model, LENGTH(vector) FROM embeddings "
+            f"LIMIT {_READONLY_SCAN_ROW_CAP + 1}"
+        ),
+        budget=budget,
+    )
     for node_id, model, byte_length in rows:
         if (
             not node_id
             or not model
             or byte_length is None
-            or int(byte_length) != expected_dim * 4
+            or int(str(byte_length)) != expected_dim * 4
         ):
             raise SQLiteWALUnsupportedError(
                 "read-only embedding identity is inconsistent"
@@ -218,6 +274,11 @@ def verify_readonly_profile(conn: object) -> dict[str, str]:  # noqa: C901
         "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_embeddings'"
     ).fetchone()
     if vec_table is not None:
+        vec_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='vec_embeddings'"
+        ).fetchone()[0]
+        if not is_supported_vec_ddl(vec_sql):
+            raise SQLiteWALUnsupportedError("read-only vec declaration is invalid")
         # Loading sqlite-vec into a query-only connection only registers the
         # virtual-table module; it does not alter the DB, WAL, or SHM files.
         try:
@@ -239,11 +300,10 @@ def verify_readonly_profile(conn: object) -> dict[str, str]:  # noqa: C901
                 pass
         vec_columns = {
             str(row[1])
-            for row in conn.execute("PRAGMA table_info(vec_embeddings)").fetchall()
+            for row in _bounded_rows(
+                conn.execute("PRAGMA table_info(vec_embeddings)"), budget=budget
+            )
         }
-        vec_sql = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE name='vec_embeddings'"
-        ).fetchone()[0]
         declared_dimension_match = re.search(
             r"(?:float|int8)\s*\[\s*(\d+)\s*\]", str(vec_sql), re.IGNORECASE
         )
@@ -257,16 +317,24 @@ def verify_readonly_profile(conn: object) -> dict[str, str]:  # noqa: C901
             try:
                 vec_ids = {
                     str(row[0])
-                    for row in conn.execute(
-                        "SELECT node_id FROM vec_embeddings"
-                    ).fetchall()
+                    for row in _bounded_rows(
+                        conn.execute(
+                            "SELECT node_id FROM vec_embeddings "
+                            f"LIMIT {_READONLY_SCAN_ROW_CAP + 1}"
+                        ),
+                        budget=budget,
+                    )
                 }
                 ordinary_ids = {str(row[0]) for row in rows}
                 vec_lengths = {
                     str(row[0]): row[1]
-                    for row in conn.execute(
-                        "SELECT node_id, LENGTH(embedding) FROM vec_embeddings"
-                    ).fetchall()
+                    for row in _bounded_rows(
+                        conn.execute(
+                            "SELECT node_id, LENGTH(embedding) FROM vec_embeddings "
+                            f"LIMIT {_READONLY_SCAN_ROW_CAP + 1}"
+                        ),
+                        budget=budget,
+                    )
                 }
             except Exception as exc:
                 raise SQLiteWALUnsupportedError(
@@ -275,7 +343,7 @@ def verify_readonly_profile(conn: object) -> dict[str, str]:  # noqa: C901
             if vec_ids != ordinary_ids:
                 raise SQLiteWALUnsupportedError("read-only vec and ordinary IDs differ")
             if any(
-                length is None or int(length) != expected_vec_dim * 4
+                length is None or int(str(length)) != expected_vec_dim * 4
                 for length in vec_lengths.values()
             ):
                 raise SQLiteWALUnsupportedError("read-only vec blob dimensions differ")
@@ -284,10 +352,10 @@ def verify_readonly_profile(conn: object) -> dict[str, str]:  # noqa: C901
     return {
         "sqlite_source_id": source_id,
         "user_version": str(user_version),
-        "provider_model": meta["embedding_model"],
+        "provider_model": str(meta["embedding_model"]),
         "provider_embedding_dim": str(expected_dim),
         "provider_vec_dim": str(expected_vec_dim),
-        "provider_epoch": meta["maintenance_epoch"],
+        "provider_epoch": str(meta["maintenance_epoch"]),
     }
 
 

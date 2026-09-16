@@ -9,6 +9,7 @@ import json
 import pathlib
 import sqlite3
 import types
+from contextlib import nullcontext
 
 import numpy as np
 import pytest
@@ -16,6 +17,7 @@ import pytest
 import plugins.memory.cashew as cashew_module
 from plugins.memory.cashew import CashewMemoryProvider
 from plugins.memory.cashew.config import CashewConfig
+from plugins.memory.cashew.cron_reconcile import cron_prompt, profile_identity
 
 
 @pytest.fixture(autouse=True)
@@ -671,12 +673,16 @@ def test_unresolved_identity_is_keyword_only_and_recovers_after_reinitialize(
             "name": "cashew-sleep-cycle",
             "script": "cashew-sleep-cycle.py",
             "schedule": "every 12h",
+            "prompt": cron_prompt(profile_identity(tmp_path)),
+            "no_agent": True,
+            "repeat": None,
         },
         {"id": "other", "name": "unrelated-job", "script": "other.py"},
     ]
     created: list[dict] = []
 
-    def list_jobs():
+    def list_jobs(*, include_disabled: bool = False):
+        del include_disabled
         return list(jobs)
 
     def remove_job(job_id):
@@ -687,9 +693,7 @@ def test_unresolved_identity_is_keyword_only_and_recovers_after_reinitialize(
         created.append(kwargs)
         job = {
             "id": "recovered-cashew",
-            "name": kwargs["name"],
-            "script": kwargs["script"],
-            "schedule": kwargs["schedule"],
+            **kwargs,
         }
         jobs.append(job)
         return job
@@ -700,6 +704,9 @@ def test_unresolved_identity_is_keyword_only_and_recovers_after_reinitialize(
     cron_jobs.list_jobs = list_jobs
     cron_jobs.remove_job = remove_job
     cron_jobs.create_job = create_job
+    cron_jobs.parse_schedule = lambda schedule: schedule
+    cron_jobs.update_job = lambda _job_id, _updates: None
+    cron_jobs.use_cron_store = lambda _home: nullcontext()
     monkeypatch.setitem(sys.modules, "cron", cron_package)
     monkeypatch.setitem(sys.modules, "cron.jobs", cron_jobs)
     monkeypatch.setattr(cashew_module, "_HAS_HERMES_CRON", True)

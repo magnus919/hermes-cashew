@@ -12,11 +12,11 @@ except ModuleNotFoundError:  # Python 3.10 CI floor
 import yaml
 
 CASHEW_ARCHIVE_URL = (
-    "https://github.com/rajkripal/cashew/archive/"
-    "dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz"
+    "https://github.com/magnus919/true/archive/"
+    "fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz"
 )
 CASHEW_ARCHIVE_SHA256 = (
-    "38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab"
+    "23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3"
 )
 CASHEW_REQUIREMENT = (
     f"cashew-brain @ {CASHEW_ARCHIVE_URL}#sha256={CASHEW_ARCHIVE_SHA256}"
@@ -70,7 +70,7 @@ def test_source_install_docs_require_reinstall_and_provenance_check() -> None:
     assert "scripts/verify-cashew-baseline.py" in integration_readme
 
 
-def test_sleep_cycle_dependencies_are_direct_project_requirements() -> None:
+def test_embedding_runtime_dependencies_are_direct_project_requirements() -> None:
     root = Path(__file__).parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text())
     dependency_names = {
@@ -78,4 +78,5 @@ def test_sleep_cycle_dependencies_are_direct_project_requirements() -> None:
         for dependency in project["project"]["dependencies"]
     }
 
-    assert {"numpy", "scikit-learn", "sentence-transformers"} <= dependency_names
+    assert {"numpy", "sentence-transformers"} <= dependency_names
+    assert "scikit-learn" not in dependency_names

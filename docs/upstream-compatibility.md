@@ -25,18 +25,21 @@ Issue #188 tested this candidate baseline:
 | Component | Exact reference | Availability and provenance |
 | --- | --- | --- |
 | hermes-cashew | `cc1e31c66b1f0cf72079d91497e21c7347c47c99` plus the issue #188 dependency, test, workflow, and documentation change | This was `origin/main` when the final candidate was refreshed and tested. It includes the merged #199 real-Hermes integration lane. |
-| cashew-brain | `dd57ef029cf9a6dce0b8145d335a55202dd1bac4` | Immutable [upstream source archive](https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz), locked with archive SHA-256 `38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab`. The installed `core/session.py` SHA-256 is `0ce60cc63adf4fb7136581aee722bb10e9a344e556b6fb98f4d46855d53c36cd`. |
+| cashew-brain | `fcb4919ac37144bfbeb822eaafc668a4bdceb791` | Immutable [composite fork archive](https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz), locked with archive SHA-256 `23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3`. Tree `29d97fb93c7998c97be0da8f19b90c6523f9d1e9` combines PR 136 (`ac090ce75ffd2e97dac257cee9430628c68aa241`) and PR 137 (`cb940f34c15460b87831748b2e702334c1c5fbd0`). The installed `core/session.py` SHA-256 is `0ce60cc63adf4fb7136581aee722bb10e9a344e556b6fb98f4d46855d53c36cd`. |
 | Hermes Agent loader/lifecycle evidence | `990473a79c6b0396b0a648fdd85ee8f7a5c267d3` | The #199 lane merged in wrapper commit `cc1e31c66b1f0cf72079d91497e21c7347c47c99`. Its flat and development loader, auxiliary routing, lifecycle, and cron contracts also passed in a fresh environment containing the exact #188 source pin. The embedding model and external client were deterministic fakes; Hermes, SQLite 3.47.1, and the Cashew package boundary were real. This is bounded compatibility evidence, not a published Hermes minimum-version promise or native embedding-crash proof. |
 
-The selected commit was the upstream `main` tip at the audit date and is 22
-commits ahead of `v1.2.1` (`894637ba76b059347af3fe2142201521d9484fb4`).
-The [upstream comparison](https://github.com/rajkripal/cashew/compare/v1.2.1...dd57ef029cf9a6dce0b8145d335a55202dd1bac4)
-contains the schema-contention fix. Production installs use the exact source
-archive and digest below rather than floating on Cashew `main`:
+The selected source is a composite fork at `fcb4919ac37144bfbeb822eaafc668a4bdceb791`,
+tree `29d97fb93c7998c97be0da8f19b90c6523f9d1e9`, combining PR 136
+(`ac090ce75ffd2e97dac257cee9430628c68aa241`) and PR 137
+(`cb940f34c15460b87831748b2e702334c1c5fbd0`). Production installs use the
+exact source archive and digest below rather than floating on Cashew `main`.
+The composite is the tested production baseline while those upstream pull
+requests remain open. A later dependency PR may replace it with a canonical
+upstream commit after independently verifying the same contracts:
 
 ```text
-https://github.com/rajkripal/cashew/archive/dd57ef029cf9a6dce0b8145d335a55202dd1bac4.tar.gz
-sha256=38d2cb085fc8970a285991fca5df6b44309324b80947bb816f738a9acaaf72ab
+https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz
+sha256=23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3
 ```
 
 The source archive builds normally, but its metadata still says `1.2.1`, the
@@ -93,7 +96,7 @@ replacement is the intended destination, not that this issue implements it.
 
 | Surface and evidence in `b14d7b0` | Original symptom / current responsibility | Upstream replacement and status | Decision, retirement prerequisite, and required regression |
 | --- | --- | --- | --- |
-| [`_patch_upstream_embedding`](https://github.com/magnus919/hermes-cashew/blob/b14d7b013ac0e95314f78cca6cacfef202a30654/plugins/memory/cashew/__init__.py#L276-L340) | The released Cashew 1.2.1 artifact exposes model-name and dimension globals but no supported provider device injection. The adapter must select the configured model, force safe CPU fallback, and prevent one Hermes profile/session from inheriting another's backend state. The historical device/host-crash cause is not recovered; the protection is observable in the patch and its tests. | The selected source still constructs `SentenceTransformer` without a device parameter; commit `394d6cffe308ba106df8db750248f1ff272bb814` only guards daemon dimension mismatch. No replacement contract exists. | **Retain.** Replace only after a released upstream model/device contract proves CPU fallback, model dimension, daemon mismatch, and two-profile isolation in tests. Preserve rollback to the patched path. |
+| [`embedding_compat.py`](../plugins/memory/cashew/embedding_compat.py) and provider binding | The released Cashew 1.2.1 artifact exposes model-name and dimension globals but no supported provider device injection. The adapter must select the configured model, force safe CPU fallback, and prevent one Hermes profile/session from inheriting another's backend state. The historical device/host-crash cause is not recovered; the protection is observable in the compatibility module and its tests. | The selected source still constructs `SentenceTransformer` without a device parameter; commit `394d6cffe308ba106df8db750248f1ff272bb814` only guards daemon dimension mismatch. No replacement contract exists. | **Retain.** The compatibility facade is now isolated by integration responsibility, while the three upstream shim assignments stay in the provider binding path. Replace only after a released upstream model/device contract proves CPU fallback, model dimension, daemon mismatch, and two-profile isolation in tests. Preserve rollback to the patched path. |
 | Embedding-dimension and `vec_embeddings` migration/create in [`__init__.py`](https://github.com/magnus919/hermes-cashew/blob/b14d7b013ac0e95314f78cca6cacfef202a30654/plugins/memory/cashew/__init__.py#L821-L1080) | Older brains can contain the rowid-shaped vec schema or vectors from a previous model dimension. The adapter detects/rebuilds the incompatible virtual table, derives the configured dimension, and falls back when sqlite-vec is unavailable. The original host-crash history is unknown; the old schema failure is documented in the code and commit `43eea9e`. | The selected source creates the current `node_id` vec table and contains dimension/daemon guards (`233b75684025656cde46bf4a2af9bca416ef5145`, `394d6cffe308ba106df8db750248f1ff272bb814`). It does not prove migration of every legacy adapter-created table. | **Retain, then replace migration ownership.** #188 must test old/new schema, mixed dimensions, persistence, and rollback before local migration is removed. The provider's profile path guard and neutral fallback remain Hermes responsibilities. |
 | Local consolidation engine [`sleep_refactor.py`](https://github.com/magnus919/hermes-cashew/blob/b14d7b013ac0e95314f78cca6cacfef202a30654/plugins/memory/cashew/sleep_refactor.py) (candidate discovery, cross-links, connected-component dedup, rewiring, GC, permanence, orphan embedding) | The adapter needed a scheduled, bounded sleep path with edge caps, source filtering, advisory locking, and profile-scoped persistence. The history records the implementation and fixes but does not establish a single original upstream failure for every phase. | The selected source has a substantially hardened and shorter `core/sleep.py` from `c7ddfc670703afd439bc63ab1379afc906230ce3`, followed by permanence, timestamp, embedding, and vector fixes (`550ae97`, `3fe1436`, `15a28a9`, and related commits). It still has a capped pending-batch defect and has not replaced the wrapper contract. | **Retain pending replacement.** #192 defines consolidation safety; #193 may replace the engine only after #188/#189 and #192 regression tests pass for lock ownership, caps, permanence, mixed dimensions, orphan embedding, and rollback. Do not remove the local engine in #187. |
 | Keyword fallback [`_keyword_search`](https://github.com/magnus919/hermes-cashew/blob/b14d7b013ac0e95314f78cca6cacfef202a30654/plugins/memory/cashew/__init__.py#L1900-L1950) and neutral retrieval fallback around [`retrieve_recursive_bfs`](https://github.com/magnus919/hermes-cashew/blob/b14d7b013ac0e95314f78cca6cacfef202a30654/plugins/memory/cashew/__init__.py#L1580-L1810) | Recall must remain usable when sqlite-vec, an embedding model, or an upstream retrieval call is unavailable. The fallback is an availability safeguard, not a second ranking engine. | Upstream retrieval remains the engine owner; upstream does not provide this Hermes failure-isolation contract. | **Retain as adapter responsibility.** #202/#204 must prove truthful status, context correctness, bounded work, and deterministic fallback before any simplification. |
@@ -176,7 +179,45 @@ The final #187 verification target is the full offline suite:
 uv run --frozen --extra dev pytest
 ```
 
+### Integrity repair delegation
+
+The selected composite includes the connection-aware `core.integrity` contract
+from upstream PR #137. The adapter delegates `inspect_integrity(conn, ...)`
+and explicitly confirmed `apply_integrity_repairs(conn=conn, ...)` to that
+module. The caller supplies an open connection inside its outer transaction and
+retains ownership of locking, backup, commit, rollback, post-repair inspection,
+and close. Path-only CLI calls are rejected without opening a database, and
+older installations without `core.integrity` remain fail-closed.
+
+The subprocess fixture in `tests/fixtures/cashew-pr137/` is test evidence only.
+Its `core/integrity.py` bytes and SHA-256 are checked against upstream PR #137;
+the installed composite is checked separately by the selected-source baseline
+tests. No production code is copied from the fixture and no upstream maintainer
+merge is required for this baseline.
+
 This document does not claim that a local source build, a static import, or a
 passing component test proves production compatibility. A future baseline must
 record the exact dependency artifact, Hermes revision, CI result, and boundary
 test at the same head.
+
+## Deterministic consolidation measurements
+
+Issue [#205](https://github.com/magnus919/hermes-cashew/issues/205) has an
+opt-in benchmark for comparing the current local sleep adapter with a future
+upstream replacement. It creates a temporary SQLite database, seeds
+deterministic vectors and orphan rows, delays a fake embedding client, and
+records per-phase wall time, selected work, edge rows committed, orphan rows
+repaired, a competing SQLite commit, and whether a participating shared-lock
+writer was admitted during the maintenance lease:
+
+```bash
+python3 scripts/benchmark-sleep-contention.py --nodes 32 128 --orphans 4 --delay-ms 50
+```
+
+The default orthogonal fixture isolates phase cost. To exercise the edge cap,
+use `--pair-similarity 0.92 --max-edges 1`; the current pinned adapter is
+expected to report truthful directed-row accounting when the cap is reached.
+That is measurement evidence for
+[#193](https://github.com/magnus919/hermes-cashew/issues/193), not a production
+claim. The harness never opens `~/.hermes` and does not alter the production
+sleep implementation.

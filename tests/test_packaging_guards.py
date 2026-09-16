@@ -107,6 +107,7 @@ def test_distribution_guard_accepts_clean_wheel_and_sdist(tmp_path: Path) -> Non
     [
         ("nested.db", "wheel", "forbidden paths"),
         ("graphify-out/report.md", "wheel", "forbidden paths"),
+        ("tests/fixtures/cashew-pr137/core/integrity.py", "wheel", "forbidden paths"),
         ("plugins/memory/cashew/loop", "sdist-link", "symlink entries"),
     ],
 )

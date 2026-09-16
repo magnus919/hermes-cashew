@@ -117,6 +117,14 @@ This enables:
 
 Without LLM, Cashew falls back to heuristic extraction.
 
+Consolidation delegates to the pinned upstream `core.sleep` pipeline through
+`sleep_adapter.py`; `sleep_refactor.py` survives only as a transition shim for
+the historical import path. The adapter's migration guards remain the shipped
+compatibility boundary. Read-only integrity inspection with explicit repair
+delegation ([PR #241](https://github.com/magnus919/hermes-cashew/pull/241)) is
+included in current `main`; integrity coverage (#206) and loader cleanup (#208)
+remain open tracked work.
+
 ## Logs
 
 Plugin logs go to `~/.hermes/logs/agent.log` (not gateway.log — the gateway has a component filter).
@@ -124,7 +132,6 @@ Plugin logs go to `~/.hermes/logs/agent.log` (not gateway.log — the gateway ha
 Key log lines to watch:
 ```
 INFO plugins.memory.cashew: llm_aux_role='memory': using opencode-go deepseek-v4-flash ...
-INFO plugins.memory.cashew: on_session_end called: ...
 INFO plugins.memory.cashew: think cycle produced 2 insight(s) on cluster: ...
 WARNING plugins.memory.cashew: think cycle failed ...
 WARNING plugins.memory.cashew: on_pre_compress failed ...

@@ -100,6 +100,11 @@ graphify path "ModuleA" "ModuleB"
 Key architectural points:
 - **Dual layout**: root `__init__.py` (re-export shim) + `plugins/memory/cashew/__init__.py` (real implementation)
 - **PEP 420 namespace packages**: `plugins/` and `plugins/memory/` intentionally have **no** `__init__.py`
+- **Ownership boundary**: Cashew owns graph algorithms and schema management;
+  the adapter owns Hermes lifecycle, profile paths, queueing, cron integration,
+  fallback behavior, and compatibility migration guards. Do not remove an
+  adapter safeguard until the upstream replacement is merged, pinned where
+  required, and covered at the runtime boundary.
 - **Threading**: `sync_turn()` enqueues onto `queue.Queue(maxsize=16)` drained by a single **daemon** worker thread. Shutdown rejects new producers, drains accepted turns ahead of `_SHUTDOWN = object()`, and defers cleanup if its bounded join times out.
 - **Silent degrade**: all Cashew failures log `WARNING` with `exc_info=True` and return neutral values — never raise into Hermes.
 

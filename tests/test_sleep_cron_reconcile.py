@@ -20,6 +20,10 @@ from plugins.memory.cashew.cron_reconcile import (
     profile_identity,
     stage_script,
 )
+from plugins.memory.cashew.log_filter import (
+    acquire_provider_scrub_filters,
+    release_provider_scrub_filters,
+)
 
 
 def _install_fake_cron(monkeypatch, jobs: list[dict]):
@@ -285,9 +289,15 @@ def test_tampered_cron_template_does_not_install_script_or_job(
 
     monkeypatch.setattr(Path, "read_text", read_tampered_template)
 
-    provider._register_sleep_cron()
+    acquire_provider_scrub_filters()
+    try:
+        provider._register_sleep_cron()
+    finally:
+        release_provider_scrub_filters()
 
     assert created == []
     assert provider._sleep_cron_job_id is None
     assert not (tmp_path / "scripts" / "cashew-sleep-cycle.py").exists()
-    assert "cron script template is invalid" in caplog.text
+    assert "sleep: failed to register cron job" in caplog.text
+    assert "error=RuntimeError" in caplog.text
+    assert "cron script template is invalid" not in caplog.text

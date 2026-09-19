@@ -7,21 +7,52 @@ cron job. These tests verify that:
 3. ordinary ``shutdown()`` preserves the profile-owned job for adoption
 4. the cron script is installed correctly
 
-All tests in this file require the Hermes ``cron`` module, which is only
-available in a full Hermes Agent environment — not in CI or standalone
-test runs. The module-level skip handles this automatically.
+These lifecycle tests install the current minimal Hermes cron API in-process so
+they run in the standalone suite. The reconciliation module retains a separate
+real-store test that skips only when Hermes itself is unavailable.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 import time
+import types
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
-pytest.importorskip("cron.jobs", reason="Hermes Agent cron module not available")
+
+@pytest.fixture(autouse=True)
+def _fake_cron_api(monkeypatch):
+    """Provide the current Hermes cron surface for installation-independent tests."""
+    package = types.ModuleType("cron")
+    package.__path__ = []
+    jobs = types.ModuleType("cron.jobs")
+    jobs.list_jobs = lambda *, include_disabled=False: []
+    jobs.remove_job = lambda _job_id: None
+    jobs.parse_schedule = lambda schedule: schedule
+    jobs.create_job = lambda **_kwargs: {"id": "fake-job-id"}
+    jobs.update_job = lambda _job_id, _updates: None
+
+    @contextmanager
+    def use_cron_store(_home):
+        yield
+
+    jobs.use_cron_store = use_cron_store
+    monkeypatch.setitem(sys.modules, "cron", package)
+    monkeypatch.setitem(sys.modules, "cron.jobs", jobs)
+    monkeypatch.setattr("plugins.memory.cashew._HAS_HERMES_CRON", True)
+
+
+def _install_development_anchor(hermes_home: Path) -> None:
+    """Model the supported development layout required by cron registration."""
+    source = Path(__file__).parents[1] / "plugins" / "memory" / "cashew"
+    anchor = hermes_home / "hermes-agent" / "plugins" / "memory" / "cashew"
+    anchor.parent.mkdir(parents=True, exist_ok=True)
+    anchor.symlink_to(source, target_is_directory=True)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -62,6 +93,7 @@ def test_initialize_skips_cron_when_sleep_disabled(tmp_path, monkeypatch):
     """When sleep_cycles=false, initialize() does NOT register a cron job."""
     hermes_home = tmp_path / "h1"
     hermes_home.mkdir()
+    _install_development_anchor(hermes_home)
     cfg = hermes_home / "cashew.json"
     cfg.write_text(json.dumps(_make_config(hermes_home, sleep_cycles=False)))
 
@@ -111,6 +143,7 @@ def test_initialize_registers_cron_when_sleep_enabled(tmp_path, monkeypatch):
     """When sleep_cycles=true and sleep_schedule is set, initialize() registers a cron job."""
     hermes_home = tmp_path / "h2"
     hermes_home.mkdir()
+    _install_development_anchor(hermes_home)
     cfg = hermes_home / "cashew.json"
     config_yaml = hermes_home / "config.yaml"
     config_yaml.write_text("model:\n  provider: test\n  default: test\n")
@@ -159,6 +192,7 @@ def test_initialize_skips_cron_when_no_schedule(tmp_path, monkeypatch):
     """When sleep_schedule is empty, initialize() does NOT register a cron job."""
     hermes_home = tmp_path / "h3"
     hermes_home.mkdir()
+    _install_development_anchor(hermes_home)
     cfg = hermes_home / "cashew.json"
     cfg.write_text(
         json.dumps(
@@ -207,6 +241,7 @@ def test_shutdown_preserves_profile_owned_cron_job(tmp_path, monkeypatch):
     """Ordinary session shutdown leaves scheduled profile maintenance intact."""
     hermes_home = tmp_path / "h4"
     hermes_home.mkdir()
+    _install_development_anchor(hermes_home)
     cfg = hermes_home / "cashew.json"
     config_yaml = hermes_home / "config.yaml"
     config_yaml.write_text("model:\n  provider: test\n  default: test\n")
@@ -233,7 +268,7 @@ def test_shutdown_preserves_profile_owned_cron_job(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cron_jobs, "create_job", fake_create_job)
     monkeypatch.setattr(cron_jobs, "remove_job", fake_remove_job)
-    monkeypatch.setattr(cron_jobs, "list_jobs", lambda: [])
+    monkeypatch.setattr(cron_jobs, "list_jobs", lambda *, include_disabled=False: [])
 
     from plugins.memory.cashew import CashewMemoryProvider
 
@@ -254,6 +289,7 @@ def test_cron_script_is_installed(tmp_path, monkeypatch):
     """initialize() writes the cron script to $HERMES_HOME/scripts/."""
     hermes_home = tmp_path / "h5"
     hermes_home.mkdir()
+    _install_development_anchor(hermes_home)
     cfg = hermes_home / "cashew.json"
     config_yaml = hermes_home / "config.yaml"
     config_yaml.write_text("model:\n  provider: test\n  default: test\n")
@@ -286,7 +322,8 @@ def test_cron_script_is_installed(tmp_path, monkeypatch):
     assert script_path.exists(), f"Cron script not found at {script_path}"
     content = script_path.read_text()
     assert "run_sleep_cycle" in content
-    assert "plugins.memory.cashew.sleep_adapter" in content
+    assert "_INSTALLATION_MARKER = {" in content
+    assert "_load_profile_modules" in content
 
     provider.shutdown()
 
@@ -318,12 +355,10 @@ def test_cron_script_imports_resolve_model_fn(tmp_path):
     script_path.write_text(script_source)
     script_path.chmod(0o755)
 
-    # Verify the script contains the resolve_model_fn import
-    assert "resolve_model_fn" in script_source
-    assert (
-        "model_fn = _resolve_model_fn" in script_source
-        or "resolve_model_fn(hermes_home" in script_source
-    )
+    # The generated entry point resolves the model through the profile-pinned
+    # config module loaded from its validated installation marker.
+    assert "config_module.resolve_model_fn(" in script_source
+    assert "hermes_home=hermes_home, config=config" in script_source
     assert "model_fn=model_fn" in script_source
     # No longer hardcoded None
     assert "model_fn=None" not in script_source.replace(

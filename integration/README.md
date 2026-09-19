@@ -49,6 +49,18 @@ HERMES_PINNED_SOURCE=/tmp/hermes-agent-990473a79c6b0396b0a648fdd85ee8f7a5c267d3 
   "$HERMES_TEST_ENV/bin/python" integration/run_pinned_host.py
 ```
 
+To exercise a built wheel at the real Hermes boundary, install the wheel into
+the same clean interpreter first, then run the matrix. The wheel scenario
+links the installed distribution's provider package into a disposable Hermes
+development overlay, matching the documented package-install workaround, and
+fails if it resolves the repository checkout:
+
+```sh
+"$HERMES_TEST_ENV/bin/pip" install --force-reinstall dist/*.whl
+HERMES_PINNED_SOURCE=/tmp/hermes-agent-990473a79c6b0396b0a648fdd85ee8f7a5c267d3 \
+  "$HERMES_TEST_ENV/bin/python" integration/run_pinned_host.py
+```
+
 Check explicit auxiliary-role admission separately with the same pinned source:
 
 ```sh
@@ -67,9 +79,14 @@ routing, `cron.jobs`, and SQLite remain real. It proves loader and lifecycle
 compatibility with the verified source pin, not native embedding-model health
 or complete process-crash containment.
 
-Cron subprocess execution is part of the default command. The current main
-branch includes the flat-install import fix from issue #186, so both the flat
-and development scenarios are expected to pass. A cron failure remains an
-actionable integration failure rather than a skipped check. The development
-scenario can still be run alone with `--scenario dev` when isolating loader
-behavior.
+Cron subprocess execution is part of every scenario. The harness parses the
+cron JSON, requires a non-empty result with a documented status and selected
+nodes, and verifies that a synthetic eligible record was durably consolidated
+in the temporary database. The current main branch includes the flat-install
+import fix from issue #186, so the flat and development scenarios are expected
+to pass. A cron failure remains an actionable integration failure rather than a
+skipped check. The development scenario can still be run alone with
+`--scenario dev` or `--scenario wheel` can be used when isolating loader
+behavior; the wheel scenario requires a clean interpreter containing the built
+`hermes-cashew` wheel. The default matrix runs flat, development, and wheel
+scenarios.

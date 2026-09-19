@@ -14,6 +14,8 @@ public archive URL, revision, and SHA256 required before running this script.
 from __future__ import annotations
 
 import argparse
+import base64
+import csv
 import hashlib
 import importlib
 import inspect
@@ -44,6 +46,21 @@ REQUIRED_HOST_FILES = (
 
 def _error(message: str) -> NoReturn:
     raise SystemExit(f"SETUP ERROR: {message}")
+
+
+def _parse_cron_result(stdout: str) -> dict[str, Any]:
+    """Validate the minimum durable-result contract of one cron invocation."""
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(f"cron script did not produce JSON: {stdout!r}") from exc
+    if not isinstance(payload, dict) or not payload:
+        raise AssertionError(f"cron script produced an empty/non-object result: {payload!r}")
+    if payload.get("status") not in {"completed", "partial", "unavailable"}:
+        raise AssertionError(f"cron script returned an unknown status: {payload!r}")
+    if payload.get("nodes_selected", 0) < 1:
+        raise AssertionError(f"cron script selected no eligible nodes: {payload!r}")
+    return payload
 
 
 def _git_revision(source: Path) -> str | None:
@@ -156,8 +173,72 @@ def _copy_plugin(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, ignore=ignored)
 
 
+def _installed_wheel_package(repository: Path) -> Path:
+    """Locate the provider package from the installed distribution only."""
+    try:
+        from importlib.metadata import distribution, entry_points
+
+        installed = distribution("hermes-cashew")
+        entry = next(
+            (item for item in entry_points(group="hermes_agent.plugins")
+             if item.name == "cashew"),
+            None,
+        )
+        if entry is None or entry.value != "plugins.memory.cashew":
+            _error("installed wheel has no cashew Hermes entry point")
+        package = Path(installed.locate_file("plugins/memory/cashew")).resolve()
+    except Exception as exc:
+        _error(f"hermes-cashew wheel is not installed in this interpreter: {exc}")
+    if not package.is_dir():
+        _error(f"installed hermes-cashew wheel has no provider package: {package}")
+    if package.is_relative_to(repository.resolve()):
+        _error(f"wheel scenario resolved the repository provider: {package}")
+    _verify_wheel_package(
+        package,
+        (repository / "plugins" / "memory" / "cashew").resolve(),
+        installed.read_text("RECORD"),
+    )
+    return package
+
+
+def _verify_wheel_package(package: Path, candidate: Path, record_text: str) -> None:
+    """Require installed provider bytes and RECORD hashes to match candidate."""
+    record_hashes = {
+        Path(row[0]): row[1]
+        for row in csv.reader(record_text.splitlines())
+        if len(row) == 3 and row[0].startswith("plugins/memory/cashew/") and row[1]
+    }
+    candidate_files = {
+        Path("plugins/memory/cashew") / path.relative_to(candidate)
+        for path in candidate.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    }
+    installed_files = {
+        Path("plugins/memory/cashew") / path.relative_to(package)
+        for path in package.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    }
+    if candidate_files != installed_files:
+        _error("installed wheel provider files do not match the candidate tree")
+    for relative in sorted(candidate_files):
+        relative_package = relative.relative_to("plugins/memory/cashew")
+        candidate_path = candidate / relative_package
+        installed_path = package / relative_package
+        if candidate_path.read_bytes() != installed_path.read_bytes():
+            _error(f"installed wheel differs from candidate source: {relative}")
+        encoded = record_hashes.get(relative)
+        if encoded:
+            algorithm, expected = encoded.split("=", 1)
+            actual = base64.urlsafe_b64encode(
+                hashlib.new(algorithm, candidate_path.read_bytes()).digest()
+            ).rstrip(b"=").decode("ascii")
+            if actual != expected:
+                _error(f"wheel RECORD hash mismatch: {relative}")
+
+
 def _make_dev_overlay(
-    hermes_source: Path, plugin_source: Path, destination: Path
+    hermes_source: Path, plugin_source: Path, destination: Path,
+    *, installed_package: Path | None = None,
 ) -> None:
     """Expose the plugin as a bundled/dev provider without mutating Hermes source."""
     (destination / "plugins" / "memory").mkdir(parents=True)
@@ -167,11 +248,16 @@ def _make_dev_overlay(
         target.symlink_to(hermes_source / relative)
     memory_init = destination / "plugins" / "memory" / "__init__.py"
     shutil.copy2(hermes_source / "plugins/memory/__init__.py", memory_init)
-    shutil.copytree(
-        plugin_source / "plugins" / "memory" / "cashew",
-        destination / "plugins" / "memory" / "cashew",
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-    )
+    if installed_package is None:
+        shutil.copytree(
+            plugin_source / "plugins" / "memory" / "cashew",
+            destination / "plugins" / "memory" / "cashew",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+    else:
+        (destination / "plugins" / "memory" / "cashew").symlink_to(
+            installed_package, target_is_directory=True
+        )
 
 
 def _write_profile(home: Path) -> None:
@@ -263,9 +349,20 @@ def _exercise_real_host(mode: str, hermes_source: Path, plugin_source: Path) -> 
         _write_profile(home)
         user_home.mkdir()
 
+        installed_package: Path | None = None
         if mode == "flat":
             _copy_plugin(plugin_source, home / "plugins" / "cashew")
             import_root = hermes_source
+        elif mode == "wheel":
+            installed_package = _installed_wheel_package(plugin_source)
+            overlay = home / "hermes-agent"
+            _make_dev_overlay(
+                hermes_source,
+                plugin_source,
+                overlay,
+                installed_package=installed_package,
+            )
+            import_root = overlay
         elif mode == "dev":
             overlay = home / "hermes-agent"
             _make_dev_overlay(hermes_source, plugin_source, overlay)
@@ -319,13 +416,15 @@ def _exercise_real_host(mode: str, hermes_source: Path, plugin_source: Path) -> 
         assert provider is not None
         provider_module = sys.modules[type(provider).__module__]
         provider_origin = Path(inspect.getfile(provider_module)).resolve()
-        allowed_plugin_roots = [plugin_source.resolve()]
         if mode == "flat":
-            allowed_plugin_roots.append((home / "plugins" / "cashew").resolve())
+            allowed_plugin_roots = [(home / "plugins" / "cashew").resolve()]
+        elif mode == "wheel":
+            assert installed_package is not None
+            allowed_plugin_roots = [installed_package.resolve()]
         else:
-            allowed_plugin_roots.append(
-                (home / "hermes-agent" / "plugins" / "memory" / "cashew").resolve()
-            )
+            allowed_plugin_roots = [
+                (home / "hermes-agent" / "plugins" / "memory" / "cashew").resolve(),
+            ]
         assert any(
             provider_origin.is_relative_to(root) for root in allowed_plugin_roots
         ), provider_origin
@@ -394,6 +493,7 @@ def _exercise_real_host(mode: str, hermes_source: Path, plugin_source: Path) -> 
         )
         assert provider.is_available() is True
         assert manager.get_provider("cashew") is provider
+        assert provider._model_fn is None
 
         import sqlite3
 
@@ -404,6 +504,9 @@ def _exercise_real_host(mode: str, hermes_source: Path, plugin_source: Path) -> 
         supervisor.active_timeout = 0.1
         supervisor.backoff_base = 0.0
         with sqlite3.connect(str(provider._db_path)) as connection:
+            assert connection.execute(
+                "SELECT 1 FROM embeddings WHERE node_id = ?", ("integration-node",)
+            ).fetchone() is None
             connection.execute(
                 "INSERT INTO thought_nodes (id, content, node_type, domain, timestamp) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -477,11 +580,19 @@ def _exercise_real_host(mode: str, hermes_source: Path, plugin_source: Path) -> 
         assert jobs[0].get("no_agent") is True
         script_path = home / "scripts" / "cashew-sleep-cycle.py"
         assert script_path.is_file()
-
         cron_env = os.environ.copy()
         cron_env["PYTHONPATH"] = os.pathsep.join(
             (str(stubs.parent), str(import_root), str(hermes_source))
         )
+        with sqlite3.connect(str(provider._db_path)) as connection:
+            metadata = dict(
+                connection.execute(
+                    "SELECT key, value FROM hermes_provider_meta"
+                ).fetchall()
+            )
+        assert metadata.get("embedding_model") == "all-MiniLM-L6-v2", metadata
+        assert metadata.get("embedding_dim") == "384", metadata
+        assert metadata.get("vec_dim") == "384", metadata
         result = subprocess.run(
             [str(child_python), str(script_path)],
             cwd=temp_root,
@@ -495,7 +606,17 @@ def _exercise_real_host(mode: str, hermes_source: Path, plugin_source: Path) -> 
                 "real cron script failed; issue #186 must be incorporated before "
                 f"#199 can pass this boundary:\n{result.stdout}\n{result.stderr}"
             )
-        assert result.stdout.strip(), "cron script produced no JSON output"
+        if result.stdout.strip() == "{}":
+            raise AssertionError(f"cron script skipped its cycle: {result.stderr}")
+        cron_payload = _parse_cron_result(result.stdout)
+        assert cron_payload.get("orphans_embedded", 0) >= 1, cron_payload
+        assert cron_payload["status"] in {"completed", "partial"}, cron_payload
+        assert cron_payload["dream_generation"] == "skipped", cron_payload
+        with sqlite3.connect(str(provider._db_path)) as connection:
+            assert connection.execute(
+                "SELECT LENGTH(vector) FROM embeddings WHERE node_id = ?",
+                ("integration-node",),
+            ).fetchone() == (384 * 4,)
 
         manager.shutdown_all()
         _exercise_auxiliary_api()
@@ -548,7 +669,9 @@ def main() -> None:
         type=Path,
         help="verified archive matching an extracted Hermes source",
     )
-    parser.add_argument("--scenario", choices=("flat", "dev"), help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--scenario", choices=("flat", "wheel", "dev"), help=argparse.SUPPRESS
+    )
     args = parser.parse_args()
     hermes_source = (
         args.hermes_source or Path(os.environ.get("HERMES_PINNED_SOURCE", ""))
@@ -566,9 +689,11 @@ def main() -> None:
         return
 
     hermes_archive = args.hermes_archive.resolve() if args.hermes_archive else None
-    for mode in ("flat", "dev"):
+    for mode in ("flat", "dev", "wheel"):
         _run_child(mode, hermes_source, plugin_source, hermes_archive)
-    print(f"PASS pinned Hermes {HERMES_REVISION}: flat and dev lifecycle contracts")
+    print(
+        f"PASS pinned Hermes {HERMES_REVISION}: flat, dev, and wheel lifecycle contracts"
+    )
 
 
 if __name__ == "__main__":

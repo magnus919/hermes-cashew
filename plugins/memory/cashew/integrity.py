@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import pathlib
 import re
 import shutil
@@ -916,6 +917,156 @@ def _repair_unavailable(*, confirm: bool) -> dict[str, Any]:
     }
 
 
+def _profile_identity(
+    conn: sqlite3.Connection,
+) -> tuple[str, int] | None:
+    """Return the repair identity only when both persisted values are usable."""
+    try:
+        rows = conn.execute(
+            "SELECT key, value FROM hermes_provider_meta "
+            "WHERE key IN ('embedding_model', 'embedding_dim')"
+        ).fetchall()
+        values = {str(key): value for key, value in rows}
+        model = str(values["embedding_model"]).strip()
+        dimension = int(str(values["embedding_dim"]))
+    except (KeyError, TypeError, ValueError, sqlite3.Error):
+        return None
+    if not model or dimension <= 0:
+        return None
+    return model, dimension
+
+
+def _create_verified_backup(
+    source_path: pathlib.Path, backup_dir: pathlib.Path
+) -> pathlib.Path:
+    """Create and verify a snapshot while the caller excludes database writers."""
+    backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        prefix=".cashew-integrity-", suffix=".db", dir=backup_dir, delete=False
+    )
+    temporary = pathlib.Path(handle.name)
+    handle.close()
+    target = backup_dir / f"cashew-integrity-{time.time_ns()}.db"
+    source_conn: sqlite3.Connection | None = None
+    backup_conn: sqlite3.Connection | None = None
+    try:
+        source_conn = sqlite3.connect(f"{source_path.as_uri()}?mode=ro", uri=True)
+        backup_conn = sqlite3.connect(temporary)
+        source_conn.backup(backup_conn)
+        if str(backup_conn.execute("PRAGMA integrity_check").fetchone()[0]) != "ok":
+            raise sqlite3.DatabaseError("backup_integrity_check_failed")
+        backup_conn.close()
+        backup_conn = None
+        source_conn.close()
+        source_conn = None
+        os.chmod(temporary, 0o600)
+        temporary.replace(target)
+        return target
+    except BaseException:
+        if backup_conn is not None:
+            backup_conn.close()
+        if source_conn is not None:
+            source_conn.close()
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _repair_failure(
+    reason: str,
+    *,
+    backup_path: pathlib.Path | None = None,
+    rolled_back: bool = False,
+    committed: bool | None = False,
+    mutated: bool = False,
+    mutation_uncertain: bool = False,
+    recovery_required: bool = False,
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "unavailable",
+        "mutated": mutated,
+        "confirmed": True,
+        "committed": committed,
+        "rolled_back": rolled_back,
+        "reason": reason,
+    }
+    if mutation_uncertain:
+        report["mutation_uncertain"] = True
+    if recovery_required:
+        report["recovery_required"] = True
+    if backup_path is not None:
+        report["backup"] = {"path": str(backup_path), "verified": True}
+    return report
+
+
+def _actionable_count_keys(
+    actions: Iterable[str] | None, permanence_policy: str
+) -> set[str]:
+    selected = (
+        {
+            "repair_vec",
+            "repair_embeddings",
+            "remove_orphan_embeddings",
+            "remove_orphan_edges",
+        }
+        if actions is None
+        else set(actions)
+    )
+    keys: set[str] = set()
+    mapping = {
+        "repair_vec": {"missing_vec", "stale_vec", "invalid_vec", "vec_mismatched"},
+        "repair_embeddings": {"missing_embeddings", "invalid_embeddings"},
+        "remove_orphan_embeddings": {"orphan_embeddings"},
+        "remove_orphan_edges": {"orphan_edges"},
+        "remove_self_edges": {"self_edges"},
+        "promote_core_memories": {"core_memory_not_permanent"},
+    }
+    for action in selected:
+        keys.update(mapping.get(action, set()))
+    if permanence_policy != "report":
+        keys.add("permanent_and_decayed")
+    return keys
+
+
+def _repair_verification_matches(
+    repair: dict[str, Any],
+    inspection: dict[str, Any],
+    *,
+    actions: Iterable[str] | None,
+    permanence_policy: str,
+) -> bool:
+    """Confirm that upstream's declared outcome matches a fresh inspection."""
+    if inspection.get("status") not in {"ok", "findings"}:
+        return False
+    keys = _actionable_count_keys(actions, permanence_policy)
+    counts = inspection.get("counts")
+    remaining = repair.get("remaining")
+    if not isinstance(counts, dict) or not isinstance(remaining, dict):
+        return False
+    actual = {key: counts[key] for key in keys if counts.get(key, 0)}
+    declared = {key: remaining[key] for key in keys if remaining.get(key, 0)}
+    if actual != declared:
+        return False
+    status = repair.get("status")
+    if status == "completed":
+        return not actual
+    if status == "partial":
+        return bool(actual or repair.get("skipped") or repair.get("failures"))
+    return False
+
+
+def _profile_repair_request_error(
+    *, deadline_seconds: float, batch_size: int, max_items: int, permanence_policy: str
+) -> str | None:
+    if not math.isfinite(deadline_seconds) or deadline_seconds < 0:
+        return "invalid_deadline"
+    if batch_size <= 0 or max_items <= 0:
+        return "invalid_repair_bounds"
+    if permanence_policy not in {"report", "preserve_permanent", "preserve_decay"}:
+        return "invalid_permanence_policy"
+    return None
+
+
 def inspect_integrity(
     conn: sqlite3.Connection,
     *,
@@ -977,16 +1128,17 @@ def apply_integrity_repairs(
     permanence_policy: str = "report",
     batch_size: int = 100,
     max_items: int = 1000,
+    deadline_seconds: float = 5.0,
 ) -> dict[str, Any]:
-    """Apply only an explicit, caller-owned upstream repair operation.
+    """Apply an explicit upstream repair through either supported ownership mode.
 
-    ``conn`` must already be open inside the caller's outer transaction.  The
-    adapter never opens a path, creates a backup, acquires a lock, commits,
-    rolls back, or closes the connection.  ``confirm`` is required so audit
-    and initialization paths can never repair implicitly.  ``db_path`` and
-    ``backup_dir`` remain metadata-only compatibility arguments.
+    With ``conn``, the caller retains connection, transaction, backup, lock,
+    commit, and rollback ownership.  With ``db_path``, the adapter runs the
+    complete operator workflow: exclusive maintenance admission, compatible
+    persisted identity, verified SQLite backup, write-excluding transaction,
+    upstream repair, pre-commit verification, commit, and a fresh post-commit
+    inspection.  ``confirm`` is required in both modes.
     """
-    del db_path, backup_dir
     if not confirm:
         return {
             "schema_version": 1,
@@ -995,6 +1147,37 @@ def apply_integrity_repairs(
             "confirmed": False,
             "reason": "explicit_confirmation_required",
         }
+    if conn is not None and db_path is not None:
+        return {
+            "schema_version": 1,
+            "status": "rejected",
+            "mutated": False,
+            "confirmed": True,
+            "reason": "choose_connection_or_path",
+        }
+    if conn is None:
+        if db_path is None:
+            return {
+                "schema_version": 1,
+                "status": "rejected",
+                "mutated": False,
+                "confirmed": True,
+                "reason": "connection_or_path_required",
+            }
+        return _apply_profile_repairs(
+            pathlib.Path(db_path),
+            backup_dir=(None if backup_dir is None else pathlib.Path(backup_dir)),
+            expected_model=expected_model,
+            expected_dimension=expected_dimension,
+            embedding_fn=embedding_fn,
+            embedding_model=embedding_model,
+            require_vec_parity=require_vec_parity,
+            actions=actions,
+            permanence_policy=permanence_policy,
+            batch_size=batch_size,
+            max_items=max_items,
+            deadline_seconds=deadline_seconds,
+        )
     if not isinstance(conn, sqlite3.Connection):
         return {
             "schema_version": 1,
@@ -1036,13 +1219,184 @@ def apply_integrity_repairs(
         return {
             "schema_version": 1,
             "status": "unavailable",
-            "mutated": False,
+            "mutated": None,
+            "mutation_uncertain": True,
             "confirmed": True,
             "reason": "upstream_integrity_repair_failed",
         }
     result["confirmed"] = True
+    result.pop("expected_model", None)
     result["adapter"] = {"delegated_to": "core.integrity.repair_integrity"}
     return result
+
+
+def _apply_profile_repairs(
+    db_path: pathlib.Path,
+    *,
+    backup_dir: pathlib.Path | None,
+    expected_model: str | None,
+    expected_dimension: int | None,
+    embedding_fn: Any,
+    embedding_model: str | None,
+    require_vec_parity: bool,
+    actions: Iterable[str] | None,
+    permanence_policy: str,
+    batch_size: int,
+    max_items: int,
+    deadline_seconds: float,
+) -> dict[str, Any]:
+    """Own one complete, backup-backed repair transaction for an operator."""
+    path = db_path.resolve(strict=False)
+    request_error = _profile_repair_request_error(
+        deadline_seconds=deadline_seconds,
+        batch_size=batch_size,
+        max_items=max_items,
+        permanence_policy=permanence_policy,
+    )
+    if request_error is not None:
+        return _repair_failure(request_error)
+    if not path.is_file():
+        return _repair_failure("profile_not_found")
+    if _upstream_integrity_api() is None:
+        return _repair_unavailable(confirm=True)
+    destination = (
+        path.parent / "backups"
+        if backup_dir is None
+        else backup_dir.resolve(strict=False)
+    )
+    backup_path: pathlib.Path | None = None
+    connection: sqlite3.Connection | None = None
+    repair_result: dict[str, Any] | None = None
+    commit_attempted = False
+    commit_succeeded = False
+    selected_actions = None if actions is None else tuple(actions)
+    try:
+        with admit_operation(
+            graph_path=path, exclusive=True, deadline=deadline_seconds
+        ):
+            connection = sqlite3.connect(path, timeout=max(0.0, deadline_seconds))
+            identity = _profile_identity(connection)
+            if identity is None:
+                return _repair_failure("provider_identity_unavailable")
+            stored_model, stored_dimension = identity
+            if expected_model is not None and expected_model != stored_model:
+                return _repair_failure("embedding_model_mismatch")
+            if (
+                expected_dimension is not None
+                and expected_dimension != stored_dimension
+            ):
+                return _repair_failure("embedding_dimension_mismatch")
+            expected_model = stored_model
+            expected_dimension = stored_dimension
+            if embedding_model is None:
+                embedding_model = stored_model
+
+            connection.execute("BEGIN IMMEDIATE")
+            backup_path = _create_verified_backup(path, destination)
+            repair_result = apply_integrity_repairs(
+                conn=connection,
+                confirm=True,
+                expected_model=expected_model,
+                expected_dimension=expected_dimension,
+                embedding_fn=embedding_fn,
+                embedding_model=embedding_model,
+                require_vec_parity=require_vec_parity,
+                actions=selected_actions,
+                permanence_policy=permanence_policy,
+                batch_size=batch_size,
+                max_items=max_items,
+            )
+            if repair_result.get("status") not in {"completed", "partial"}:
+                connection.rollback()
+                failure = _repair_failure(
+                    str(repair_result.get("reason", "repair_failed")),
+                    backup_path=backup_path,
+                    rolled_back=True,
+                )
+                failure["repair"] = repair_result
+                return failure
+            before_commit = inspect_integrity(
+                connection,
+                expected_model=expected_model,
+                expected_dimension=expected_dimension,
+            )
+            if not _repair_verification_matches(
+                repair_result,
+                before_commit,
+                actions=selected_actions,
+                permanence_policy=permanence_policy,
+            ):
+                connection.rollback()
+                return _repair_failure(
+                    "precommit_verification_failed",
+                    backup_path=backup_path,
+                    rolled_back=True,
+                )
+            commit_attempted = True
+            connection.commit()
+            commit_succeeded = True
+            after_commit = inspect_integrity(
+                connection,
+                expected_model=expected_model,
+                expected_dimension=expected_dimension,
+            )
+            if not _repair_verification_matches(
+                repair_result,
+                after_commit,
+                actions=selected_actions,
+                permanence_policy=permanence_policy,
+            ):
+                return _repair_failure(
+                    "postcommit_verification_failed",
+                    backup_path=backup_path,
+                    committed=True,
+                    mutated=bool(repair_result.get("mutated")),
+                    mutation_uncertain=True,
+                    recovery_required=True,
+                )
+            repair_result["committed"] = True
+            repair_result["rolled_back"] = False
+            repair_result["backup"] = {"path": str(backup_path), "verified": True}
+            repair_result["verification"] = {
+                "before_commit": before_commit,
+                "after_commit": after_commit,
+            }
+            repair_result["operator_workflow"] = {
+                "exclusive_admission": True,
+                "sqlite_write_exclusion": "BEGIN IMMEDIATE",
+                "embedding_cache": "unchanged_same_model_content_cache",
+                "maintenance_epoch": "preserved_same_identity",
+            }
+            return repair_result
+    except Exception:
+        if connection is not None and connection.in_transaction:
+            connection.rollback()
+            rolled_back = True
+            committed: bool | None = False
+            mutation_uncertain = False
+        else:
+            rolled_back = False
+            committed = (
+                True if commit_succeeded else (None if commit_attempted else False)
+            )
+            mutation_uncertain = bool(commit_attempted and not commit_succeeded)
+        logger.warning("Cashew operator integrity repair failed")
+        return _repair_failure(
+            "operator_repair_failed",
+            backup_path=backup_path,
+            rolled_back=rolled_back,
+            committed=committed,
+            mutated=bool(
+                committed is True
+                and repair_result is not None
+                and repair_result.get("mutated")
+            ),
+            mutation_uncertain=mutation_uncertain,
+            recovery_required=bool(committed is not False),
+        )
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 # Short operator-friendly names; the explicit names remain canonical for callers.
@@ -1058,23 +1412,53 @@ def _main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="Report repair availability (never implicit).",
+        help="Run the backup-backed operator repair workflow.",
     )
     parser.add_argument(
         "--confirm", action="store_true", help="Confirm an explicit repair request."
     )
+    parser.add_argument(
+        "--backup-dir",
+        type=pathlib.Path,
+        help="Backup destination (default: a backups directory beside the database).",
+    )
+    parser.add_argument(
+        "--action",
+        action="append",
+        dest="actions",
+        help="Upstream repair action; repeat to select multiple actions.",
+    )
+    parser.add_argument(
+        "--permanence-policy",
+        choices=("report", "preserve_permanent", "preserve_decay"),
+        default="report",
+        help="Explicit resolution for contradictory permanence state.",
+    )
+    parser.add_argument("--batch-size", type=int, default=100)
+    parser.add_argument("--max-items", type=int, default=1000)
+    parser.add_argument("--deadline-seconds", type=float, default=5.0)
     args = parser.parse_args(list(argv) if argv is not None else None)
     report = (
-        apply_integrity_repairs(args.db_path, confirm=args.confirm)
+        apply_integrity_repairs(
+            args.db_path,
+            confirm=args.confirm,
+            backup_dir=args.backup_dir,
+            actions=args.actions,
+            permanence_policy=args.permanence_policy,
+            batch_size=args.batch_size,
+            max_items=args.max_items,
+            deadline_seconds=args.deadline_seconds,
+        )
         if args.apply
         else audit_integrity(args.db_path)
     )
     print(json.dumps(report, sort_keys=True, indent=2))
-    return (
-        0
-        if report.get("status") in {"ok", "findings", "audit_incomplete", "unavailable"}
-        else 1
+    successful = (
+        {"completed", "partial"}
+        if args.apply
+        else {"ok", "findings", "audit_incomplete", "unavailable"}
     )
+    return 0 if report.get("status") in successful else 1
 
 
 if __name__ == "__main__":  # pragma: no cover

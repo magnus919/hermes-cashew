@@ -195,8 +195,15 @@ from upstream PR #137. The adapter delegates `inspect_integrity(conn, ...)`
 and explicitly confirmed `apply_integrity_repairs(conn=conn, ...)` to that
 module. The caller supplies an open connection inside its outer transaction and
 retains ownership of locking, backup, commit, rollback, post-repair inspection,
-and close. Path-only CLI calls are rejected without opening a database, and
-older installations without `core.integrity` remain fail-closed.
+and close. The path-based operator CLI wraps the same delegation with the
+Hermes-owned maintenance admission, persisted model-identity check, verified
+SQLite backup, `BEGIN IMMEDIATE` writer exclusion, rollback on pre-commit
+failure, and before/after inspection. It does not implement repair algorithms
+or change journal mode. Repairs preserve model identity and the maintenance
+epoch, so the profile-scoped content-to-embedding cache remains valid and does
+not require its own exclusive lease; model-changing work must continue to use
+the graph-to-cache migration admission. Older installations without
+`core.integrity` remain fail-closed.
 
 The subprocess fixture in `tests/fixtures/cashew-pr137/` is test evidence only.
 Its `core/integrity.py` bytes and SHA-256 are checked against upstream PR #137;

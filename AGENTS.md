@@ -135,15 +135,15 @@ relying on any claim below:
 
 - Upstream sleep delegation, safe cron reconciliation, and consolidation
   bounding (#193, #203, #205) are merged to `main`. The local consolidation
-  engine is gone: `sleep_refactor.py` survives only as a transition shim, and
+  engine and its obsolete `sleep_refactor.py` transition shim are gone;
   [sleep_adapter.py](plugins/memory/cashew/sleep_adapter.py) is the Hermes
   boundary for the pinned upstream `core.sleep.run_sleep_cycle`.
 - Read-only integrity inspection with explicitly confirmed upstream repair
   delegation is merged ([PR #241](https://github.com/magnus919/hermes-cashew/pull/241));
   [#206](https://github.com/magnus919/hermes-cashew/issues/206) remains open
   for the remaining repair-path coverage.
-- [#208](https://github.com/magnus919/hermes-cashew/issues/208) (structural
-  cleanup and loader consolidation) remains open.
+- [#208](https://github.com/magnus919/hermes-cashew/issues/208) completed the
+  bounded structural cleanup and obsolete sleep-shim retirement.
 
 Do not describe remaining work as shipped until it is merged to `main` and
 validated at the runtime boundary.

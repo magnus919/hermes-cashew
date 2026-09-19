@@ -118,12 +118,12 @@ This enables:
 Without LLM, Cashew falls back to heuristic extraction.
 
 Consolidation delegates to the pinned upstream `core.sleep` pipeline through
-`sleep_adapter.py`; `sleep_refactor.py` survives only as a transition shim for
-the historical import path. The adapter's migration guards remain the shipped
+`sleep_adapter.py`. The obsolete `sleep_refactor.py` transition import was
+removed after a repository-wide caller census found no supported users. The
+adapter's migration guards remain the shipped
 compatibility boundary. Read-only integrity inspection with explicit repair
 delegation ([PR #241](https://github.com/magnus919/hermes-cashew/pull/241)) is
-included in current `main`; integrity coverage (#206) and loader cleanup (#208)
-remain open tracked work.
+included in current `main`; integrity coverage (#206) remains tracked work.
 
 ## Logs
 

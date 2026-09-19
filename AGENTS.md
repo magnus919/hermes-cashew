@@ -126,7 +126,10 @@ done
   search (see logging on startup for the fallback message).
 - **`HF_HUB_OFFLINE=1`** set in `conftest.py` before any Cashew import. Embedding model must be mocked in tests.
 - **`CASHEW_*` env vars stripped** in `conftest.py` to prevent Hermes session leak into tests.
-- **Silent degrade** on all Cashew failures — log WARNING, return empty, never raise into Hermes.
+- **Failure isolation** at Hermes callback and tool boundaries — never raise
+  Cashew failures into Hermes. Return the boundary's neutral or structured
+  failure envelope; operator-facing health and integrity paths must preserve
+  degraded, failed, and uncertain states instead of hiding them.
 
 ### Reconciliation status
 
@@ -138,12 +141,10 @@ relying on any claim below:
   engine and its obsolete `sleep_refactor.py` transition shim are gone;
   [sleep_adapter.py](plugins/memory/cashew/sleep_adapter.py) is the Hermes
   boundary for the pinned upstream `core.sleep.run_sleep_cycle`.
-- Read-only integrity inspection with explicitly confirmed upstream repair
-  delegation is merged ([PR #241](https://github.com/magnus919/hermes-cashew/pull/241));
-  [#206](https://github.com/magnus919/hermes-cashew/issues/206) remains open
-  for the remaining repair-path coverage.
-- [#208](https://github.com/magnus919/hermes-cashew/issues/208) completed the
-  bounded structural cleanup and obsolete sleep-shim retirement.
+- Read-only integrity inspection uses explicitly confirmed upstream repair
+  delegation with backup, postcondition verification, and rollback reporting.
+- The bounded structural cleanup removed the obsolete sleep transition shim;
+  supported callers use `sleep_adapter.py`.
 
 Do not describe remaining work as shipped until it is merged to `main` and
 validated at the runtime boundary.

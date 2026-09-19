@@ -125,8 +125,8 @@ Consolidation delegates to the pinned upstream `core.sleep` pipeline through
 removed after a repository-wide caller census found no supported users. The
 adapter's migration guards remain the shipped
 compatibility boundary. Read-only integrity inspection with explicit repair
-delegation ([PR #241](https://github.com/magnus919/hermes-cashew/pull/241)) is
-included in current `main`; integrity coverage (#206) remains tracked work.
+delegation is part of the provider boundary. Repair reports backup,
+postcondition, rollback, and commit-uncertainty outcomes to the operator.
 
 ## Logs
 

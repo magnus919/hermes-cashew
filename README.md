@@ -79,10 +79,15 @@ database and generated backups for manual review.
 hermes plugins install magnus919/hermes-cashew
 ```
 
-This clones the repository to `~/.hermes/plugins/cashew/` and registers the
+This clones the repository to the active Hermes home under `plugins/cashew/`
+(default: `~/.hermes/plugins/cashew/`) and registers the
 plugin entry point. This interim source baseline uses a direct URL that the
 current Hermes dependency installer intentionally rejects. Install the exact
 source archive into the Hermes environment before setup:
+
+The interpreter examples below assume the default Hermes installation. If your
+Hermes environment is installed elsewhere, substitute its Python executable.
+Profile files use `HERMES_HOME`, falling back to `$HOME/.hermes`.
 
 ```bash
 CASHEW_PIN='cashew-brain @ https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz#sha256=23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3'
@@ -90,16 +95,19 @@ uv pip install \
   --python ~/.hermes/hermes-agent/venv/bin/python3 \
   --reinstall "$CASHEW_PIN" sqlite-vec
 ~/.hermes/hermes-agent/venv/bin/python3 \
-  ~/.hermes/plugins/cashew/scripts/verify-cashew-baseline.py
+  "${HERMES_HOME:-$HOME/.hermes}/plugins/cashew/scripts/verify-cashew-baseline.py"
 ```
 
 This archive is an immutable composite fork of upstream Cashew. It combines PR
 136 (`ac090ce75ffd2e97dac257cee9430628c68aa241`) and PR 137
 (`cb940f34c15460b87831748b2e702334c1c5fbd0`) at tree
-`29d97fb93c7998c97be0da8f19b90c6523f9d1e9`. The composite lets the plugin use
-both reviewed fixes immediately while the upstream pull requests remain open.
-If canonical upstream later contains both changes, a separate tested
-dependency update can replace this archive.
+`29d97fb93c7998c97be0da8f19b90c6523f9d1e9`. The composite contains the commit
+that was proposed as PR 136 before that PR merged upstream, plus the
+still-noncanonical PR 137 commit. It is not equivalent to the current tip of
+the merged PR 136 branch. A separate tested dependency update can replace this
+archive with an immutable canonical revision or release that proves both
+required contracts. Publishing to PyPI still requires a suitable release
+because PyPI rejects direct URL dependencies.
 
 The lockfile enforces the archive digest during installation; uv may omit that
 digest from the installed PEP 610 metadata, so verification requires the exact
@@ -159,7 +167,11 @@ rebuild do not install this direct URL automatically. Re-run the exact
 `uv pip install` and provenance verification commands above after any of those
 operations, then restart the gateway.
 
-To roll the engine back to the published upstream release:
+The published upstream `cashew-brain==1.2.1` release predates the selected
+composite and does not provide its PR 136/137 contracts. Installing it is an
+unsupported diagnostic rollback: the provenance verifier will reject it and
+sleep, embedding, and resource-safety behavior must be revalidated before use.
+If that diagnostic rollback is necessary:
 
 ```bash
 uv pip install \
@@ -176,16 +188,17 @@ provenance verification commands.
 
 hermes-cashew works out of the box — all 17 persisted configuration fields have
 sane defaults and are backed by current runtime behavior. On first agent
-startup, the plugin creates `~/.hermes/cashew.json` with the full default
+startup, the plugin creates `cashew.json` in the active Hermes home with the full default
 configuration. It never edits Hermes `config.yaml`; until an auxiliary role is
 explicitly configured there, extraction remains heuristic-only.
 
-Edit `~/.hermes/cashew.json` only if you want to override specific defaults.
-The file is never overwritten once it exists:
+Edit `cashew.json` under the active Hermes home only if you want to override specific defaults.
+Automatic startup does not overwrite an existing file; an explicit
+`hermes memory setup` save can update and normalize it:
 
 ```bash
 # Optional: override individual defaults
-cat > ~/.hermes/cashew.json << 'EOF'
+cat > "${HERMES_HOME:-$HOME/.hermes}/cashew.json" << 'EOF'
 {
   "recall_k": 10,
   "think_interval": 15,
@@ -226,7 +239,7 @@ EOF
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `sleep_cycles` | `true` | Enable the refactored sleep cycle (cross-linking, dedup, GC, dreams) |
+| `sleep_cycles` | `true` | Enable the upstream Cashew sleep cycle through the Hermes adapter (cross-linking, dedup, GC, dreams) |
 | `sleep_schedule` | `"every 12h"` | Cron schedule for sleep cycle |
 | `sleep_max_nodes` | `2000` | Max nodes per sleep cycle tick |
 | `think_cycles` | `true` | Enable periodic insight generation (think cycle) |
@@ -512,11 +525,10 @@ descriptor automatically. Do not delete an old lock file to recover a cycle:
 unlinking it can let a second pathname refer to a different inode while the
 original process still holds the lock.
 
-When an API caller enables ``background_dream=True``, the returned cycle
-summary records ``dream_pending`` and the daemon uses its own connection; it is
-not guarded by the synchronous maintenance lock. This advisory lock is not a complete
-shared-brain writer-coordination policy; broader coordination is tracked in
-[#191](https://github.com/magnus919/hermes-cashew/issues/191).
+The Hermes adapter rejects ``background_dream=True`` with
+``background_dream_unsupported``. Supported cron runs pass ``false``, so the
+adapter keeps the entire accepted cycle inside the synchronous maintenance-lock
+scope.
 
 ### Config reference
 
@@ -532,7 +544,9 @@ standard dependency. If your platform doesn't support sqlite-vec's native extens
 the plugin degrades gracefully to keyword-based retrieval — still functional,
 but less precise.
 
-sqlite-vec is a standard dependency and will always be loaded at startup.
+sqlite-vec is a standard dependency, but loading its native extension can fail.
+Startup then records degraded vector availability and retains keyword + BFS
+retrieval.
 
 ## Uninstall
 
@@ -545,7 +559,8 @@ matches that Hermes profile. Afterwards use the host-supported removal flow:
 ```bash
 hermes plugins remove cashew
 hermes config set memory.provider built-in   # revert to built-in memory
-rm -rf ~/.hermes/cashew   # optional: remove the local graph data
+# Irreversible: back up first, then optionally remove the local graph data.
+rm -rf "${HERMES_HOME:-$HOME/.hermes}/cashew"
 ```
 
 ## Troubleshooting
@@ -565,7 +580,7 @@ rm -rf ~/.hermes/cashew   # optional: remove the local graph data
 2. **Stale pycache or entry point not registered** — If cashew-brain is installed
    but the plugin still shows NOT installed:
    ```bash
-   cd ~/.hermes/plugins/cashew && \
+   cd "${HERMES_HOME:-$HOME/.hermes}/plugins/cashew" && \
      ~/.hermes/hermes-agent/venv/bin/python3 -m pip install -e .
    hermes gateway restart
    ```

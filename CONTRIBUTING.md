@@ -106,7 +106,10 @@ Key architectural points:
   adapter safeguard until the upstream replacement is merged, pinned where
   required, and covered at the runtime boundary.
 - **Threading**: `sync_turn()` enqueues onto `queue.Queue(maxsize=16)` drained by a single **daemon** worker thread. Shutdown rejects new producers, drains accepted turns ahead of `_SHUTDOWN = object()`, and defers cleanup if its bounded join times out.
-- **Silent degrade**: all Cashew failures log `WARNING` with `exc_info=True` and return neutral values — never raise into Hermes.
+- **Failure isolation**: callback and tool boundaries never raise Cashew
+  failures into Hermes. Preserve structured degraded, failed, or uncertain
+  results for health, integrity, and operator actions rather than converting
+  every failure to an empty value.
 
 ## How to Contribute
 

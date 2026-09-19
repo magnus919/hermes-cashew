@@ -87,6 +87,38 @@ upstream once a released and tested contract exists. Every retirement below
 requires a regression test at the real boundary and a rollback path before the
 local safeguard changes.
 
+The module split makes that ownership concrete:
+
+| Module | Owner and reason |
+| --- | --- |
+| [`sleep_adapter.py`](../plugins/memory/cashew/sleep_adapter.py) | Hermes coordination: profile admission, maintenance lease, journal policy, and embedding-worker handoff around upstream `core.sleep`. |
+| [`embedding_compat.py`](../plugins/memory/cashew/embedding_compat.py) | Pinned compatibility boundary: generation-scoped service/cache facades and the explicit upstream singleton assignments listed below. |
+| [`config.py`](../plugins/memory/cashew/config.py) and [`tools.py`](../plugins/memory/cashew/tools.py) | Hermes configuration, auxiliary-role resolution, and tool envelopes. |
+| [`__init__.py`](../plugins/memory/cashew/__init__.py) | Provider lifecycle and delegation orchestration; retrieval, schema, extraction, and consolidation algorithms remain upstream-owned. |
+
+## Private upstream seam inventory
+
+A repository-wide census of private upstream attribute access and private
+imports found the following retained seams. `embedding_compat.py` exports
+`UPSTREAM_COMPATIBILITY_SHIMS`, covering
+`core.config.config.embedding_model`,
+`core.embedding_service._default_service`, and
+`core.embedding_service._KNOWN_DIMS[model]`. The pre-compress hook also calls
+`core.session._create_node` and `core.session._set_node_tags` because the pinned
+source has no public write-and-tag API. The matrix below links their provenance,
+regression coverage, and retirement conditions.
+
+The packaged, opt-in [`sleep_benchmark.py`](../plugins/memory/cashew/sleep_benchmark.py)
+temporarily instruments upstream `_find_pairs`, `_batch_cross_links`,
+`_run_dedup`, `_compute_metrics`, `_garbage_collect`, `_evaluate_permanence`,
+`_promote_core_memories`, and `_embed_orphans` to report phase timing. Those
+private seams are diagnostic-only: the runtime
+[`sleep_adapter.py`](../plugins/memory/cashew/sleep_adapter.py) calls the public
+`core.sleep.run_sleep_cycle` API. The benchmark contract is covered by
+[`test_sleep_benchmark.py`](../tests/test_sleep_benchmark.py); retire or revise
+its instrumentation when a pinned upstream change renames those phases or
+provides a public timing hook.
+
 ## Workaround and compatibility inventory
 
 The status is deliberately conservative. “Retain” means the current behavior
@@ -94,12 +126,13 @@ stays in place while a replacement is proved. “Replace” means an upstream
 replacement is the intended destination, not that this issue implements it.
 “Remove” is reserved for duplicate behavior with a verified owner.
 
-Update (2026-09-13, after merged #244/#245/#241): consolidation runs through
+Update (2026-09-18, after merged #244/#245/#241): consolidation runs through
 the pinned upstream `core.sleep` pipeline via
-[sleep_adapter.py](../plugins/memory/cashew/sleep_adapter.py), and
-`sleep_refactor.py` remains only as a transition shim for the historical
-import path. Read-only integrity inspection with explicitly confirmed repair
-delegation is merged ([PR #241](https://github.com/magnus919/hermes-cashew/pull/241)).
+[sleep_adapter.py](../plugins/memory/cashew/sleep_adapter.py). A full tracked-file
+and import census found no supported caller of the historical `sleep_refactor`
+path, so #208 removed that transition shim. Read-only integrity inspection with
+explicitly confirmed repair delegation is merged
+([PR #241](https://github.com/magnus919/hermes-cashew/pull/241)).
 Rows below are updated where that changes their status; historical evidence
 references are unchanged.
 
@@ -107,7 +140,7 @@ references are unchanged.
 | --- | --- | --- | --- |
 | [`embedding_compat.py`](../plugins/memory/cashew/embedding_compat.py) and provider binding | The released Cashew 1.2.1 artifact exposes model-name and dimension globals but no supported provider device injection. The adapter must select the configured model, force safe CPU fallback, and prevent one Hermes profile/session from inheriting another's backend state. The historical device/host-crash cause is not recovered; the protection is observable in the compatibility module and its tests. | The selected source still constructs `SentenceTransformer` without a device parameter; commit `394d6cffe308ba106df8db750248f1ff272bb814` only guards daemon dimension mismatch. No replacement contract exists. | **Retain.** The compatibility facade is now isolated by integration responsibility, while the three upstream shim assignments stay in the provider binding path. Replace only after a released upstream model/device contract proves CPU fallback, model dimension, daemon mismatch, and two-profile isolation in tests. Preserve rollback to the patched path. |
 | Embedding-dimension and `vec_embeddings` migration/create in [`__init__.py`](https://github.com/magnus919/hermes-cashew/blob/b14d7b013ac0e95314f78cca6cacfef202a30654/plugins/memory/cashew/__init__.py#L821-L1080) | Older brains can contain the rowid-shaped vec schema or vectors from a previous model dimension. The adapter detects/rebuilds the incompatible virtual table, derives the configured dimension, and falls back when sqlite-vec is unavailable. The original host-crash history is unknown; the old schema failure is documented in the code and commit `43eea9e`. | The selected source creates the current `node_id` vec table and contains dimension/daemon guards (`233b75684025656cde46bf4a2af9bca416ef5145`, `394d6cffe308ba106df8db750248f1ff272bb814`). It does not prove migration of every legacy adapter-created table. | **Retain, then replace migration ownership.** #188 must test old/new schema, mixed dimensions, persistence, and rollback before local migration is removed. The provider's profile path guard and neutral fallback remain Hermes responsibilities. |
-| Local consolidation engine [`sleep_refactor.py`](https://github.com/magnus919/hermes-cashew/blob/b14d7b013ac0e95314f78cca6cacfef202a30654/plugins/memory/cashew/sleep_refactor.py) (candidate discovery, cross-links, connected-component dedup, rewiring, GC, permanence, orphan embedding) | The adapter needed a scheduled, bounded sleep path with edge caps, source filtering, advisory locking, and profile-scoped persistence. The history records the implementation and fixes but does not establish a single original upstream failure for every phase. | The selected source has a substantially hardened and shorter `core/sleep.py` from `c7ddfc670703afd439bc63ab1379afc906230ce3`, followed by permanence, timestamp, embedding, and vector fixes (`550ae97`, `3fe1436`, `15a28a9`, and related commits). It still has a capped pending-batch defect. | **Replaced (merged #245, update 2026-09-13).** The Hermes boundary is now [sleep_adapter.py](../plugins/memory/cashew/sleep_adapter.py) delegating to the pinned upstream `core.sleep.run_sleep_cycle`; `sleep_refactor.py` survives only as a transition shim for the historical import path. The `core.sleep` capped pending-batch defect above remains; #192 safety contracts keep regressing it. |
+| Local consolidation engine [`sleep_refactor.py`](https://github.com/magnus919/hermes-cashew/blob/b14d7b013ac0e95314f78cca6cacfef202a30654/plugins/memory/cashew/sleep_refactor.py) (candidate discovery, cross-links, connected-component dedup, rewiring, GC, permanence, orphan embedding) | The adapter needed a scheduled, bounded sleep path with edge caps, source filtering, advisory locking, and profile-scoped persistence. The history records the implementation and fixes but does not establish a single original upstream failure for every phase. | An earlier candidate added the shorter upstream `core/sleep.py` and later permanence, timestamp, embedding, and vector fixes (`c7ddfc6`, `550ae97`, `3fe1436`, `15a28a9`). Its capped pending-batch defect was subsequently fixed by upstream PR 136 (`ac090ce7`), which is included in the currently selected composite `fcb4919`. | **Removed (merged #245 engine replacement; #208 shim retirement).** [sleep_adapter.py](../plugins/memory/cashew/sleep_adapter.py) remains the Hermes coordination boundary and delegates to `core.sleep.run_sleep_cycle`. The repository-wide census found only the transition module, its compatibility test, documentation, and stale tooling entries; supported cron, benchmark, package, and flat-loader paths already import `sleep_adapter`. The #192 consolidation safety contracts continue to regress the repaired upstream behavior. |
 | Keyword fallback [`_keyword_search`](https://github.com/magnus919/hermes-cashew/blob/b14d7b013ac0e95314f78cca6cacfef202a30654/plugins/memory/cashew/__init__.py#L1900-L1950) and neutral retrieval fallback around [`retrieve_recursive_bfs`](https://github.com/magnus919/hermes-cashew/blob/b14d7b013ac0e95314f78cca6cacfef202a30654/plugins/memory/cashew/__init__.py#L1580-L1810) | Recall must remain usable when sqlite-vec, an embedding model, or an upstream retrieval call is unavailable. The fallback is an availability safeguard, not a second ranking engine. | Upstream retrieval remains the engine owner; upstream does not provide this Hermes failure-isolation contract. | **Retain as adapter responsibility.** #202/#204 must prove truthful status, context correctness, bounded work, and deterministic fallback before any simplification. |
 | Hermes-specific result enrichment and access accounting [`_enrich_results` / `_update_access_metrics`](https://github.com/magnus919/hermes-cashew/blob/b14d7b013ac0e95314f78cca6cacfef202a30654/plugins/memory/cashew/__init__.py#L1081-L1157) | Cashew retrieval returns engine-shaped rows; Hermes needs stable context formatting and profile/session access updates. | No upstream replacement is implied: this is integration behavior. | **Retain.** Keep tests at the provider boundary; do not move it into Cashew engine code. |
 | Direct persistence helpers [`_create_node` and `_set_node_tags`](https://github.com/magnus919/hermes-cashew/blob/b14d7b013ac0e95314f78cca6cacfef202a30654/plugins/memory/cashew/__init__.py#L1388-L1435) | The pre-compress hook needs to persist forest-level insight nodes and tags. These underscore-prefixed Cashew functions are private and can change without compatibility guarantees. | Upstream `core.session` owns the helpers; no public persistence API is present in the tested release. | **Replace when available; retain now.** Require an upstream public write API, tag/embedding regression coverage, and rollback before changing this path. |

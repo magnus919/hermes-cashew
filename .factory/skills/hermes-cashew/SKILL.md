@@ -16,7 +16,7 @@ Thin adapter around upstream [cashew-brain](https://github.com/rajkripal/cashew)
 | `plugins/memory/cashew/__init__.py` | CashewMemoryProvider class + register() entry point |
 | `plugins/memory/cashew/config.py` | CashewConfig dataclass, defaults, load/save, schema |
 | `plugins/memory/cashew/tools.py` | JSON envelope builders for tool call responses |
-| `plugins/memory/cashew/sleep_refactor.py` | Refactored sleep cycle (vectorized, batch-scalable) |
+| `plugins/memory/cashew/sleep_adapter.py` | Hermes coordination boundary for upstream Cashew sleep |
 | `plugins/memory/cashew/sleep_cron_script.py` | Cron script entry point for Hermes scheduler |
 | `plugins/memory/cashew/verify.py` | Verification helpers |
 | `tests/` | pytest suite (236 tests) |

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -12,7 +11,7 @@ import numpy as np
 from core.backup import create_backup
 from core.db import ensure_schema
 
-from plugins.memory.cashew import sleep_adapter, sleep_refactor
+from plugins.memory.cashew import sleep_adapter
 from plugins.memory.cashew.config import resolve_db_path
 from plugins.memory.cashew.locking import try_maintenance_lock
 
@@ -350,22 +349,16 @@ def test_real_vec_rows_survive_upstream_cycle_and_malformed_row_is_ignored(
         ).fetchone()[0] == 8
 
 
-def test_upstream_failure_degrades_silently_and_historical_import_keeps_contract(
+def test_upstream_failure_degrades_silently(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
-    assert sleep_refactor.run_sleep_cycle is sleep_adapter.run_sleep_cycle
-    assert set(inspect.signature(sleep_refactor.run_sleep_cycle).parameters) >= {
-        "db_path",
-        "model_fn",
-        "embedding_client",
-    }
     db_path = _brain(tmp_path)
 
     def fail(**kwargs: Any) -> dict[str, Any]:
         raise RuntimeError("candidate failure")
 
     monkeypatch.setattr(sleep_adapter, "_upstream_run_sleep_cycle", fail)
-    assert sleep_refactor.run_sleep_cycle(str(db_path), model_fn=None) == {}
+    assert sleep_adapter.run_sleep_cycle(str(db_path), model_fn=None) == {}
 
 
 def test_background_dream_is_rejected_until_hermes_can_retain_its_lease(

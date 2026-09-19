@@ -6,6 +6,7 @@ import hashlib
 import json
 import sqlite3
 import struct
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -80,6 +81,7 @@ def test_audit_reports_findings_and_preserves_profile_files(tmp_path: Path) -> N
     conn = sqlite3.connect(path)
     _add_node(conn, "valid")
     _add_node(conn, "missing")
+    _add_node(conn, "bad-dimension")
     _add_node(conn, "permanent-decayed", permanent=1, decayed=1)
     conn.execute(
         "INSERT INTO embeddings VALUES (?, ?, ?, '2026-09-12')",
@@ -88,6 +90,10 @@ def test_audit_reports_findings_and_preserves_profile_files(tmp_path: Path) -> N
     conn.execute(
         "INSERT INTO embeddings VALUES (?, ?, ?, '2026-09-12')",
         ("orphan", struct.pack("<4f", 0.0, 0.0, 0.0, 0.0), "wrong-model"),
+    )
+    conn.execute(
+        "INSERT INTO embeddings VALUES (?, ?, ?, '2026-09-12')",
+        ("bad-dimension", struct.pack("<3f", 1.0, 0.0, 0.0), "model-a"),
     )
     conn.execute(
         "INSERT INTO derivation_edges VALUES ('valid', 'valid', 1.0, 'self', 'now')"
@@ -110,9 +116,10 @@ def test_audit_reports_findings_and_preserves_profile_files(tmp_path: Path) -> N
     assert report["counts"]["orphan_embeddings"] == 1
     assert report["counts"]["nodes_without_embeddings"] == 2
     assert report["reasons"]["embedding_zero_norm"] == 1
+    assert report["reasons"]["embedding_dimension_mismatch"] == 1
     assert report["reasons"]["embedding_model_mismatch"] == 1
     assert report["reasons"]["permanent_and_decayed"] == 1
-    assert report["reasons"]["vec_index_missing"] == 2
+    assert report["reasons"]["vec_index_missing"] == 3
     assert report["reasons"]["orphan_edge"] == 1
     assert report["reasons"]["self_edge"] == 1
     assert report["uncertainty"] == ["historical_consolidation"]
@@ -300,19 +307,28 @@ def test_audit_loaded_vec_parity_is_read_only(tmp_path: Path) -> None:
         "CREATE VIRTUAL TABLE vec_embeddings USING vec0(node_id TEXT PRIMARY KEY, embedding float[4])"
     )
     _add_node(conn, "vec-node")
+    _add_node(conn, "missing-vec")
     blob = struct.pack("<4f", 1.0, 0.0, 0.0, 0.0)
     conn.execute(
         "INSERT INTO embeddings VALUES (?, ?, ?, '2026-09-12')",
         ("vec-node", blob, "model-a"),
     )
+    conn.execute(
+        "INSERT INTO embeddings VALUES (?, ?, ?, '2026-09-12')",
+        ("missing-vec", blob, "model-a"),
+    )
     conn.execute("INSERT INTO vec_embeddings VALUES (?, ?)", ("vec-node", blob))
+    conn.execute("INSERT INTO vec_embeddings VALUES (?, ?)", ("stale-vec", blob))
     conn.commit()
     conn.close()
     before = _snapshot(path)
     report = audit_integrity(path)
     assert report["vector_index"]["available"] is True
-    assert report["vector_index"]["entries"] == 1
-    assert "vec_entry_missing" not in report["reasons"]
+    assert report["vector_index"]["entries"] == 2
+    assert report["vector_index"]["missing_entries"] == 1
+    assert report["vector_index"]["stale_entries"] == 1
+    assert report["reasons"]["vec_entry_missing"] == 1
+    assert report["reasons"]["vec_entry_stale"] == 1
     assert _snapshot(path) == before
 
 
@@ -549,29 +565,25 @@ def test_audit_rejects_incomplete_schema_without_mutating(tmp_path: Path) -> Non
     assert "schema_table_missing" in report["reasons"]
 
 
-def test_apply_requires_caller_connection_and_does_not_open_database(
-    tmp_path: Path, monkeypatch
+def test_apply_rejects_missing_profile_without_creating_database(
+    tmp_path: Path,
 ) -> None:
     path = tmp_path / "does-not-exist.db"
-
-    def fail_connect(*args, **kwargs):
-        raise AssertionError(
-            "apply must not open a profile before stable repair exists"
-        )
-
-    monkeypatch.setattr(sqlite3, "connect", fail_connect)
     report = apply_integrity_repairs(
         path, confirm=True, backup_dir=tmp_path / "backups"
     )
 
     assert report == {
         "schema_version": 1,
-        "status": "rejected",
+        "status": "unavailable",
         "mutated": False,
         "confirmed": True,
-        "reason": "caller_connection_required",
+        "committed": False,
+        "rolled_back": False,
+        "reason": "profile_not_found",
     }
     assert not path.exists()
+    assert not (tmp_path / "backups").exists()
 
 
 def test_path_apply_without_confirmation_is_rejected_before_opening_database(
@@ -615,3 +627,325 @@ def test_apply_with_caller_connection_fails_closed_without_upstream_api(
     assert conn.in_transaction
     conn.rollback()
     conn.close()
+
+
+def test_operator_apply_is_backed_up_verified_and_repeatable(tmp_path: Path) -> None:
+    path = tmp_path / "brain.db"
+    _create_profile(path)
+    with sqlite3.connect(path) as conn:
+        _add_node(conn, "live")
+        conn.execute(
+            "INSERT INTO embeddings VALUES (?, ?, ?, 'now')",
+            ("live", struct.pack("<4f", 1.0, 0.0, 0.0, 0.0), "model-a"),
+        )
+        conn.execute(
+            "INSERT INTO embeddings VALUES (?, ?, ?, 'now')",
+            ("ghost", struct.pack("<4f", 1.0, 0.0, 0.0, 0.0), "model-a"),
+        )
+
+    first = apply_integrity_repairs(
+        path,
+        confirm=True,
+        actions={"remove_orphan_embeddings"},
+        require_vec_parity=False,
+    )
+
+    assert first["status"] == "completed"
+    assert first["committed"] is True
+    assert first["rolled_back"] is False
+    assert first["repairs"]["orphan_embeddings_removed"] == 1
+    assert first["backup"]["verified"] is True
+    backup = Path(first["backup"]["path"])
+    assert backup.parent == tmp_path / "backups"
+    assert backup.stat().st_mode & 0o777 == 0o600
+    with sqlite3.connect(backup) as saved:
+        assert saved.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert saved.execute(
+            "SELECT COUNT(*) FROM embeddings WHERE node_id='ghost'"
+        ).fetchone() == (1,)
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM embeddings WHERE node_id='ghost'"
+        ).fetchone() == (0,)
+
+    second = apply_integrity_repairs(
+        path,
+        confirm=True,
+        actions={"remove_orphan_embeddings"},
+        require_vec_parity=False,
+    )
+
+    assert second["status"] == "completed"
+    assert second["committed"] is True
+    assert second["repairs"]["orphan_embeddings_removed"] == 0
+    assert Path(second["backup"]["path"]) != backup
+
+
+def test_operator_apply_rolls_back_mid_repair_failure_and_keeps_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "brain.db"
+    _create_profile(path)
+    with sqlite3.connect(path) as conn:
+        _add_node(conn, "kept")
+        conn.execute(
+            "INSERT INTO embeddings VALUES (?, ?, ?, 'now')",
+            ("ghost", struct.pack("<4f", 1.0, 0.0, 0.0, 0.0), "model-a"),
+        )
+
+    def inspect_ok(_conn, **_kwargs):
+        return {"status": "ok", "counts": {}}
+
+    def fail_after_write(conn, **_kwargs):
+        conn.execute("DELETE FROM embeddings WHERE node_id='ghost'")
+        raise sqlite3.OperationalError("injected failure")
+
+    monkeypatch.setattr(
+        integrity, "_upstream_integrity_api", lambda: (inspect_ok, fail_after_write)
+    )
+
+    report = apply_integrity_repairs(path, confirm=True)
+
+    assert report["status"] == "unavailable"
+    assert report["committed"] is False
+    assert report["rolled_back"] is True
+    assert report["reason"] == "upstream_integrity_repair_failed"
+    backup = Path(report["backup"]["path"])
+    assert backup.is_file()
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM embeddings WHERE node_id='ghost'"
+        ).fetchone() == (1,)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM thought_nodes WHERE id='kept'"
+        ).fetchone() == (1,)
+
+
+def test_operator_apply_excludes_concurrent_sqlite_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "brain.db"
+    _create_profile(path)
+    observed: list[str] = []
+
+    def inspect_ok(_conn, **_kwargs):
+        return {"status": "ok", "counts": {}}
+
+    def probe_writer(_conn, **_kwargs):
+        def compete() -> None:
+            contender = sqlite3.connect(path, timeout=0)
+            try:
+                contender.execute(
+                    "INSERT INTO hermes_provider_meta VALUES ('contender', '1')"
+                )
+                contender.commit()
+                observed.append("committed")
+            except sqlite3.OperationalError:
+                observed.append("locked")
+            finally:
+                contender.close()
+
+        thread = threading.Thread(target=compete)
+        thread.start()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        return {
+            "status": "completed",
+            "mutated": False,
+            "repairs": {},
+            "remaining": {},
+        }
+
+    monkeypatch.setattr(
+        integrity, "_upstream_integrity_api", lambda: (inspect_ok, probe_writer)
+    )
+
+    report = apply_integrity_repairs(path, confirm=True)
+
+    assert report["status"] == "completed"
+    assert report["committed"] is True
+    assert observed == ["locked"]
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM hermes_provider_meta WHERE key='contender'"
+        ).fetchone() == (0,)
+
+
+def test_operator_cli_runs_confirmed_workflow_and_returns_success(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "brain.db"
+    _create_profile(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO embeddings VALUES (?, ?, ?, 'now')",
+            ("ghost", struct.pack("<4f", 1.0, 0.0, 0.0, 0.0), "model-a"),
+        )
+
+    exit_code = integrity._main(
+        [
+            "--apply",
+            "--confirm",
+            "--action",
+            "remove_orphan_embeddings",
+            str(path),
+        ]
+    )
+
+    report = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert report["status"] == "completed"
+    assert report["committed"] is True
+    assert Path(report["backup"]["path"]).is_file()
+
+
+@pytest.mark.parametrize("deadline", [-1.0, float("inf"), float("nan")])
+def test_operator_apply_rejects_invalid_deadline_before_opening_profile(
+    tmp_path: Path, deadline: float
+) -> None:
+    report = apply_integrity_repairs(
+        tmp_path / "missing.db", confirm=True, deadline_seconds=deadline
+    )
+
+    assert report["reason"] == "invalid_deadline"
+    assert report["committed"] is False
+    assert not (tmp_path / "missing.db").exists()
+
+
+def test_operator_apply_rolls_back_when_declared_repair_fails_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "brain.db"
+    _create_profile(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO embeddings VALUES (?, ?, ?, 'now')",
+            ("ghost", struct.pack("<4f", 1.0, 0.0, 0.0, 0.0), "model-a"),
+        )
+
+    def inspect_mismatch(_conn, **_kwargs):
+        return {"status": "findings", "counts": {"orphan_embeddings": 1}}
+
+    def lie_about_repair(conn, **_kwargs):
+        conn.execute("DELETE FROM embeddings WHERE node_id='ghost'")
+        return {
+            "status": "completed",
+            "mutated": True,
+            "repairs": {"orphan_embeddings_removed": 1},
+            "remaining": {},
+        }
+
+    monkeypatch.setattr(
+        integrity,
+        "_upstream_integrity_api",
+        lambda: (inspect_mismatch, lie_about_repair),
+    )
+
+    report = apply_integrity_repairs(
+        path,
+        confirm=True,
+        actions={"remove_orphan_embeddings"},
+        require_vec_parity=False,
+    )
+
+    assert report["reason"] == "precommit_verification_failed"
+    assert report["rolled_back"] is True
+    assert report["committed"] is False
+    assert report["mutated"] is False
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM embeddings WHERE node_id='ghost'"
+        ).fetchone() == (1,)
+
+
+def test_postcommit_verification_failure_reports_durable_uncertain_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "brain.db"
+    _create_profile(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO embeddings VALUES (?, ?, ?, 'now')",
+            ("ghost", struct.pack("<4f", 1.0, 0.0, 0.0, 0.0), "model-a"),
+        )
+    inspections = iter(
+        [
+            {"status": "ok", "counts": {}},
+            {"status": "findings", "counts": {"orphan_embeddings": 1}},
+        ]
+    )
+
+    def inspect_sequence(_conn, **_kwargs):
+        return next(inspections)
+
+    def remove_ghost(conn, **_kwargs):
+        conn.execute("DELETE FROM embeddings WHERE node_id='ghost'")
+        return {
+            "status": "completed",
+            "mutated": True,
+            "repairs": {"orphan_embeddings_removed": 1},
+            "remaining": {},
+        }
+
+    monkeypatch.setattr(
+        integrity, "_upstream_integrity_api", lambda: (inspect_sequence, remove_ghost)
+    )
+
+    report = apply_integrity_repairs(
+        path,
+        confirm=True,
+        actions={"remove_orphan_embeddings"},
+        require_vec_parity=False,
+    )
+
+    assert report["reason"] == "postcommit_verification_failed"
+    assert report["committed"] is True
+    assert report["mutated"] is True
+    assert report["mutation_uncertain"] is True
+    assert report["recovery_required"] is True
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM embeddings WHERE node_id='ghost'"
+        ).fetchone() == (0,)
+
+
+def test_commit_exception_after_durable_commit_reports_unknown_commit_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "brain.db"
+    _create_profile(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO embeddings VALUES (?, ?, ?, 'now')",
+            ("ghost", struct.pack("<4f", 1.0, 0.0, 0.0, 0.0), "model-a"),
+        )
+    real_connect = sqlite3.connect
+
+    class CommitThenRaise(sqlite3.Connection):
+        def commit(self) -> None:
+            super().commit()
+            raise sqlite3.OperationalError("commit result unavailable")
+
+    def selected_connect(database, *args, **kwargs):
+        if str(database) == str(path) and not kwargs.get("uri"):
+            kwargs["factory"] = CommitThenRaise
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(integrity.sqlite3, "connect", selected_connect)
+
+    report = apply_integrity_repairs(
+        path,
+        confirm=True,
+        actions={"remove_orphan_embeddings"},
+        require_vec_parity=False,
+    )
+
+    assert report["reason"] == "operator_repair_failed"
+    assert report["committed"] is None
+    assert report["rolled_back"] is False
+    assert report["mutation_uncertain"] is True
+    assert report["recovery_required"] is True
+    with real_connect(path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM embeddings WHERE node_id='ghost'"
+        ).fetchone() == (0,)

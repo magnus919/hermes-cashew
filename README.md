@@ -29,23 +29,42 @@ effect. Reports include only bounded counts and reason codes; historical merge
 intent remains an explicit manual-review item because it cannot be reconstructed
 from the stored graph safely.
 
-The explicit operator apply surface is connection-owned and remains fail-closed
-for path-only CLI calls:
+The explicit operator apply surface is opt-in and backup-backed:
 
 ```bash
 python -m plugins.memory.cashew.integrity --apply --confirm /path/to/brain.db
 ```
 
-It returns a structured `caller_connection_required` result and does not open
-or create the profile. The selected immutable Cashew composite provides the
-connection-aware API: callers may use `inspect_integrity(conn, ...)` and, only
-after an explicit `confirm=True`,
-`apply_integrity_repairs(conn=conn, ...)`. The caller must provide an open
-connection inside its outer transaction and owns backup, locking, commit,
-post-repair inspection, rollback, and close. The adapter never opens a path,
-touches `HOME`, changes journal mode, or repairs automatically. Older Cashew
-installations without the API remain fail-closed. Do not use broad sleep or
-whole-database re-embedding as an integrity repair substitute.
+The command takes the canonical exclusive maintenance lease, reads the stored
+model identity, writes and verifies a SQLite backup under the profile's
+`backups/` directory, starts a write-excluding transaction, delegates bounded
+repairs to Cashew, verifies the result before and after commit, and reports the
+backup path. A failure before commit rolls back the repair transaction while
+retaining the backup. Missing profiles, missing model identity, incompatible
+requested identity, unavailable upstream APIs, and lock/backup failures all
+fail closed. The workflow does not touch `HOME` or change journal mode.
+It preserves the maintenance epoch and does not lock or invalidate the separate
+embedding cache: targeted repairs preserve the stored model identity, and that
+cache maps content to same-model vectors rather than graph rows. A future repair
+that changes model identity must use the existing graph-to-cache migration
+boundary instead of this workflow.
+
+By default Cashew attempts its information-preserving repairs. Operators can
+restrict the work by repeating `--action`; use `--max-items` and `--batch-size`
+to bound a run. Contradictory permanence state remains report-only unless
+`--permanence-policy preserve_permanent` or `preserve_decay` is chosen
+explicitly. Missing or invalid embeddings require a compatible embedding
+callable through the Python API; the CLI does not construct one or perform
+blanket re-embedding.
+
+The selected immutable Cashew composite also provides the connection-owned API
+for applications that already own the full maintenance boundary. Such callers
+may use `inspect_integrity(conn, ...)` and, only after `confirm=True`,
+`apply_integrity_repairs(conn=conn, ...)`; they retain ownership of backup,
+locking, transaction, commit, rollback, verification, and close. Older Cashew
+installations without the API remain fail-closed. Neither mode reconstructs
+merged facts or restores decayed nodes automatically; retain the original
+database and generated backups for manual review.
 
 ## Prerequisites
 

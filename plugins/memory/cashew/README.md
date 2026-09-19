@@ -2,6 +2,9 @@
 
 Persistent thought-graph memory for Hermes Agent, backed by [cashew-brain](https://github.com/rajkripal/cashew).
 
+For runtime readiness, bounded queue loss, concurrent-session contention, and
+crash-containment limits, see the [operator guidance](../../../README.md#runtime-health-and-concurrent-sessions).
+
 ## Quick Start
 
 ```bash

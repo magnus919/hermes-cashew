@@ -281,7 +281,49 @@ hermes gateway restart   # ensure gateway picks up the new plugin
 hermes memory status
 ```
 
-Expected output shows `Provider: cashew` with `Plugin: installed` and `Status: available`.
+The host can show `Provider: cashew`, `Plugin: installed`, and
+`Status: available`. Those discovery results do not prove that a turn was
+persisted or that semantic retrieval is ready. Availability is a cheap check of
+configuration/dependencies; it does not open or repair the brain.
+
+### Runtime health and concurrent sessions
+
+The provider's read-only `health_status()` diagnostic distinguishes runtime
+readiness from discovery. It returns state, reason codes, fallback/cron status,
+and bounded outcome counts without querying the database or loading a model.
+Host versions differ in which diagnostics they display; do not interpret a
+successful `hermes memory status` command as a full integrity check.
+
+- **Ready** means initialization established the active runtime. It does not
+  guarantee that every future extraction succeeds.
+- **Degraded** means a capability is unavailable. Check the reported reason and
+  fallback: keyword recall may remain usable while semantic retrieval or writes
+  are disabled. A missing configured auxiliary model can leave heuristic
+  extraction available.
+- **Failed, stopping, or stopped** require attention to the reported lifecycle
+  state; installed files alone do not establish an active worker.
+
+Concurrent sessions coordinate access to the same profile through advisory
+leases. Contended maintenance can skip a cycle, and writer admission can time
+out. A lock warning is a reason to inspect competing sessions and maintenance,
+not to delete lock files or the SQLite journal. Stop competing processes before
+intentional model migration. These protections apply to participating clients;
+an unrelated program writing the database directly can bypass them.
+
+`sync_turn` enqueues work and returns promptly; returning does not acknowledge
+persistence. The queue holds at most 16 pending turns. When full, the oldest
+pending turn is dropped with a warning to admit the newest; a remaining full
+queue rejects the new turn. Shutdown rejects new work and gives accepted work a
+bounded drain interval. The queue is in memory, so process termination can lose
+pending turns. Outcome diagnostics distinguish accepted work, drops, and write
+results; investigate warnings before assuming the conversation was stored.
+
+Embedding model execution is isolated in a child process, but SQLite,
+sqlite-vec, graph operations, and auxiliary calls still run in the host process.
+The isolation does not make Hermes immune to every native crash or external
+termination. The original reported crash had no retained traceback establishing
+its cause; the regression tests prove specific failure boundaries, not a
+retrospective diagnosis.
 
 ## How It Works
 

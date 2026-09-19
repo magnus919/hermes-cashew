@@ -121,16 +121,16 @@ def test_sync_turn_fast_on_empty_queue(tmp_path, monkeypatch):
 @pytest.mark.skipif(
     not os.environ.get("CI_STRICT_TIMING"),
     reason=(
-        "strict 15ms bound; opt-in via CI_STRICT_TIMING=1 env var. "
+        "strict 10ms bound; opt-in via CI_STRICT_TIMING=1 env var. "
         "The lenient 50ms test (test_sync_turn_fast_on_empty_queue) "
         "always runs and catches blocking-put regressions."
     ),
 )
-def test_sync_turn_empty_queue_strict_15ms(tmp_path, monkeypatch):
-    """Enforces the ROADMAP's 10ms success criterion with 5ms headroom.
+def test_sync_turn_empty_queue_strict_10ms(tmp_path, monkeypatch):
+    """Enforces the ROADMAP's 10ms success criterion.
 
     Under ideal conditions (empty queue, mocked worker that consumes
-    instantly), a single sync_turn() must return in under 15ms. This
+    instantly), a single sync_turn() must return in under 10ms. This
     is the strict interpretation; the 50ms lenient test catches the
     100x blocking-put regression without being flake-prone.
 
@@ -146,8 +146,8 @@ def test_sync_turn_empty_queue_strict_15ms(tmp_path, monkeypatch):
         start = time.monotonic()
         p.sync_turn("u", "a")
         elapsed = time.monotonic() - start
-        assert elapsed < 0.015, (
-            f"sync_turn blocked for {elapsed * 1000:.1f}ms; strict bound 15ms"
+        assert elapsed < 0.010, (
+            f"sync_turn blocked for {elapsed * 1000:.1f}ms; strict bound 10ms"
         )
     finally:
         p.shutdown()

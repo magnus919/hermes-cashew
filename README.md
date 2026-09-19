@@ -100,7 +100,9 @@ This archive is an immutable composite fork of upstream Cashew. It combines PR
 that was proposed as PR 136 before that PR merged upstream, plus the
 still-noncanonical PR 137 commit. It is not equivalent to the current tip of
 the merged PR 136 branch. A separate tested dependency update can replace this
-archive once a canonical release contains both required contracts.
+archive with an immutable canonical revision or release that proves both
+required contracts. Publishing to PyPI still requires a suitable release
+because PyPI rejects direct URL dependencies.
 
 The lockfile enforces the archive digest during installation; uv may omit that
 digest from the installed PEP 610 metadata, so verification requires the exact

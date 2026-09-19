@@ -119,7 +119,7 @@ done
   v1 migration uses `ALTER TABLE ... DROP COLUMN`. The PyPI `1.2.1` artifact
   has the same requirement even though its package metadata does not declare
   it. This minimum does not establish safety from the separate SQLite WAL-reset
-  issue tracked by #191.
+  WAL-reset safety requirement.
 - **sqlite-vec** enables vector similarity search. It's a standard dependency
   (not optional) — the plugin requires it. If your platform doesn't support
   sqlite-vec's native extension, the plugin degrades gracefully to keyword + BFS
@@ -133,16 +133,17 @@ done
 
 ### Reconciliation status
 
-Tracked replacement work has landed incrementally. Verify on `main` before
-relying on any claim below:
+Verify these ownership claims against the current checkout before relying on
+them:
 
 - Upstream sleep delegation, safe cron reconciliation, and consolidation
-  bounding (#193, #203, #205) are merged to `main`. The local consolidation
+  bounding are implemented. The local consolidation
   engine and its obsolete `sleep_refactor.py` transition shim are gone;
   [sleep_adapter.py](plugins/memory/cashew/sleep_adapter.py) is the Hermes
   boundary for the pinned upstream `core.sleep.run_sleep_cycle`.
-- Read-only integrity inspection uses explicitly confirmed upstream repair
-  delegation with backup, postcondition verification, and rollback reporting.
+- Read-only integrity inspection reports diagnostics without mutation.
+  Separately, repair is opt-in and delegates upstream only after confirmation,
+  with backup, postcondition verification, and rollback reporting.
 - The bounded structural cleanup removed the obsolete sleep transition shim;
   supported callers use `sleep_adapter.py`.
 

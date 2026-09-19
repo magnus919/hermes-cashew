@@ -79,10 +79,15 @@ database and generated backups for manual review.
 hermes plugins install magnus919/hermes-cashew
 ```
 
-This clones the repository to `~/.hermes/plugins/cashew/` and registers the
+This clones the repository to the active Hermes home under `plugins/cashew/`
+(default: `~/.hermes/plugins/cashew/`) and registers the
 plugin entry point. This interim source baseline uses a direct URL that the
 current Hermes dependency installer intentionally rejects. Install the exact
 source archive into the Hermes environment before setup:
+
+The interpreter examples below assume the default Hermes installation. If your
+Hermes environment is installed elsewhere, substitute its Python executable.
+Profile files use `HERMES_HOME`, falling back to `$HOME/.hermes`.
 
 ```bash
 CASHEW_PIN='cashew-brain @ https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz#sha256=23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3'
@@ -90,7 +95,7 @@ uv pip install \
   --python ~/.hermes/hermes-agent/venv/bin/python3 \
   --reinstall "$CASHEW_PIN" sqlite-vec
 ~/.hermes/hermes-agent/venv/bin/python3 \
-  ~/.hermes/plugins/cashew/scripts/verify-cashew-baseline.py
+  "${HERMES_HOME:-$HOME/.hermes}/plugins/cashew/scripts/verify-cashew-baseline.py"
 ```
 
 This archive is an immutable composite fork of upstream Cashew. It combines PR
@@ -183,17 +188,17 @@ provenance verification commands.
 
 hermes-cashew works out of the box — all 17 persisted configuration fields have
 sane defaults and are backed by current runtime behavior. On first agent
-startup, the plugin creates `~/.hermes/cashew.json` with the full default
+startup, the plugin creates `cashew.json` in the active Hermes home with the full default
 configuration. It never edits Hermes `config.yaml`; until an auxiliary role is
 explicitly configured there, extraction remains heuristic-only.
 
-Edit `~/.hermes/cashew.json` only if you want to override specific defaults.
+Edit `cashew.json` under the active Hermes home only if you want to override specific defaults.
 Automatic startup does not overwrite an existing file; an explicit
 `hermes memory setup` save can update and normalize it:
 
 ```bash
 # Optional: override individual defaults
-cat > ~/.hermes/cashew.json << 'EOF'
+cat > "${HERMES_HOME:-$HOME/.hermes}/cashew.json" << 'EOF'
 {
   "recall_k": 10,
   "think_interval": 15,
@@ -555,7 +560,7 @@ matches that Hermes profile. Afterwards use the host-supported removal flow:
 hermes plugins remove cashew
 hermes config set memory.provider built-in   # revert to built-in memory
 # Irreversible: back up first, then optionally remove the local graph data.
-rm -rf ~/.hermes/cashew
+rm -rf "${HERMES_HOME:-$HOME/.hermes}/cashew"
 ```
 
 ## Troubleshooting
@@ -575,7 +580,7 @@ rm -rf ~/.hermes/cashew
 2. **Stale pycache or entry point not registered** — If cashew-brain is installed
    but the plugin still shows NOT installed:
    ```bash
-   cd ~/.hermes/plugins/cashew && \
+   cd "${HERMES_HOME:-$HOME/.hermes}/plugins/cashew" && \
      ~/.hermes/hermes-agent/venv/bin/python3 -m pip install -e .
    hermes gateway restart
    ```

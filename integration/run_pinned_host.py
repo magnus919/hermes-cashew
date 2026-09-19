@@ -56,7 +56,7 @@ def _parse_cron_result(stdout: str) -> dict[str, Any]:
         raise AssertionError(f"cron script did not produce JSON: {stdout!r}") from exc
     if not isinstance(payload, dict) or not payload:
         raise AssertionError(f"cron script produced an empty/non-object result: {payload!r}")
-    if payload.get("status") not in {"completed", "partial", "unavailable"}:
+    if payload.get("status") not in {"completed", "partial"}:
         raise AssertionError(f"cron script returned an unknown status: {payload!r}")
     if payload.get("nodes_selected", 0) < 1:
         raise AssertionError(f"cron script selected no eligible nodes: {payload!r}")
@@ -227,13 +227,14 @@ def _verify_wheel_package(package: Path, candidate: Path, record_text: str) -> N
         if candidate_path.read_bytes() != installed_path.read_bytes():
             _error(f"installed wheel differs from candidate source: {relative}")
         encoded = record_hashes.get(relative)
-        if encoded:
-            algorithm, expected = encoded.split("=", 1)
-            actual = base64.urlsafe_b64encode(
-                hashlib.new(algorithm, candidate_path.read_bytes()).digest()
-            ).rstrip(b"=").decode("ascii")
-            if actual != expected:
-                _error(f"wheel RECORD hash mismatch: {relative}")
+        if not encoded or "=" not in encoded:
+            _error(f"wheel RECORD hash missing or invalid: {relative}")
+        algorithm, expected = encoded.split("=", 1)
+        actual = base64.urlsafe_b64encode(
+            hashlib.new(algorithm, candidate_path.read_bytes()).digest()
+        ).rstrip(b"=").decode("ascii")
+        if actual != expected:
+            _error(f"wheel RECORD hash mismatch: {relative}")
 
 
 def _make_dev_overlay(
@@ -593,6 +594,11 @@ def _exercise_real_host(mode: str, hermes_source: Path, plugin_source: Path) -> 
         assert metadata.get("embedding_model") == "all-MiniLM-L6-v2", metadata
         assert metadata.get("embedding_dim") == "384", metadata
         assert metadata.get("vec_dim") == "384", metadata
+        with sqlite3.connect(str(provider._db_path)) as connection:
+            assert connection.execute(
+                "SELECT 1 FROM embeddings WHERE node_id = ?",
+                ("integration-node",),
+            ).fetchone() is None, "cron target was embedded before cron execution"
         result = subprocess.run(
             [str(child_python), str(script_path)],
             cwd=temp_root,

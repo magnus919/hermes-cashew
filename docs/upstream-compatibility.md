@@ -106,8 +106,18 @@ imports found the following retained seams. `embedding_compat.py` exports
 `core.embedding_service._KNOWN_DIMS[model]`. The pre-compress hook also calls
 `core.session._create_node` and `core.session._set_node_tags` because the pinned
 source has no public write-and-tag API. The matrix below links their provenance,
-regression coverage, and retirement conditions. No private sleep helper remains
-in the adapter.
+regression coverage, and retirement conditions.
+
+The packaged, opt-in [`sleep_benchmark.py`](../plugins/memory/cashew/sleep_benchmark.py)
+temporarily instruments upstream `_find_pairs`, `_batch_cross_links`,
+`_run_dedup`, `_compute_metrics`, `_garbage_collect`, `_evaluate_permanence`,
+`_promote_core_memories`, and `_embed_orphans` to report phase timing. Those
+private seams are diagnostic-only: the runtime
+[`sleep_adapter.py`](../plugins/memory/cashew/sleep_adapter.py) calls the public
+`core.sleep.run_sleep_cycle` API. The benchmark contract is covered by
+[`test_sleep_benchmark.py`](../tests/test_sleep_benchmark.py); retire or revise
+its instrumentation when a pinned upstream change renames those phases or
+provides a public timing hook.
 
 ## Workaround and compatibility inventory
 

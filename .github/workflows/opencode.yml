@@ -58,7 +58,7 @@ jobs:
       - name: Run opencode
         if: steps.trust.outputs.allowed == 'true'
         # anomalyco/opencode v1.18.29
-        uses: anomalyco/opencode/github@02a167e048d3bd7299225068d79e4fce5c830d67
+        uses: anomalyco/opencode/github@0f3a0c206fd1996430dcef3759fb529f21d27244
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         with:

@@ -1,65 +1,42 @@
 #!/usr/bin/env python3
-"""Verify that cashew-brain is the selected source build, not PyPI 1.2.1."""
+"""Verify the bundled Cashew source and SQLite migration capability."""
 
 from __future__ import annotations
 
-import hashlib
+import argparse
 import importlib.metadata
-import json
+import importlib.util
 import sqlite3
 from contextlib import closing
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
 
-ARCHIVE_URL = (
-    "https://github.com/magnus919/true/archive/"
-    "fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz"
-)
-ARCHIVE_SHA256 = "23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3"
-SESSION_SHA256 = "0ce60cc63adf4fb7136581aee722bb10e9a344e556b6fb98f4d46855d53c36cd"
-INTEGRITY_SHA256 = "80e928c4a073aadb9340095a27b65f03512393d9c1e03cfd025e9aa70d99b9ba"
 MINIMUM_SQLITE = (3, 35, 0)
 
 
 def main() -> None:
-    distribution = importlib.metadata.distribution("cashew-brain")
-    direct_url_text = distribution.read_text("direct_url.json")
-    if direct_url_text is None:
-        raise SystemExit(
-            "cashew-brain has no direct_url.json; version 1.2.1 does not prove "
-            "the selected source is installed"
-        )
-    direct_url = json.loads(direct_url_text)
-    actual_url = direct_url["url"]
-    if urlunsplit(urlsplit(actual_url)._replace(fragment="")) != ARCHIVE_URL:
-        raise SystemExit(f"unexpected cashew-brain source: {actual_url}")
-    expected_hash = f"sha256={ARCHIVE_SHA256}"
-    url_hash = urlsplit(actual_url).fragment
-    archive_hash = direct_url.get("archive_info", {}).get("hash", "")
-    if url_hash or archive_hash:
-        if expected_hash not in (url_hash, archive_hash):
-            raise SystemExit(
-                f"unexpected cashew-brain archive hash: {url_hash or archive_hash}; "
-                f"expected {expected_hash}"
-            )
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--installed",
+        action="store_true",
+        help="audit the installed wheel/sdist rather than the adjacent flat source",
+    )
+    args = parser.parse_args()
+    if args.installed:
+        distribution = importlib.metadata.distribution("hermes-cashew")
+        vendor = Path(distribution.locate_file("plugins/memory/cashew/_vendor"))
+    else:
+        vendor = Path(__file__).resolve().parents[1] / "plugins/memory/cashew/_vendor"
+    print(f"auditing bundled source: {vendor}")
 
-    session_path = Path(distribution.locate_file("core/session.py"))
-    actual_hash = hashlib.sha256(session_path.read_bytes()).hexdigest()
-    if actual_hash != SESSION_SHA256:
-        raise SystemExit(
-            f"unexpected core/session.py SHA-256: {actual_hash}; "
-            f"expected {SESSION_SHA256}"
-        )
-    integrity_path = Path(distribution.locate_file("core/integrity.py"))
-    actual_integrity_hash = hashlib.sha256(integrity_path.read_bytes()).hexdigest()
-    if actual_integrity_hash != INTEGRITY_SHA256:
-        raise SystemExit(
-            f"unexpected core/integrity.py SHA-256: {actual_integrity_hash}; "
-            f"expected {INTEGRITY_SHA256}"
-        )
-    print(f"cashew-brain source verified: {actual_url}")
-    print(f"core/session.py SHA-256: {actual_hash}")
-    print(f"core/integrity.py SHA-256: {actual_integrity_hash}")
+    spec = importlib.util.spec_from_file_location(
+        "_cashew_provenance", vendor / "verify.py"
+    )
+    assert spec is not None and spec.loader is not None
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    manifest = verifier.verify(vendor)
+    print(f"bundled Cashew source verified: {manifest['commit']}")
+    print(f"upstream archive SHA-256: {manifest['archive_sha256']}")
 
     with closing(sqlite3.connect(":memory:")) as connection:
         source_id = connection.execute("SELECT sqlite_source_id()").fetchone()[0]

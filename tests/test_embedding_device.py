@@ -42,7 +42,10 @@ def test_normalize_embedding_device_defaults_to_cpu() -> None:
 def test_embedding_configuration_routes_upstream_without_parent_fallback(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import core.embedding_service
+    from plugins.memory.cashew._vendor import core
+    from plugins.memory.cashew._vendor.core import (
+        embedding_service as _vendor_embedding_service,  # noqa: F401
+    )
 
     class FakeSupervisor:
         dimension = 1024
@@ -89,7 +92,10 @@ def test_embedding_configuration_routes_upstream_without_parent_fallback(
 def test_upstream_cache_miss_uses_child_and_cache_hit_does_not(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import core.embedding_service
+    from plugins.memory.cashew._vendor import core
+    from plugins.memory.cashew._vendor.core import (
+        embedding_service as _vendor_embedding_service,  # noqa: F401
+    )
 
     class FakeSupervisor:
         dimension = 384
@@ -131,8 +137,13 @@ def test_upstream_cache_miss_uses_child_and_cache_hit_does_not(
 def test_rejected_second_provider_does_not_replace_active_upstream_state(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import core.config
-    import core.embedding_service
+    from plugins.memory.cashew._vendor import core
+    from plugins.memory.cashew._vendor.core import (
+        config as _vendor_config,  # noqa: F401
+    )
+    from plugins.memory.cashew._vendor.core import (
+        embedding_service as _vendor_embedding_service,  # noqa: F401
+    )
 
     active_service = object()
     monkeypatch.setattr(core.config.config, "embedding_model", "active/model")
@@ -160,8 +171,13 @@ def test_rejected_second_provider_does_not_replace_active_upstream_state(
 def test_binding_requires_explicit_profile_cache_without_global_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import core.config
-    import core.embedding_service
+    from plugins.memory.cashew._vendor import core
+    from plugins.memory.cashew._vendor.core import (
+        config as _vendor_config,  # noqa: F401
+    )
+    from plugins.memory.cashew._vendor.core import (
+        embedding_service as _vendor_embedding_service,  # noqa: F401
+    )
 
     service = object()
     monkeypatch.setattr(core.config.config, "embedding_model", "active/model")
@@ -212,8 +228,13 @@ def test_closed_generation_rejects_cached_uncached_and_blank_service_paths(
 def test_failed_child_handshake_publishes_no_upstream_global_state(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import core.config
-    import core.embedding_service
+    from plugins.memory.cashew._vendor import core
+    from plugins.memory.cashew._vendor.core import (
+        config as _vendor_config,  # noqa: F401
+    )
+    from plugins.memory.cashew._vendor.core import (
+        embedding_service as _vendor_embedding_service,  # noqa: F401
+    )
 
     class FailingSupervisor:
         def __init__(self, **_kwargs: object) -> None:
@@ -242,7 +263,10 @@ def test_failed_child_handshake_publishes_no_upstream_global_state(
 def test_unknown_model_dimension_is_published_only_after_child_handshake(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import core.embedding_service
+    from plugins.memory.cashew._vendor import core
+    from plugins.memory.cashew._vendor.core import (
+        embedding_service as _vendor_embedding_service,  # noqa: F401
+    )
 
     class VerifiedSupervisor:
         dimension = 7
@@ -282,7 +306,10 @@ def test_same_model_profiles_keep_distinct_cache_and_late_close_cannot_clobber_b
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A late old-generation teardown cannot overwrite the published service."""
-    import core.embedding_service
+    from plugins.memory.cashew._vendor import core
+    from plugins.memory.cashew._vendor.core import (
+        embedding_service as _vendor_embedding_service,  # noqa: F401
+    )
 
     release_old_close = threading.Event()
     old_close_started = threading.Event()
@@ -334,7 +361,10 @@ def test_same_model_profiles_do_not_cross_hit_the_upstream_embedding_cache(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Profile-scoped upstream caches stay separate even for one model name."""
-    import core.embedding_service
+    from plugins.memory.cashew._vendor import core
+    from plugins.memory.cashew._vendor.core import (
+        embedding_service as _vendor_embedding_service,  # noqa: F401
+    )
 
     class FakeSupervisor:
         instances: list["FakeSupervisor"] = []
@@ -392,8 +422,13 @@ def test_pinned_upstream_shims_are_bounded_and_have_retirement_provenance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Guard the dd57 compatibility seam against a return to class patching."""
-    import core.config
-    import core.embedding_service
+    from plugins.memory.cashew._vendor import core
+    from plugins.memory.cashew._vendor.core import (
+        config as _vendor_config,  # noqa: F401
+    )
+    from plugins.memory.cashew._vendor.core import (
+        embedding_service as _vendor_embedding_service,  # noqa: F401
+    )
 
     monkeypatch.setattr(core.config.config, "embedding_model", "thenlper/gte-large")
 
@@ -410,9 +445,13 @@ def test_pinned_upstream_shims_are_bounded_and_have_retirement_provenance(
     assert "DaemonBackend" not in source
     # The broad offline fixture intentionally replaces this production entry
     # point. Reload just the pinned module for its source-level contract.
-    core_embeddings = importlib.reload(importlib.import_module("core.embeddings"))
+    core_embeddings = importlib.reload(
+        importlib.import_module("plugins.memory.cashew._vendor.core.embeddings")
+    )
     migration_script = importlib.reload(
-        importlib.import_module("scripts.migrate_embeddings")
+        importlib.import_module(
+            "plugins.memory.cashew._vendor.scripts.migrate_embeddings"
+        )
     )
 
     def calls(function) -> list[ast.Call]:
@@ -504,11 +543,11 @@ def test_pinned_upstream_shims_are_bounded_and_have_retirement_provenance(
         for node in ast.walk(ast.parse(source_path.read_text()))
         if isinstance(node, (ast.Assign, ast.AnnAssign))
         for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
-        if (assigned_target(target) or "").startswith("core.")
+        if (assigned_target(target) or "").startswith(("_config.", "_service."))
     ]
     assert len(shim_writes) == 3
     assert set(shim_writes) == {
-        "core.config.config.embedding_model",
-        "core.embedding_service._KNOWN_DIMS[model]",
-        "core.embedding_service._default_service",
+        "_config.config.embedding_model",
+        "_service._KNOWN_DIMS[model]",
+        "_service._default_service",
     }

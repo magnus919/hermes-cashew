@@ -314,7 +314,7 @@ def test_pinned_upstream_root_emissions_and_late_handlers_are_sanitized(
     """Pinned core uses root logging; source-path boundary handles late handlers."""
     import sqlite3
 
-    from core import embeddings, session
+    from plugins.memory.cashew._vendor.core import embeddings, session
 
     root = logging.getLogger()
     core_logger = logging.getLogger("core")

@@ -41,10 +41,13 @@ git push -u origin HEAD
 
 Releases are triggered by pushing a `v*` tag. The release workflow gates on tests passing, auto-syncs plugin manifest versions, builds the wheel, and publishes to PyPI via trusted publishing.
 
-While `pyproject.toml` contains the approved direct Cashew source reference,
-the release workflow deliberately fails before tests or build because PyPI
-rejects direct URL dependencies. Do not create a release tag until a tested
-upstream release replaces the source reference.
+The selected Cashew engine is bundled privately under
+`plugins/memory/cashew/_vendor/`, with its upstream MIT license, pristine snapshot,
+and provenance manifest. `scripts/vendor-cashew.py` reproduces it from the
+hash-verified archive. Only intra-engine absolute imports are relocated; do not
+edit engine algorithms locally. Runtime dependencies must be ordinary index
+requirements accepted by Hermes. The release guard continues rejecting direct
+URL requirements. A merge does not authorize a release tag.
 
 **Important:** You only bump the version in `pyproject.toml` and `CHANGELOG.md` — CI automatically syncs both `plugin.yaml` files to match before building. See [Plugin Version Manifest](#plugin-version-manifest).
 
@@ -106,15 +109,13 @@ done
 
 - **No `~/.hermes` writes.** All paths scope under `hermes_home`. Tests use `tmp_path` fixture.
 - **`sync_turn` must return <10 ms.** Bounded queue + daemon worker; shutdown gives already-accepted turns a bounded opportunity to drain.
-- **Cashew dependency**: source archive at composite fork commit
+- **Cashew engine**: private bundle of composite commit
   `fcb4919ac37144bfbeb822eaafc668a4bdceb791` (tree
-  `29d97fb93c7998c97be0da8f19b90c6523f9d1e9`, combining PR 136
-  `ac090ce75ffd2e97dac257cee9430628c68aa241` and PR 137
-  `cb940f34c15460b87831748b2e702334c1c5fbd0`), pinned by its full commit and
-  SHA-256 in `pyproject.toml`, both manifests, and `uv.lock`. The upstream
-  package still reports version `1.2.1`, so version metadata alone does not
-  identify the selected code. Replace the fork with the canonical upstream
-  release once both parent changes are merged upstream.
+  `29d97fb93c7998c97be0da8f19b90c6523f9d1e9`). Provenance includes the full
+  upstream archive SHA-256, pristine/runtime file hashes, and import relocation.
+  Verify using `scripts/verify-cashew-baseline.py`. Never import generic `core`:
+  adapter imports must use `._vendor.core`. Replace the bundled snapshot only
+  after testing a canonical upstream revision/release with both required contracts.
 - **SQLite baseline**: SQLite `>=3.35` is required because the upstream legacy
   v1 migration uses `ALTER TABLE ... DROP COLUMN`. The PyPI `1.2.1` artifact
   has the same requirement even though its package metadata does not declare

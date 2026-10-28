@@ -82,7 +82,7 @@ def test_sync_turn_enqueues_tuple(tmp_path, monkeypatch):
     started = threading.Event()
     release = threading.Event()
     monkeypatch.setattr(
-        "core.session.end_session",
+        "plugins.memory.cashew._vendor.core.session.end_session",
         fake_end_session_blocked(started, release),
         raising=False,
     )
@@ -97,7 +97,9 @@ def test_sync_turn_enqueues_tuple(tmp_path, monkeypatch):
         assert p._sync_queue.qsize() == 1
     finally:
         monkeypatch.setattr(
-            "core.session.end_session", fake_end_session_ok([]), raising=False
+            "plugins.memory.cashew._vendor.core.session.end_session",
+            fake_end_session_ok([]),
+            raising=False,
         )
         release.set()
         p.shutdown()
@@ -106,7 +108,9 @@ def test_sync_turn_enqueues_tuple(tmp_path, monkeypatch):
 def test_sync_turn_fast_on_empty_queue(tmp_path, monkeypatch):
     """50ms lenient upper bound; always-on contract guard against blocking-put regression."""
     monkeypatch.setattr(
-        "core.session.end_session", fake_end_session_ok([]), raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        fake_end_session_ok([]),
+        raising=False,
     )
     p = make_initialized_provider(tmp_path)
     try:
@@ -139,7 +143,9 @@ def test_sync_turn_empty_queue_strict_10ms(tmp_path, monkeypatch):
     dedicated strict-timing job opt in.
     """
     monkeypatch.setattr(
-        "core.session.end_session", fake_end_session_ok([]), raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        fake_end_session_ok([]),
+        raising=False,
     )
     p = make_initialized_provider(tmp_path)
     try:
@@ -158,7 +164,7 @@ def test_sync_turn_fast_even_on_full_queue(tmp_path, monkeypatch):
     started = threading.Event()
     release = threading.Event()
     monkeypatch.setattr(
-        "core.session.end_session",
+        "plugins.memory.cashew._vendor.core.session.end_session",
         fake_end_session_blocked(started, release),
         raising=False,
     )
@@ -178,7 +184,9 @@ def test_sync_turn_fast_even_on_full_queue(tmp_path, monkeypatch):
         )
     finally:
         monkeypatch.setattr(
-            "core.session.end_session", fake_end_session_ok([]), raising=False
+            "plugins.memory.cashew._vendor.core.session.end_session",
+            fake_end_session_ok([]),
+            raising=False,
         )
         release.set()
         p.shutdown()
@@ -189,7 +197,9 @@ def test_drop_oldest_logs_warning_and_preserves_newest(tmp_path, monkeypatch, ca
     calls: list[dict] = []
     # Phase 1: slow mock so queue fills
     monkeypatch.setattr(
-        "core.session.end_session", fake_end_session_slow(0.5), raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        fake_end_session_slow(0.5),
+        raising=False,
     )
     p = make_initialized_provider(tmp_path)
     try:
@@ -207,7 +217,9 @@ def test_drop_oldest_logs_warning_and_preserves_newest(tmp_path, monkeypatch, ca
         )
     finally:
         monkeypatch.setattr(
-            "core.session.end_session", fake_end_session_ok(calls), raising=False
+            "plugins.memory.cashew._vendor.core.session.end_session",
+            fake_end_session_ok(calls),
+            raising=False,
         )
         if p._config is not None:
             p._config = dataclasses.replace(p._config, sync_queue_timeout=1.0)
@@ -217,7 +229,9 @@ def test_drop_oldest_logs_warning_and_preserves_newest(tmp_path, monkeypatch, ca
 def test_drop_oldest_balances_task_done(tmp_path, monkeypatch, caplog):
     """Pitfall 3: drop-oldest overflow must not cause task_done() double-count ValueError."""
     monkeypatch.setattr(
-        "core.session.end_session", fake_end_session_slow(0.2), raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        fake_end_session_slow(0.2),
+        raising=False,
     )
     p = make_initialized_provider(tmp_path)
     try:
@@ -226,7 +240,9 @@ def test_drop_oldest_balances_task_done(tmp_path, monkeypatch, caplog):
                 p.sync_turn(f"u{i}", f"a{i}")
         # Swap to fast so drain completes
         monkeypatch.setattr(
-            "core.session.end_session", fake_end_session_ok([]), raising=False
+            "plugins.memory.cashew._vendor.core.session.end_session",
+            fake_end_session_ok([]),
+            raising=False,
         )
         assert drain_queue(p, budget_s=5.0)
         # No ValueError('task_done called too many times') raised anywhere
@@ -273,7 +289,9 @@ def test_sync_turn_silent_noop_on_corrupt_config_provider(tmp_path, caplog):
 def test_sync_turn_silent_noop_after_shutdown(tmp_path, monkeypatch, caplog):
     """Post-shutdown: sync_turn silent no-op (shutdown cleared _sync_queue)."""
     monkeypatch.setattr(
-        "core.session.end_session", fake_end_session_ok([]), raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        fake_end_session_ok([]),
+        raising=False,
     )
     p = make_initialized_provider(tmp_path)
     p.shutdown()

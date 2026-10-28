@@ -32,38 +32,36 @@ The selected source is a composite fork at `fcb4919ac37144bfbeb822eaafc668a4bdce
 tree `29d97fb93c7998c97be0da8f19b90c6523f9d1e9`, combining PR 136
 (`ac090ce75ffd2e97dac257cee9430628c68aa241`) and PR 137
 (`cb940f34c15460b87831748b2e702334c1c5fbd0`). Production installs use the
-exact source archive and digest below rather than floating on Cashew `main`.
-The composite contains the commit proposed as PR 136 before that PR merged
-upstream, plus the still-noncanonical PR 137 commit. It is not equivalent to
-the current tip of the merged PR 136 branch. A later dependency change may
-replace it with an immutable canonical revision or release after independently
-verifying the same contracts. PyPI publication separately requires a suitable
-release because direct URL dependencies are rejected:
+bundled source identified by the archive and digest below rather than floating on
+Cashew `main`. The composite contains the earlier PR 136 commit and the
+still-noncanonical PR 137 commit. It is not the current merged PR 136 tip.
+A later source change must independently verify both required contracts before
+replacing this snapshot with a canonical upstream revision or release.
 
 ```text
 https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz
 sha256=23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3
 ```
 
-The source archive builds normally, but its metadata still says `1.2.1`, the
-same version already published on PyPI. Version metadata is therefore not
-valid provenance. Install verification checks both `direct_url.json` and the
-installed `core/session.py` digest.
+Discussion [#261](https://github.com/magnus919/hermes-cashew/discussions/261)
+exposed that Hermes rejects direct URL dependencies during managed updates.
+The engine now ships under `plugins/memory/cashew/_vendor/core`, with no separate
+`cashew-brain` requirement. All external requirements are ordinary index packages.
+Existing separately installed Cashew packages cannot override the private engine.
 
-A public hermes-cashew wheel cannot declare this direct URL as a normal PyPI
-dependency: PyPI rejects `Requires-Dist` entries using direct URLs
-([setuptools dependency guidance](https://setuptools.pypa.io/en/stable/userguide/dependency_management.html#direct-url-dependencies)).
-The release workflow fails before tests or build while the source pin is
-present. Existing published hermes-cashew packages remain unchanged and still
-resolve their released Cashew range; `pip install hermes-cashew` from PyPI does
-not obtain this source baseline.
+`_vendor/LICENSE` preserves the upstream MIT notice. `pristine-core.tar.gz` retains
+the unmodified core files; `provenance.json` records upstream and runtime hashes.
+`scripts/vendor-cashew.py` verifies the full upstream archive SHA-256 and reproduces
+the bundle. The transformations replace absolute `from core.X` imports with relative
+imports (`from .X` in core, `from ..core.X` in the migration script), and remove
+the standalone migration script's `sys.path` bootstrap. The offline verifier compares every runtime file with
+that exact transformation of the pristine snapshot, and rejects extra or missing
+files. Neither algorithms nor database formats are changed by bundling.
 
-Hermes also rejects direct URLs in plugin manifests. GitHub and local wheel
-installs can resolve the dependency metadata, but flat plugin users must run
-the explicit `uv pip install --python … --reinstall` command in the main
-README and verify provenance. The same command is required after `hermes
-plugins update cashew`, `hermes update`, or a Hermes environment rebuild. This
-is an approved interim delivery constraint, not an automatic-healing claim.
+The package metadata no longer contains the direct URL rejected by Hermes and
+PyPI. The release workflow retains its guard against reintroducing URL requirements.
+This change does not itself publish a new release or advance the external catalog.
+Older published plugin artifacts retain their original dependency behavior.
 
 The selected source includes the schema fast path and the PR 136 pending-batch
 fix. It still has no supported device-injection contract, and several wrapper

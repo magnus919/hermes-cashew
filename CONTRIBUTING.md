@@ -37,8 +37,8 @@ This project is governed by the [Apache 2.0 License](./LICENSE) and the followin
 
 ### Development Install
 
-hermes-cashew depends on an immutable, hash-pinned upstream `cashew-brain`
-source archive, SQLite 3.35 or newer, and Hermes Agent. The SQLite minimum is
+hermes-cashew bundles an immutable upstream Cashew engine privately, and depends
+on SQLite 3.35 or newer and Hermes Agent. The SQLite minimum is
 required by upstream's legacy v1 migration and applies to the published PyPI
 `1.2.1` code as well as the selected source. For development:
 
@@ -274,9 +274,11 @@ This project uses **pytest** with `pytest-asyncio` and `pytest-mock`.
 
 Maintainers handle releases. The process is:
 
-The current direct Cashew source pin is an explicit publication hold. The
-release workflow fails before tests or build until a tested upstream release
-replaces that direct URL; do not create a release tag while the hold is active.
+The private Cashew bundle includes its MIT license and verifiable provenance.
+Reproduce it with `scripts/vendor-cashew.py <verified-upstream-archive>` and run
+`scripts/verify-cashew-baseline.py` before changing the selected source. Do not
+edit bundled engine algorithms. The release workflow rejects direct URL runtime
+dependencies; all declared requirements must survive Hermes' index-only admission.
 
 1. Version is bumped in `pyproject.toml` and `CHANGELOG.md` is updated
 2. A tag is pushed (`vX.Y.Z`)

@@ -111,7 +111,7 @@ def _load_sqlite_vec(conn):
 
 def _make_dimension_mismatch_db(db_path):
     """Create canonical tables with both stores fixed at the old 384 dimension."""
-    from core.db import ensure_schema
+    from plugins.memory.cashew._vendor.core.db import ensure_schema
 
     ensure_schema(str(db_path))
     conn = sqlite3.connect(str(db_path))
@@ -404,7 +404,8 @@ def test_initialize_backs_up_and_migrates_embedding_dimension(tmp_path, monkeypa
     db_path.parent.mkdir(parents=True)
     _make_dimension_mismatch_db(db_path)
     monkeypatch.setattr(
-        "scripts.migrate_embeddings.migrate_embeddings", _fake_migrate_to_1024
+        "plugins.memory.cashew._vendor.scripts.migrate_embeddings.migrate_embeddings",
+        _fake_migrate_to_1024,
     )
 
     p = CashewMemoryProvider()
@@ -467,7 +468,8 @@ def test_existing_vec_schema_without_extension_keeps_identity_ready(
     db_path.parent.mkdir(parents=True)
     _make_dimension_mismatch_db(db_path)
     monkeypatch.setattr(
-        "scripts.migrate_embeddings.migrate_embeddings", _fake_migrate_to_1024
+        "plugins.memory.cashew._vendor.scripts.migrate_embeddings.migrate_embeddings",
+        _fake_migrate_to_1024,
     )
 
     import sqlite_vec
@@ -494,8 +496,15 @@ def test_existing_vec_schema_without_extension_keeps_identity_ready(
         return types.SimpleNamespace(new_nodes=["written"], new_edges=[])
 
     monkeypatch.setattr(sqlite_vec, "load", unavailable_after_migration)
-    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", record_embedding_route)
-    monkeypatch.setattr("core.session.end_session", persist_extract, raising=False)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs",
+        record_embedding_route,
+    )
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        persist_extract,
+        raising=False,
+    )
     provider = CashewMemoryProvider()
     provider.save_config({"embedding_model": "thenlper/gte-large"}, str(tmp_path))
     provider.initialize("vec-unavailable-repair", hermes_home=str(tmp_path))
@@ -533,8 +542,12 @@ def test_pinned_upstream_migration_uses_owned_child_embedding_boundary(tmp_path)
     """The dd57 migration persists child-produced vectors without a parent model."""
     # The suite's broad guard replaces core.embed_nodes. Restore just the
     # pinned upstream function here; its service remains the owned child path.
-    core_embeddings = importlib.import_module("core.embeddings")
-    migration_script = importlib.import_module("scripts.migrate_embeddings")
+    core_embeddings = importlib.import_module(
+        "plugins.memory.cashew._vendor.core.embeddings"
+    )
+    migration_script = importlib.import_module(
+        "plugins.memory.cashew._vendor.scripts.migrate_embeddings"
+    )
     importlib.reload(core_embeddings)
     importlib.reload(migration_script)
     db_path = tmp_path / "cashew" / "brain.db"
@@ -560,8 +573,12 @@ def test_pinned_upstream_migration_uses_owned_child_embedding_boundary(tmp_path)
 @pytest.mark.real_embedding_child
 def test_pinned_upstream_migrates_same_dimension_model_identity(tmp_path):
     """A 384-to-384 model switch is still a destructive identity migration."""
-    core_embeddings = importlib.import_module("core.embeddings")
-    migration_script = importlib.import_module("scripts.migrate_embeddings")
+    core_embeddings = importlib.import_module(
+        "plugins.memory.cashew._vendor.core.embeddings"
+    )
+    migration_script = importlib.import_module(
+        "plugins.memory.cashew._vendor.scripts.migrate_embeddings"
+    )
     importlib.reload(core_embeddings)
     importlib.reload(migration_script)
     db_path = tmp_path / "cashew" / "brain.db"
@@ -602,7 +619,8 @@ def test_failed_embedding_migration_restores_backup(tmp_path, monkeypatch, caplo
         raise RuntimeError("synthetic migration failure")
 
     monkeypatch.setattr(
-        "scripts.migrate_embeddings.migrate_embeddings", destructive_failure
+        "plugins.memory.cashew._vendor.scripts.migrate_embeddings.migrate_embeddings",
+        destructive_failure,
     )
     p = CashewMemoryProvider()
     p._config = CashewConfig(embedding_model="thenlper/gte-large")
@@ -642,7 +660,8 @@ def test_initialize_failure_restores_legacy_vec_before_wrapper_migration(
         raise RuntimeError("synthetic migration failure")
 
     monkeypatch.setattr(
-        "scripts.migrate_embeddings.migrate_embeddings", destructive_failure
+        "plugins.memory.cashew._vendor.scripts.migrate_embeddings.migrate_embeddings",
+        destructive_failure,
     )
     provider = CashewMemoryProvider()
     provider.save_config({"embedding_model": "thenlper/gte-large"}, str(tmp_path))
@@ -728,7 +747,8 @@ def test_unresolved_identity_is_keyword_only_and_recovers_after_reinitialize(
         raise RuntimeError("synthetic migration failure")
 
     monkeypatch.setattr(
-        "scripts.migrate_embeddings.migrate_embeddings", destructive_failure
+        "plugins.memory.cashew._vendor.scripts.migrate_embeddings.migrate_embeddings",
+        destructive_failure,
     )
     called_embedding_retrieval = False
 
@@ -776,7 +796,8 @@ def test_unresolved_identity_is_keyword_only_and_recovers_after_reinitialize(
         provider.shutdown()
 
     monkeypatch.setattr(
-        "scripts.migrate_embeddings.migrate_embeddings", _fake_migrate_to_1024
+        "plugins.memory.cashew._vendor.scripts.migrate_embeddings.migrate_embeddings",
+        _fake_migrate_to_1024,
     )
     monkeypatch.setattr(
         cashew_module, "_retrieve_with_embedding_wait", real_embedding_wait
@@ -801,13 +822,23 @@ def test_unresolved_identity_is_keyword_only_and_recovers_after_reinitialize(
             conn.close()
         return types.SimpleNamespace(new_nodes=["recovered-write"], new_edges=[])
 
-    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", record_embedding_route)
-    monkeypatch.setattr("core.session.end_session", persist_extract, raising=False)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs",
+        record_embedding_route,
+    )
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        persist_extract,
+        raising=False,
+    )
     provider.initialize("recovered", hermes_home=str(tmp_path))
     try:
         assert provider._embedding_identity_ready is True
         assert provider._embedding_dimensions(db_path) == ({1024}, 1024)
-        import core.embedding_service
+        from plugins.memory.cashew._vendor import core
+        from plugins.memory.cashew._vendor.core import (
+            embedding_service as _vendor_embedding_service,  # noqa: F401
+        )
 
         service = core.embedding_service.get_default_service()
         assert isinstance(service, cashew_module._GenerationBoundEmbeddingService)
@@ -865,7 +896,8 @@ def test_partial_embedding_migration_restores_backup(tmp_path, monkeypatch, capl
         return {"nodes_embedded": 0}
 
     monkeypatch.setattr(
-        "scripts.migrate_embeddings.migrate_embeddings", incomplete_success
+        "plugins.memory.cashew._vendor.scripts.migrate_embeddings.migrate_embeddings",
+        incomplete_success,
     )
     p = CashewMemoryProvider()
     p._config = CashewConfig(embedding_model="thenlper/gte-large")
@@ -899,7 +931,8 @@ def test_migration_rolls_back_wrong_model_or_vec_identity(
         return summary
 
     monkeypatch.setattr(
-        "scripts.migrate_embeddings.migrate_embeddings", wrong_postcondition
+        "plugins.memory.cashew._vendor.scripts.migrate_embeddings.migrate_embeddings",
+        wrong_postcondition,
     )
     p = CashewMemoryProvider()
     p._config = CashewConfig(embedding_model="thenlper/gte-large")
@@ -937,7 +970,10 @@ def test_vec_only_postcondition_mismatch_rolls_back_to_identity_unresolved(
             conn.close()
         return summary
 
-    monkeypatch.setattr("scripts.migrate_embeddings.migrate_embeddings", wrong_vec_only)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.scripts.migrate_embeddings.migrate_embeddings",
+        wrong_vec_only,
+    )
     provider = CashewMemoryProvider()
     provider.save_config({"embedding_model": "thenlper/gte-large"}, str(tmp_path))
     provider.initialize("vec-only-mismatch", hermes_home=str(tmp_path))
@@ -964,7 +1000,8 @@ def test_embedding_migration_defers_while_sleep_lock_is_held(
         return {}
 
     monkeypatch.setattr(
-        "scripts.migrate_embeddings.migrate_embeddings", unexpected_migration
+        "plugins.memory.cashew._vendor.scripts.migrate_embeddings.migrate_embeddings",
+        unexpected_migration,
     )
     lock_fd = pathlib.Path(f"{db_path}.sleep.lock").open("a+")
     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

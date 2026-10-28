@@ -230,6 +230,9 @@ def test_generated_script_executes_real_upstream_sleep_candidate(
     """Both installed layouts must execute the pinned public upstream call."""
     hermes_home, script, implementation = _generate_script(tmp_path, monkeypatch, kind)
     source_root = Path(__file__).parents[1] / "plugins" / "memory" / "cashew"
+    import shutil
+
+    shutil.copytree(source_root / "_vendor", implementation / "_vendor")
     config_path = implementation / "config.py"
     config_path.write_text(config_path.read_text().replace("'384'", "'1024'"))
     (implementation / "sleep_adapter.py").write_text(

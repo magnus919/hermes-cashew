@@ -84,7 +84,7 @@ sys.argv[:] = ["child", str(fake_root / "profile"), "marker", "initialize"]
 try:
     exec(namespace["_CHILD"], {"__name__": "__main__"})
 except ModuleNotFoundError as exc:
-    if exc.name != "core.session":
+    if exc.name != "plugins.memory.cashew._vendor.core.session":
         raise
     print("partial-core-failed-naturally")
     raise SystemExit(0)
@@ -108,8 +108,10 @@ os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_DATASETS_OFFL
 import plugins.memory.cashew as cashew_module
 from plugins.memory.cashew import CashewMemoryProvider
 from plugins.memory.cashew.config import CashewConfig
-import core.session
-import core.embedding_service
+from plugins.memory.cashew._vendor import core
+from plugins.memory.cashew._vendor.core import session as _vendor_session  # noqa: F401
+from plugins.memory.cashew._vendor import core
+from plugins.memory.cashew._vendor.core import embedding_service as _vendor_embedding_service  # noqa: F401
 assert getattr(core.session, "__file__", ""), "real core.session required"
 
 home = Path(sys.argv[1]); marker = sys.argv[2]; action = sys.argv[3]
@@ -262,7 +264,8 @@ elif action == "migration":
     supervisor = VerifiedSupervisor("thenlper/gte-small")
     _embedding_service.model = "thenlper/gte-small"
     _embedding_service.dim = 384
-    import core.config
+    from plugins.memory.cashew._vendor import core
+    from plugins.memory.cashew._vendor.core import config as _vendor_config  # noqa: F401
     core.config.config.embedding_model = "thenlper/gte-small"
     core.embedding_service._KNOWN_DIMS["thenlper/gte-small"] = 384
     core.embedding_service._default_service = _embedding_service

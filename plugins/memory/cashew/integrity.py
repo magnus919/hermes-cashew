@@ -890,7 +890,7 @@ def _upstream_integrity_api() -> tuple[Any, Any] | None:
     provider importable when Cashew is absent from a test environment.
     """
     try:
-        from core import integrity as upstream_integrity
+        from ._vendor.core import integrity as upstream_integrity
 
         inspect_fn = getattr(upstream_integrity, "inspect_integrity", None)
         repair_fn = getattr(upstream_integrity, "repair_integrity", None)

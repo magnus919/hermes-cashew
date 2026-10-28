@@ -93,10 +93,23 @@ def test_recursive_symlink_checker_allows_external_development_link(
 def test_distribution_guard_accepts_clean_wheel_and_sdist(tmp_path: Path) -> None:
     verifier = _load_script("verify-distributions.py")
     wheel = tmp_path / "hermes_cashew-0.10.2-py3-none-any.whl"
+    required = ["plugins/memory/cashew/__init__.py"] + [
+        f"plugins/memory/cashew/_vendor/{name}"
+        for name in (
+            "LICENSE",
+            "pristine-core.tar.gz",
+            "provenance.json",
+            "verify.py",
+            "core/session.py",
+            "core/integrity.py",
+            "core/sleep.py",
+        )
+    ]
     with zipfile.ZipFile(wheel, "w") as archive:
-        archive.writestr("plugins/memory/cashew/__init__.py", "")
+        for name in required:
+            archive.writestr(name, "")
     sdist = tmp_path / "hermes_cashew-0.10.2.tar.gz"
-    _write_sdist(sdist, ["plugins/memory/cashew/__init__.py"])
+    _write_sdist(sdist, required)
 
     verifier.verify_distribution(wheel)
     verifier.verify_distribution(sdist)

@@ -113,7 +113,9 @@ def test_worker_not_started_on_corrupt_config(tmp_path, caplog):
 def test_worker_processes_single_turn(tmp_path, monkeypatch):
     calls: list[dict] = []
     monkeypatch.setattr(
-        "core.session.end_session", fake_end_session_ok(calls), raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        fake_end_session_ok(calls),
+        raising=False,
     )
     p = make_initialized_provider(tmp_path)
     try:
@@ -133,7 +135,9 @@ def test_worker_processes_single_turn(tmp_path, monkeypatch):
 def test_worker_processes_multiple_turns_fifo(tmp_path, monkeypatch):
     calls: list[dict] = []
     monkeypatch.setattr(
-        "core.session.end_session", fake_end_session_ok(calls), raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        fake_end_session_ok(calls),
+        raising=False,
     )
     p = make_initialized_provider(tmp_path)
     try:
@@ -150,7 +154,9 @@ def test_worker_processes_multiple_turns_fifo(tmp_path, monkeypatch):
 def test_auto_extraction_false_does_not_enqueue_turn(tmp_path, monkeypatch):
     calls: list[dict] = []
     monkeypatch.setattr(
-        "core.session.end_session", fake_end_session_ok(calls), raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        fake_end_session_ok(calls),
+        raising=False,
     )
     p = make_initialized_provider(tmp_path)
     try:
@@ -165,10 +171,12 @@ def test_auto_extraction_false_does_not_enqueue_turn(tmp_path, monkeypatch):
 def test_think_cycles_false_skips_periodic_think(tmp_path, monkeypatch):
     think_calls: list[dict] = []
     monkeypatch.setattr(
-        "core.session.end_session", fake_end_session_ok([]), raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        fake_end_session_ok([]),
+        raising=False,
     )
     monkeypatch.setattr(
-        "core.session.think_cycle",
+        "plugins.memory.cashew._vendor.core.session.think_cycle",
         lambda **kwargs: think_calls.append(kwargs),
         raising=False,
     )
@@ -192,7 +200,9 @@ def test_poisoned_turn_does_not_break_worker(tmp_path, monkeypatch, caplog):
             raise RuntimeError("synthetic poison")
         return types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[])
 
-    monkeypatch.setattr("core.session.end_session", _fake, raising=False)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.session.end_session", _fake, raising=False
+    )
     p = make_initialized_provider(tmp_path)
     try:
         with caplog.at_level(logging.WARNING, logger="plugins.memory.cashew"):
@@ -225,7 +235,9 @@ def test_poisoned_turn_does_not_break_worker(tmp_path, monkeypatch, caplog):
 
 def test_shutdown_posts_sentinel_and_joins(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        "core.session.end_session", fake_end_session_ok([]), raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        fake_end_session_ok([]),
+        raising=False,
     )
     baseline = threading.active_count()
     p = make_initialized_provider(tmp_path)
@@ -250,7 +262,9 @@ def test_interpreter_termination_drops_turn_and_stops_worker(tmp_path, monkeypat
         raise RuntimeError("can't register atexit after shutdown")
 
     monkeypatch.setattr(
-        "core.session.end_session", finalizing_end_session, raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        finalizing_end_session,
+        raising=False,
     )
     p = make_initialized_provider(tmp_path)
     try:
@@ -279,7 +293,9 @@ def test_shutdown_drains_accepted_turns_and_rejects_new_ones(tmp_path, monkeypat
         return types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[])
 
     monkeypatch.setattr(
-        "core.session.end_session", controlled_end_session, raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        controlled_end_session,
+        raising=False,
     )
     p = make_initialized_provider(tmp_path)
     p.sync_turn("u1", "a1")
@@ -317,7 +333,9 @@ def test_shutdown_keeps_model_open_until_accepted_turns_drain(tmp_path, monkeypa
         return types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[])
 
     monkeypatch.setattr(
-        "core.session.end_session", controlled_end_session, raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        controlled_end_session,
+        raising=False,
     )
     p = make_initialized_provider(tmp_path)
     p._model_fn = model_fn
@@ -359,7 +377,9 @@ def test_shutdown_full_queue_drains_after_blocked_backend_without_watcher_leak(
         return types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[])
 
     monkeypatch.setattr(
-        "core.session.end_session", controlled_end_session, raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        controlled_end_session,
+        raising=False,
     )
     p = CashewMemoryProvider()
     p.save_config({"sync_queue_timeout": 0.05}, str(tmp_path))
@@ -413,7 +433,11 @@ def test_repeated_shutdown_is_idempotent_while_cleanup_is_deferred(
         assert release_backend.wait(timeout=2.0)
         return types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[])
 
-    monkeypatch.setattr("core.session.end_session", blocked_end_session, raising=False)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        blocked_end_session,
+        raising=False,
+    )
     p = CashewMemoryProvider()
     p.save_config({"sync_queue_timeout": 0.05}, str(tmp_path))
     p.initialize("session-a", hermes_home=str(tmp_path))
@@ -455,7 +479,9 @@ def test_admitted_turn_keeps_session_when_switch_occurs_while_worker_blocked(
         return types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[])
 
     monkeypatch.setattr(
-        "core.session.end_session", controlled_end_session, raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        controlled_end_session,
+        raising=False,
     )
     p = make_initialized_provider(tmp_path)
     try:
@@ -482,7 +508,11 @@ def test_shutdown_blocks_public_old_profile_access_until_cleanup(tmp_path, monke
         assert release_first.wait(timeout=2.0)
         return types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[])
 
-    monkeypatch.setattr("core.session.end_session", blocked_end_session, raising=False)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        blocked_end_session,
+        raising=False,
+    )
     home_a = tmp_path / "profile-a"
     home_b = tmp_path / "profile-b"
     p = CashewMemoryProvider()
@@ -543,7 +573,10 @@ def test_prefetch_uses_snapshot_after_shutdown_clears_runtime(tmp_path, monkeypa
         assert release_upstream.wait(timeout=2.0)
         return []
 
-    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", blocked_upstream)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs",
+        blocked_upstream,
+    )
     p = make_initialized_provider(tmp_path)
     expected_db = p._db_path
 
@@ -594,7 +627,9 @@ def test_shutdown_hung_worker_logs_warning_no_raise(tmp_path, monkeypatch, caplo
     guaranteeing the thread exits cleanly before the next test starts."""
     baseline = threading.active_count()
     monkeypatch.setattr(
-        "core.session.end_session", fake_end_session_slow(0.3), raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        fake_end_session_slow(0.3),
+        raising=False,
     )
     p = CashewMemoryProvider()
     p.save_config({"sync_queue_timeout": 0.1}, str(tmp_path))
@@ -636,7 +671,9 @@ def test_shutdown_cleanup_thread_start_failure_blocks_init_until_retry(
     tmp_path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setattr(
-        "core.session.end_session", fake_end_session_slow(0.25), raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        fake_end_session_slow(0.25),
+        raising=False,
     )
     first_home = tmp_path / "first"
     second_home = tmp_path / "second"
@@ -740,7 +777,9 @@ def test_on_session_end_returns_without_draining_queue(tmp_path, monkeypatch):
     Data-loss protection is handled by dispose(), not on_session_end.
     """
     monkeypatch.setattr(
-        "core.session.end_session", fake_end_session_slow(0.1), raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        fake_end_session_slow(0.1),
+        raising=False,
     )
     p = make_initialized_provider(tmp_path)
     try:
@@ -767,7 +806,9 @@ def test_on_session_end_returns_instantly_regardless_of_queue(tmp_path, monkeypa
     only.
     """
     monkeypatch.setattr(
-        "core.session.end_session", fake_end_session_slow(2.0), raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        fake_end_session_slow(2.0),
+        raising=False,
     )
     p = CashewMemoryProvider()
     p.save_config({"sync_queue_timeout": 0.3}, str(tmp_path))
@@ -783,7 +824,9 @@ def test_on_session_end_returns_instantly_regardless_of_queue(tmp_path, monkeypa
         assert p._sync_worker.is_alive()
     finally:
         monkeypatch.setattr(
-            "core.session.end_session", fake_end_session_ok([]), raising=False
+            "plugins.memory.cashew._vendor.core.session.end_session",
+            fake_end_session_ok([]),
+            raising=False,
         )
         p.shutdown()
 

@@ -187,7 +187,7 @@ jobs:
           assert '$GITHUB_WORKSPACE' not in str(loaded), loaded
           print(f'wheel import: {loaded}')
           "
-              "$WHEEL_SMOKE_VENV/bin/python" "$GITHUB_WORKSPACE/scripts/verify-cashew-baseline.py"
+              "$WHEEL_SMOKE_VENV/bin/python" "$GITHUB_WORKSPACE/scripts/verify-cashew-baseline.py" --installed
             )
             "$WHEEL_SMOKE_VENV/bin/python" -c "
           import importlib.metadata as im
@@ -216,7 +216,7 @@ jobs:
           assert '$GITHUB_WORKSPACE' not in str(loaded), loaded
           print(f'sdist import: {loaded}')
           "
-              "$SDIST_SMOKE_VENV/bin/python" "$GITHUB_WORKSPACE/scripts/verify-cashew-baseline.py"
+              "$SDIST_SMOKE_VENV/bin/python" "$GITHUB_WORKSPACE/scripts/verify-cashew-baseline.py" --installed
             )
             mkdir -p "$FLAT_UNPACKED" "$FLAT_SMOKE_HOME/plugins"
             tar -xzf dist/*.tar.gz -C "$FLAT_UNPACKED" --strip-components=1
@@ -228,40 +228,26 @@ jobs:
             )
           } 2>&1 | tee sdist-smoke.log
 
-      - name: Install flat-manifest dependency and verify update and rollback
+      - name: Verify bundled runtime survives an older installed Cashew
         run: |
           set -o pipefail
           FLAT_SMOKE_VENV="$RUNNER_TEMP/hermes-cashew-flat-smoke"
-          FLAT_DEP="$(.venv/bin/python -c "import yaml; print(next(d for d in yaml.safe_load(open('plugin.yaml'))['pip_dependencies'] if d.startswith('cashew-brain ')))")"
           .venv/bin/python -m venv --clear "$FLAT_SMOKE_VENV"
           {
-            # Model an existing user on the public 1.2.1 wheel, then apply the
-            # manifest source without relying on a higher version number.
+            "$FLAT_SMOKE_VENV/bin/pip" install dist/*.whl
             "$FLAT_SMOKE_VENV/bin/pip" install --no-deps "cashew-brain==1.2.1"
-            "$FLAT_SMOKE_VENV/bin/pip" install --force-reinstall --no-deps "$FLAT_DEP"
-            "$FLAT_SMOKE_VENV/bin/python" scripts/verify-cashew-baseline.py
-
-            # Roll back to the released artifact, whose identical 1.2.1 version
-            # makes source provenance more reliable than version checks.
-            "$FLAT_SMOKE_VENV/bin/pip" install --force-reinstall --no-deps "cashew-brain==1.2.1"
-            "$FLAT_SMOKE_VENV/bin/python" -c "
-          import hashlib
-          import importlib.metadata as metadata
-          from pathlib import Path
-
-          distribution = metadata.distribution('cashew-brain')
-          assert distribution.read_text('direct_url.json') is None
-          session_hash = hashlib.sha256(
-              Path(distribution.locate_file('core/session.py')).read_bytes()
-          ).hexdigest()
-          assert session_hash != '0ce60cc63adf4fb7136581aee722bb10e9a344e556b6fb98f4d46855d53c36cd'
-          print(f'cashew-brain rollback verified: {session_hash}')
+            (
+              cd "$RUNNER_TEMP"
+              "$FLAT_SMOKE_VENV/bin/python" -c "
+          import core.context
+          import plugins.memory.cashew as provider
+          from plugins.memory.cashew._vendor.core.context import ContextRetriever
+          assert provider.ContextRetriever is ContextRetriever
+          assert provider.ContextRetriever is not core.context.ContextRetriever
+          print('bundled engine remains authoritative with old Cashew imported')
           "
-
-            # Reapply the manifest requirement exactly as existing users must
-            # after a Hermes update or venv rebuild.
-            "$FLAT_SMOKE_VENV/bin/pip" install --force-reinstall --no-deps "$FLAT_DEP"
-            "$FLAT_SMOKE_VENV/bin/python" scripts/verify-cashew-baseline.py
+              "$FLAT_SMOKE_VENV/bin/python" "$GITHUB_WORKSPACE/scripts/verify-cashew-baseline.py" --installed
+            )
           } 2>&1 | tee flat-smoke.log
 
       - name: CI-03 (wheel-smoke) — fail if embedding model was downloaded during wheel install/import

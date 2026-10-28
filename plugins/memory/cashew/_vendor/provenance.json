@@ -1,0 +1,111 @@
+{
+  "archive_sha256": "23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3",
+  "archive_url": "https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz",
+  "commit": "fcb4919ac37144bfbeb822eaafc668a4bdceb791",
+  "files": {
+    "core/__init__.py": {
+      "runtime_sha256": "0abe563bfc07c89ec4e0cc07b785aedefc97f145b3bb4988a67880b82422dd03",
+      "upstream_sha256": "0abe563bfc07c89ec4e0cc07b785aedefc97f145b3bb4988a67880b82422dd03"
+    },
+    "core/backup.py": {
+      "runtime_sha256": "ccc5b673ee93c9336eb8a71886902f291deea352e46bc80cf8b229a253c239d1",
+      "upstream_sha256": "ccc5b673ee93c9336eb8a71886902f291deea352e46bc80cf8b229a253c239d1"
+    },
+    "core/config.py": {
+      "runtime_sha256": "d585c5a8513cb5afa50f64abd3026080802a896994434d1a973141584778b2d0",
+      "upstream_sha256": "d585c5a8513cb5afa50f64abd3026080802a896994434d1a973141584778b2d0"
+    },
+    "core/context.py": {
+      "runtime_sha256": "4503b926535345e5be87b9ca45d650f77f2e6c873ab31e828c2d654838da0fc7",
+      "upstream_sha256": "4503b926535345e5be87b9ca45d650f77f2e6c873ab31e828c2d654838da0fc7"
+    },
+    "core/daemon.py": {
+      "runtime_sha256": "fffdae881bcb732fd8020dccecf939344590b6ca62c2fae8b5d31636a7ea2afc",
+      "upstream_sha256": "fffdae881bcb732fd8020dccecf939344590b6ca62c2fae8b5d31636a7ea2afc"
+    },
+    "core/db.py": {
+      "runtime_sha256": "41285bdc147172b23acd3d8eb89d134de2d47e1307bae7aca3e33ce065d6560d",
+      "upstream_sha256": "69d50b0af5df7e7db13e191583b02dbbc00ed11901b321d2f47fbc5b151cb80f"
+    },
+    "core/decay.py": {
+      "runtime_sha256": "46cd0698e8550adb2740472f26d482a0f6be470d739a84fa69427720b335b745",
+      "upstream_sha256": "46cd0698e8550adb2740472f26d482a0f6be470d739a84fa69427720b335b745"
+    },
+    "core/decay_audit.py": {
+      "runtime_sha256": "47bb95e78378a9d78ac68ab6529424148cff8f6e3ab8ace4a60ce9a85c21417b",
+      "upstream_sha256": "47bb95e78378a9d78ac68ab6529424148cff8f6e3ab8ace4a60ce9a85c21417b"
+    },
+    "core/embedding_cache.py": {
+      "runtime_sha256": "f6152539704d6577f37979369375133bdef947f311bb8114c90c3ae3d0875159",
+      "upstream_sha256": "f6152539704d6577f37979369375133bdef947f311bb8114c90c3ae3d0875159"
+    },
+    "core/embedding_service.py": {
+      "runtime_sha256": "1c1ee0ce2cb0cd2586a4d04a962c567127b49618efd4011d974e61c2df90cc0d",
+      "upstream_sha256": "1c1ee0ce2cb0cd2586a4d04a962c567127b49618efd4011d974e61c2df90cc0d"
+    },
+    "core/embeddings.py": {
+      "runtime_sha256": "eb3831d32b5070eda013533976a1cc415abd0c91766edf163dccc984dc82e801",
+      "upstream_sha256": "eb3831d32b5070eda013533976a1cc415abd0c91766edf163dccc984dc82e801"
+    },
+    "core/export.py": {
+      "runtime_sha256": "f18feec0cab32177d8ad2f9b2a8bdb45cd7ed57d78437c01b805b267746da6d6",
+      "upstream_sha256": "f18feec0cab32177d8ad2f9b2a8bdb45cd7ed57d78437c01b805b267746da6d6"
+    },
+    "core/extractors.py": {
+      "runtime_sha256": "2c7f992fde682a10cce70229c54cd8112fcb1504afbb996d91783e389f338e15",
+      "upstream_sha256": "fe61b1dd37438507addef15b2ff45ac9d8363e1d449ec9cb9f7b501bea4afd4a"
+    },
+    "core/graph_utils.py": {
+      "runtime_sha256": "ee5c90d9b7a115690cb1ca29658df1e731e3c5e5782126291ce4f895f4ecef3d",
+      "upstream_sha256": "ee5c90d9b7a115690cb1ca29658df1e731e3c5e5782126291ce4f895f4ecef3d"
+    },
+    "core/integrity.py": {
+      "runtime_sha256": "80e928c4a073aadb9340095a27b65f03512393d9c1e03cfd025e9aa70d99b9ba",
+      "upstream_sha256": "80e928c4a073aadb9340095a27b65f03512393d9c1e03cfd025e9aa70d99b9ba"
+    },
+    "core/llm.py": {
+      "runtime_sha256": "3b3ceebf1e5d71c27dc3710a5901e4f09c553e74ab864117598c1ae5f8097ae7",
+      "upstream_sha256": "3b3ceebf1e5d71c27dc3710a5901e4f09c553e74ab864117598c1ae5f8097ae7"
+    },
+    "core/metrics.py": {
+      "runtime_sha256": "1ecc11a6e32f7f8223f78434185cced395420aed28f1e2ce81aefd06954d4753",
+      "upstream_sha256": "1ecc11a6e32f7f8223f78434185cced395420aed28f1e2ce81aefd06954d4753"
+    },
+    "core/model_profiles.py": {
+      "runtime_sha256": "7dcb8328737669fa082b327cbea69feb2d645ba17cea7385a85ef2070212d42e",
+      "upstream_sha256": "7dcb8328737669fa082b327cbea69feb2d645ba17cea7385a85ef2070212d42e"
+    },
+    "core/permanence.py": {
+      "runtime_sha256": "1dc47636d3ec1fcfe60d6374dcb03eab3fe4477414de385a2fabd3f2965f140c",
+      "upstream_sha256": "1dc47636d3ec1fcfe60d6374dcb03eab3fe4477414de385a2fabd3f2965f140c"
+    },
+    "core/retrieval.py": {
+      "runtime_sha256": "a8ac144d9172d5b7a5105d519f9bdcc725e380974429c052629e301da1075a6d",
+      "upstream_sha256": "a8ac144d9172d5b7a5105d519f9bdcc725e380974429c052629e301da1075a6d"
+    },
+    "core/session.py": {
+      "runtime_sha256": "fd2a0a8b5dd8f9fc3e76aa5a7bdc78597e0d65557fc8403efd4ebca678dbc655",
+      "upstream_sha256": "0ce60cc63adf4fb7136581aee722bb10e9a344e556b6fb98f4d46855d53c36cd"
+    },
+    "core/sleep.py": {
+      "runtime_sha256": "7022b6a763f9176959f7b209c76404c999f11f1ed0b841a6bfed158fdfe40f03",
+      "upstream_sha256": "2d8cd35ee2ce45f6b2eb3eb4dc1396ab6e157711c0a7eadfbf5e4afe6823b7db"
+    },
+    "core/stats.py": {
+      "runtime_sha256": "282327e17cd7a9aaff9eedc2cf19bc26227d3ad4c05bcb12ff3750cfbc4c25d7",
+      "upstream_sha256": "282327e17cd7a9aaff9eedc2cf19bc26227d3ad4c05bcb12ff3750cfbc4c25d7"
+    },
+    "core/traversal.py": {
+      "runtime_sha256": "bf0a05e1bf8b645f7d56b2e76ad6122a89ff680a64eaac196e6f35e0c5bc7e0a",
+      "upstream_sha256": "bf0a05e1bf8b645f7d56b2e76ad6122a89ff680a64eaac196e6f35e0c5bc7e0a"
+    },
+    "scripts/migrate_embeddings.py": {
+      "runtime_sha256": "3aabd0bf6f45d18ed3347cfe8f4a368b2b6b9cdfcf6cae91a7e84541f4119eac",
+      "upstream_sha256": "36d36746ffdbd4cc4cb3952a769291e9046acf579e62bdd633cf0c544a16d140"
+    }
+  },
+  "license_sha256": "8f713dc86b956eb075e2e1cb50aebbb166594d89cd26ac2b6f9c1c9737dfca26",
+  "pristine_sha256": "017a81f3a23c6d3195c3d6b1096d35bb2e83f2ebc069a7853d49a465cf0f568c",
+  "relocation": "relative intra-engine imports; remove migration CLI sys.path bootstrap",
+  "tree": "29d97fb93c7998c97be0da8f19b90c6523f9d1e9"
+}

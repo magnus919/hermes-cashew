@@ -340,7 +340,9 @@ def test_queue_prefetch_roundtrip_hits_warm_cache_without_second_retrieval(
         calls.append(kwargs)
         return [SimpleNamespace(node_id="warm")]
 
-    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", retrieve)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs", retrieve
+    )
     monkeypatch.setattr(
         provider,
         "_enrich_results",
@@ -371,7 +373,9 @@ def test_queue_prefetch_filtered_request_cold_falls_through_staged_result(
         node_id = "work" if kwargs.get("domain") == "work" else "personal"
         return [SimpleNamespace(node_id=node_id)]
 
-    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", retrieve)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs", retrieve
+    )
     monkeypatch.setattr(
         provider,
         "_enrich_results",
@@ -419,7 +423,9 @@ def test_queue_prefetch_dispatches_tracked_background_thread(
         return []
 
     monkeypatch.setattr(
-        "core.retrieval.retrieve_recursive_bfs", blocked_retrieval, raising=False
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs",
+        blocked_retrieval,
+        raising=False,
     )
     provider.queue_prefetch("test query")
     assert started.wait(timeout=1.0)
@@ -460,7 +466,9 @@ def test_queue_prefetch_burst_has_one_active_and_one_latest_pending(
         return []
 
     monkeypatch.setattr(
-        "core.retrieval.retrieve_recursive_bfs", blocked_retrieval, raising=False
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs",
+        blocked_retrieval,
+        raising=False,
     )
     before = _METRICS._snapshot()["prefetch_coalesced"]
     provider.queue_prefetch("active request")
@@ -505,7 +513,7 @@ def test_superseded_active_prefetch_skips_retrieval_after_cue_extraction(
 
     provider._model_fn = blocked_model
     monkeypatch.setattr(
-        "core.retrieval.retrieve_recursive_bfs",
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs",
         lambda **kwargs: retrieval_queries.append(kwargs["query"]) or [],
         raising=False,
     )
@@ -538,7 +546,9 @@ def test_active_prefetch_drops_result_after_runtime_identity_change(
         return [SimpleNamespace(node_id="late")]
 
     monkeypatch.setattr(
-        "core.retrieval.retrieve_recursive_bfs", blocked_retrieval, raising=False
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs",
+        blocked_retrieval,
+        raising=False,
     )
     monkeypatch.setattr(
         provider,
@@ -579,7 +589,9 @@ def test_idle_prefetch_worker_is_reused_for_the_next_request(
         calls.append(kwargs["query"])
         return []
 
-    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", retrieve)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs", retrieve
+    )
 
     provider.queue_prefetch("first request")
     assert _wait_for_prefetch_idle(provider)
@@ -605,7 +617,9 @@ def test_prefetch_worker_restarts_after_shutdown_and_reinitialize(
         calls.append((kwargs["query"], kwargs["db_path"]))
         return []
 
-    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", retrieve)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs", retrieve
+    )
 
     provider.initialize("first-session", hermes_home=str(tmp_path))
     provider.queue_prefetch("first request")
@@ -646,7 +660,9 @@ def test_shutdown_waits_for_accepted_prefetch_before_clearing_state(
         return []
 
     monkeypatch.setattr(
-        "core.retrieval.retrieve_recursive_bfs", blocked_retrieval, raising=False
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs",
+        blocked_retrieval,
+        raising=False,
     )
     expected_db = provider._db_path
     provider.queue_prefetch("test query")
@@ -684,7 +700,9 @@ def test_shutdown_timeout_retains_state_until_prefetch_exits(
         return []
 
     monkeypatch.setattr(
-        "core.retrieval.retrieve_recursive_bfs", blocked_retrieval, raising=False
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs",
+        blocked_retrieval,
+        raising=False,
     )
     expected_db = provider._db_path
     provider.queue_prefetch("test query")

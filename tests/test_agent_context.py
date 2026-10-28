@@ -40,7 +40,7 @@ def test_non_primary_context_rejects_background_and_explicit_writes(
 ) -> None:
     calls: list[dict] = []
     monkeypatch.setattr(
-        "core.session.end_session",
+        "plugins.memory.cashew._vendor.core.session.end_session",
         lambda **kwargs: calls.append(kwargs),
         raising=False,
     )

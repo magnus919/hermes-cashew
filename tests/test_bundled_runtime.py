@@ -1,5 +1,6 @@
 """Installer and private-engine regressions for discussion #261."""
 
+import json
 import shutil
 from pathlib import Path
 
@@ -11,7 +12,7 @@ except ModuleNotFoundError:
     import tomli as tomllib
 
 
-def test_all_runtime_requirements_survive_hermes_admission():
+def test_all_runtime_requirements_survive_hermes_admission() -> None:
     root = Path(__file__).resolve().parents[1]
     specs = tomllib.loads((root / "pyproject.toml").read_text())["project"][
         "dependencies"
@@ -22,10 +23,10 @@ def test_all_runtime_requirements_survive_hermes_admission():
 
     fixture = root / "tests/fixtures/hermes-pm/plugin_declarations.py"
     source = fixture.read_bytes()
-    assert (
-        hashlib.sha256(source).hexdigest()
-        == "fafbb66a9e0ac3f685c7558bc56403f149e6c1f58066dc7f9b5f56df020a016f"
-    )
+    provenance = json.loads((fixture.parent / "PROVENANCE.json").read_text())
+    assert provenance["commit"] == "5b32cfc230078417fc523e12b9aabbc9b59f684b"
+    assert provenance["file"] == "pm/plugin_declarations.py"
+    assert hashlib.sha256(source).hexdigest() == provenance["sha256"]
     tree = ast.parse(source)
     function = next(
         n
@@ -41,7 +42,7 @@ def test_all_runtime_requirements_survive_hermes_admission():
     assert accepted == specs, "Hermes discards required direct-URL dependencies"
 
 
-def test_bundled_provenance_and_import_only_relocation():
+def test_bundled_provenance_and_import_only_relocation() -> None:
     from plugins.memory.cashew._vendor.verify import verify
 
     manifest = verify()
@@ -52,7 +53,9 @@ def test_bundled_provenance_and_import_only_relocation():
 @pytest.mark.parametrize(
     "mutation", ["changed", "missing", "extra", "pristine", "license"]
 )
-def test_provenance_rejects_changed_or_incomplete_vendor(tmp_path, mutation):
+def test_provenance_rejects_changed_or_incomplete_vendor(
+    tmp_path: Path, mutation: str
+) -> None:
     from plugins.memory.cashew._vendor import verify as verifier
 
     source = Path(verifier.__file__).resolve().parent
@@ -74,7 +77,7 @@ def test_provenance_rejects_changed_or_incomplete_vendor(tmp_path, mutation):
         verifier.verify(vendor)
 
 
-def test_bundled_engine_ignores_preimported_ambient_core(tmp_path):
+def test_bundled_engine_ignores_preimported_ambient_core(tmp_path: Path) -> None:
     import subprocess
     import sys
     import textwrap
@@ -108,7 +111,7 @@ def test_bundled_engine_ignores_preimported_ambient_core(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_flat_source_audit_needs_no_installed_package_metadata():
+def test_flat_source_audit_needs_no_installed_package_metadata() -> None:
     import subprocess
     import sys
 
@@ -118,3 +121,21 @@ def test_flat_source_audit_needs_no_installed_package_metadata():
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "bundled Cashew source verified" in result.stdout
+
+
+def test_relocation_changes_only_allowlisted_import_plumbing() -> None:
+    from plugins.memory.cashew._vendor.verify import relocate
+
+    original = b"from core.db import ensure_schema\n    from core.session import end_session\nvalue = 'from core.db import fake'\nfrom .config import config\n"
+    assert (
+        relocate("core/example.py", original)
+        == b"from .db import ensure_schema\n    from .session import end_session\nvalue = 'from core.db import fake'\nfrom .config import config\n"
+    )
+    bootstrap = b"ROOT = Path(__file__).resolve().parent.parent\nif str(ROOT) not in sys.path:\n    sys.path.insert(0, str(ROOT))\n"
+    script = bootstrap + b"from core.embeddings import embed_nodes\nresult = 42\n"
+    assert (
+        relocate("scripts/migrate_embeddings.py", script)
+        == b"from ..core.embeddings import embed_nodes\nresult = 42\n"
+    )
+    assert relocate("core/example.py", bootstrap) == bootstrap
+    assert relocate("core/example.txt", original) == original

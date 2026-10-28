@@ -18,6 +18,20 @@ PRISTINE_SHA256 = "017a81f3a23c6d3195c3d6b1096d35bb2e83f2ebc069a7853d49a465cf0f5
 LICENSE_SHA256 = "8f713dc86b956eb075e2e1cb50aebbb166594d89cd26ac2b6f9c1c9737dfca26"
 
 
+def relocate(name: str, original: bytes) -> bytes:
+    """Apply the sole allowlisted packaging transformation to upstream bytes."""
+    relocated = original
+    if name.endswith(".py"):
+        prefix = rb"\1from ..core." if name.startswith("scripts/") else rb"\1from ."
+        relocated = re.sub(rb"(?m)^([ \t]*)from core\.", prefix, original)
+    if name == "scripts/migrate_embeddings.py":
+        relocated = relocated.replace(
+            b"ROOT = Path(__file__).resolve().parent.parent\nif str(ROOT) not in sys.path:\n    sys.path.insert(0, str(ROOT))\n",
+            b"",
+        )
+    return relocated
+
+
 def verify(root: Path | None = None) -> dict[str, Any]:
     """Reject changed/incomplete snapshots and non-import runtime modifications."""
     root = root or Path(__file__).resolve().parent
@@ -65,17 +79,7 @@ def verify(root: Path | None = None) -> dict[str, Any]:
             expected = manifest["files"][name]
             if hashlib.sha256(original).hexdigest() != expected["upstream_sha256"]:
                 raise ValueError(f"pristine source hash mismatch: {name}")
-            relocated = original
-            if name.endswith(".py"):
-                prefix = (
-                    rb"\1from ..core." if name.startswith("scripts/") else rb"\1from ."
-                )
-                relocated = re.sub(rb"(?m)^([ \t]*)from core\.", prefix, original)
-            if name == "scripts/migrate_embeddings.py":
-                relocated = relocated.replace(
-                    b"ROOT = Path(__file__).resolve().parent.parent\nif str(ROOT) not in sys.path:\n    sys.path.insert(0, str(ROOT))\n",
-                    b"",
-                )
+            relocated = relocate(name, original)
             installed = root / name
             if installed.is_symlink():
                 raise ValueError(f"bundled source is a symlink: {name}")

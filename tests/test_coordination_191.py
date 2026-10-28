@@ -60,9 +60,11 @@ def _run_think_process(
     recover: bool = False,
 ) -> None:
     """Exercise the production think caller with only the opaque model mocked."""
-    import core.session
-
     from plugins.memory.cashew import CashewMemoryProvider
+    from plugins.memory.cashew._vendor import core
+    from plugins.memory.cashew._vendor.core import (
+        session as _vendor_session,  # noqa: F401
+    )
     from plugins.memory.cashew.config import CashewConfig
 
     provider = CashewMemoryProvider()
@@ -322,7 +324,7 @@ def test_generation_bound_cache_rejects_stale_put_without_exact_admission(tmp_pa
 
 def test_real_cache_facade_get_compute_put_preserves_per_model_metadata(tmp_path):
     """The pinned EmbeddingCache uses one leased file with model-scoped metadata."""
-    from core.embedding_cache import EmbeddingCache
+    from plugins.memory.cashew._vendor.core.embedding_cache import EmbeddingCache
 
     cache_path = tmp_path / "shared-cache.db"
     graph_a = tmp_path / "graph-a.db"
@@ -847,7 +849,7 @@ def test_affected_wal_provider_never_enters_write_or_upstream_paths(
     tmp_path, monkeypatch
 ):
     """A verified affected-WAL profile remains read-only across provider APIs."""
-    from core.db import ensure_schema
+    from plugins.memory.cashew._vendor.core.db import ensure_schema
 
     db = tmp_path / "affected-live-wal.db"
     ensure_schema(str(db))
@@ -896,10 +898,20 @@ def test_affected_wal_provider_never_enters_write_or_upstream_paths(
 
         return fail
 
-    monkeypatch.setattr("core.embedding_cache.EmbeddingCache", forbidden("cache"))
-    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", forbidden("bfs"))
-    monkeypatch.setattr("core.session.end_session", forbidden("extract"))
-    monkeypatch.setattr("core.session.think_cycle", forbidden("think"))
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.embedding_cache.EmbeddingCache",
+        forbidden("cache"),
+    )
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs",
+        forbidden("bfs"),
+    )
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.session.end_session", forbidden("extract")
+    )
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.session.think_cycle", forbidden("think")
+    )
     monkeypatch.setattr(
         "plugins.memory.cashew.sleep_adapter.run_sleep_cycle", forbidden("sleep")
     )
@@ -1007,7 +1019,9 @@ def test_admitted_busy_failure_is_not_replayed(tmp_path, monkeypatch):
         calls += 1
         raise sqlite3.OperationalError("database is locked")
 
-    monkeypatch.setattr("core.session.end_session", busy, raising=False)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.session.end_session", busy, raising=False
+    )
     with pytest.raises(RuntimeError, match="not replayable"):
         provider._drain_once(("u", "a", "s"))
     assert calls == 1
@@ -1040,7 +1054,11 @@ def test_unknown_upstream_failure_is_uncertain_and_not_replayed(tmp_path, monkey
         # returns no ExtractionResult, leaving commit progress unknowable.
         return None
 
-    monkeypatch.setattr("core.session.end_session", swallowed_progress, raising=False)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        swallowed_progress,
+        raising=False,
+    )
     ledger = provider._outcomes
     ledger.admit()
     ledger.start()
@@ -1092,7 +1110,9 @@ def test_opaque_upstream_prefix_is_partial_and_unknown_is_not_replayed(
         raise RuntimeError("upstream failed after commit")
 
     monkeypatch.setattr(
-        "core.session.end_session", writes_prefix_then_fails, raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        writes_prefix_then_fails,
+        raising=False,
     )
     ledger = provider._outcomes
     ledger.admit()
@@ -1139,7 +1159,9 @@ def test_think_claim_failure_is_uncertain_and_blocks_replay(tmp_path, monkeypatc
         calls += 1
         raise RuntimeError("model failed")
 
-    monkeypatch.setattr("core.session.think_cycle", fail, raising=False)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.session.think_cycle", fail, raising=False
+    )
     provider._run_think_cycle_if_due()
     provider._run_think_cycle_if_due()
     with sqlite3.connect(db) as conn:
@@ -1177,7 +1199,11 @@ def test_corrupt_think_counter_is_reset_without_opaque_call(tmp_path, monkeypatc
     def forbidden(**_kwargs):
         raise AssertionError("corrupt metadata must not invoke think_cycle")
 
-    monkeypatch.setattr("core.session.think_cycle", forbidden, raising=False)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.session.think_cycle",
+        forbidden,
+        raising=False,
+    )
     provider._run_think_cycle_if_due()
 
     with sqlite3.connect(db) as conn:

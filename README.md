@@ -69,9 +69,9 @@ database and generated backups for manual review.
 ## Prerequisites
 
 - [Hermes Agent](https://github.com/nousresearch/hermes-agent) installed
-- `cashew-brain` from the reviewed upstream source commit documented below
+- Cashew engine included with the plugin; no separate `cashew-brain` install
 - SQLite 3.35 or newer, required for Cashew's legacy v1 schema migration
-- `sqlite-vec` — enables vector similarity search; included in the manual install below
+- `sqlite-vec` — enables vector similarity search; installed as a runtime dependency
 
 ## Install
 
@@ -79,48 +79,25 @@ database and generated backups for manual review.
 hermes plugins install magnus919/hermes-cashew
 ```
 
-This clones the repository to the active Hermes home under `plugins/cashew/`
-(default: `~/.hermes/plugins/cashew/`) and registers the
-plugin entry point. This interim source baseline uses a direct URL that the
-current Hermes dependency installer intentionally rejects. Install the exact
-source archive into the Hermes environment before setup:
+This installs into the active Hermes home under `plugins/cashew/`
+(default: `~/.hermes/plugins/cashew/`). Hermes installs ordinary index dependencies;
+the reviewed Cashew engine ships inside the plugin. No manual direct-URL install
+is needed after installation or a Hermes environment rebuild.
 
-The interpreter examples below assume the default Hermes installation. If your
-Hermes environment is installed elsewhere, substitute its Python executable.
-Profile files use `HERMES_HOME`, falling back to `$HOME/.hermes`.
+The bundled engine is the selected composite commit
+`fcb4919ac37144bfbeb822eaafc668a4bdceb791`. Its schema, retrieval, session, sleep,
+and integrity algorithms remain upstream-owned. A private namespace prevents an
+older separately installed `cashew-brain` from replacing it. The bundle includes
+the upstream MIT license, a pristine source snapshot, and a file-by-file provenance
+inventory. Absolute intra-engine imports are mechanically relocated, and the standalone
+migration script's `sys.path` bootstrap is removed.
+See [upstream compatibility](docs/upstream-compatibility.md) for the source and
+replacement policy.
 
-```bash
-CASHEW_PIN='cashew-brain @ https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz#sha256=23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3'
-uv pip install \
-  --python ~/.hermes/hermes-agent/venv/bin/python3 \
-  --reinstall "$CASHEW_PIN" sqlite-vec
-~/.hermes/hermes-agent/venv/bin/python3 \
-  "${HERMES_HOME:-$HOME/.hermes}/plugins/cashew/scripts/verify-cashew-baseline.py"
-```
-
-This archive is an immutable composite fork of upstream Cashew. It combines PR
-136 (`ac090ce75ffd2e97dac257cee9430628c68aa241`) and PR 137
-(`cb940f34c15460b87831748b2e702334c1c5fbd0`) at tree
-`29d97fb93c7998c97be0da8f19b90c6523f9d1e9`. The composite contains the commit
-that was proposed as PR 136 before that PR merged upstream, plus the
-still-noncanonical PR 137 commit. It is not equivalent to the current tip of
-the merged PR 136 branch. A separate tested dependency update can replace this
-archive with an immutable canonical revision or release that proves both
-required contracts. Publishing to PyPI still requires a suitable release
-because PyPI rejects direct URL dependencies.
-
-The lockfile enforces the archive digest during installation; uv may omit that
-digest from the installed PEP 610 metadata, so verification requires the exact
-source URL and validates a recorded digest when one is present. The verification
-step is required because the selected source and the older
-PyPI release both report version `1.2.1`. A version-only check cannot tell them
-apart. It also checks the linked SQLite version and source ID. Both the selected
-source and the existing PyPI `1.2.1` code require SQLite 3.35 or newer to
-migrate a legacy v1 database because that migration uses `ALTER TABLE ... DROP
-COLUMN`; this requirement was discovered by the source-pin gate rather than
-introduced by it. `hermes memory setup` may warn that it refused the direct
-URL; that warning is expected and does not replace or downgrade a manually
-installed candidate.
+SQLite 3.35 or newer is required for legacy v1 migrations. To audit the installed
+bundle and linked SQLite runtime, run `scripts/verify-cashew-baseline.py` with the
+Python interpreter selected by Hermes for the plugin. Version metadata alone does
+not identify the selected engine.
 
 ### Optional diagnostics
 
@@ -162,27 +139,23 @@ hermes memory setup
 
 ### Update and rollback
 
-`hermes plugins update cashew`, `hermes update`, and a Hermes virtual-environment
-rebuild do not install this direct URL automatically. Re-run the exact
-`uv pip install` and provenance verification commands above after any of those
-operations, then restart the gateway.
-
-The published upstream `cashew-brain==1.2.1` release predates the selected
-composite and does not provide its PR 136/137 contracts. Installing it is an
-unsupported diagnostic rollback: the provenance verifier will reject it and
-sleep, embedding, and resource-safety behavior must be revalidated before use.
-If that diagnostic rollback is necessary:
+Update through Hermes:
 
 ```bash
-uv pip install \
-  --python ~/.hermes/hermes-agent/venv/bin/python3 \
-  --reinstall 'cashew-brain==1.2.1'
+hermes plugins update cashew
 hermes gateway restart
+hermes memory status
 ```
 
-Do not run `hermes memory setup` expecting it to restore the source pin. To
-return to the selected source later, re-run the full pinned install and
-provenance verification commands.
+`hermes update` and environment rebuilds retain the engine as part of the plugin;
+there is no separately installed source dependency to restore. A catalog pin may
+need to advance before a catalog installation selects a newly merged fix. Updating
+the separately installed PyPI `cashew-brain` does not update the bundled engine.
+
+To roll back, select a previously tested plugin revision through Hermes. Keep
+profile configuration and graph backups; uninstalling the plugin is unnecessary
+for routine updates. Older plugin revisions may still require their documented
+manual dependency setup and should not be assumed compatible with current data.
 
 ## Zero-Config Startup
 
@@ -567,31 +540,25 @@ rm -rf "${HERMES_HOME:-$HOME/.hermes}/cashew"
 
 ### `Plugin: NOT installed` in `hermes memory status`
 
-1. **cashew-brain not installed in Hermes venv** — install and verify the exact
-   source baseline from [Install](#install). If `uv` is unavailable, bootstrap
-   pip in the Hermes environment and pass the same quoted `CASHEW_PIN` value:
-   ```bash
-   CASHEW_PIN='cashew-brain @ https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz#sha256=23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3'
-   ~/.hermes/hermes-agent/venv/bin/python3 -m ensurepip
-   ~/.hermes/hermes-agent/venv/bin/python3 -m pip install \
-     --force-reinstall "$CASHEW_PIN" sqlite-vec
-   ```
+Check that Hermes installed and enabled the plugin for the active profile:
 
-2. **Stale pycache or entry point not registered** — If cashew-brain is installed
-   but the plugin still shows NOT installed:
-   ```bash
-   cd "${HERMES_HOME:-$HOME/.hermes}/plugins/cashew" && \
-     ~/.hermes/hermes-agent/venv/bin/python3 -m pip install -e .
-   hermes gateway restart
-   ```
+```bash
+hermes plugins list
+hermes plugins doctor
+hermes memory status
+```
+
+Update or reinstall the intended plugin revision through Hermes if its files are
+missing. Preserve `cashew.json` and the graph database. Do not install an unrelated
+`cashew-brain` release to repair this plugin's bundled engine.
 
 ### `Status: not available`
 
-The plugin is available when cashew-brain is importable. Check:
-```bash
-~/.hermes/hermes-agent/venv/bin/python3 -c "from core.context import ContextRetriever; print('ok')"
-```
-If this fails, cashew-brain is not installed in the Hermes venv (see above).
+Check the active profile, declared dependency installation, and startup logs.
+Run `scripts/verify-cashew-baseline.py` with Hermes' selected plugin interpreter to
+verify the bundled source. A damaged or incomplete bundle requires reinstalling
+the same reviewed plugin revision. Model availability and initialization health
+are separate from dependency importability; see the health guidance above.
 
 ### Hermes-agent venv has no `pip`
 
@@ -607,7 +574,7 @@ or the package will land in the wrong environment.
 
 ### Embedding model download on first use
 
-`cashew-brain` bundles sentence-transformers. The first retrieval operation may
+The plugin installs sentence-transformers. The first retrieval operation may
 trigger a ~500 MB embedding model download. To avoid this in automated environments:
 
 ```bash

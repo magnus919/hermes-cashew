@@ -13,20 +13,14 @@ Profile files use `HERMES_HOME`, falling back to `$HOME/.hermes`.
 
 ```bash
 hermes plugins install cashew
-CASHEW_PIN='cashew-brain @ https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz#sha256=23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3'
-uv pip install --python ~/.hermes/hermes-agent/venv/bin/python3 \
-  --reinstall "$CASHEW_PIN" sqlite-vec
-~/.hermes/hermes-agent/venv/bin/python3 \
-  "${HERMES_HOME:-$HOME/.hermes}/plugins/cashew/scripts/verify-cashew-baseline.py"
 hermes memory setup    # configure provider
 hermes gateway restart
 ```
 
-The manual dependency step is currently required because Hermes rejects direct
-URL dependencies from plugin manifests. The selected upstream source and the
-older PyPI release both report version `1.2.1`, so keep the provenance check.
-Reapply and verify the pin after `hermes plugins update cashew`, `hermes update`,
-or a Hermes virtual-environment rebuild.
+The engine is bundled privately with the plugin. Hermes installs its ordinary
+index dependencies; no separate Cashew package needs restoring after
+`hermes plugins update cashew`, `hermes update`, or an environment rebuild.
+See the root README for provenance verification and update guidance.
 
 ## Configuration
 

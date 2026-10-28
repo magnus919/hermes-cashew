@@ -8,10 +8,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from core.backup import create_backup
-from core.db import ensure_schema
 
 from plugins.memory.cashew import sleep_adapter
+from plugins.memory.cashew._vendor.core.backup import create_backup
+from plugins.memory.cashew._vendor.core.db import ensure_schema
 from plugins.memory.cashew.config import resolve_db_path
 from plugins.memory.cashew.locking import try_maintenance_lock
 
@@ -35,7 +35,12 @@ def _brain(tmp_path: Path) -> Path:
                 "INSERT INTO thought_nodes "
                 "(id, content, node_type, domain, timestamp, source_file, permanent) "
                 "VALUES (?, ?, 'observation', 'test', '2026-09-12T00:00:00Z', ?, ?)",
-                (node_id, f"memory {node_id}", f"source-{index}", 1 if index == 0 else 0),
+                (
+                    node_id,
+                    f"memory {node_id}",
+                    f"source-{index}",
+                    1 if index == 0 else 0,
+                ),
             )
             vector = np.zeros(DIMENSION, dtype=np.float32)
             if index == 0:
@@ -88,8 +93,12 @@ def test_adapter_preserves_profile_backup_and_before_after_identity(
         )
         conn.executemany(
             "INSERT OR REPLACE INTO hermes_provider_meta (key, value) VALUES (?, ?)",
-            [("embedding_model", MODEL), ("embedding_dim", str(DIMENSION)),
-             ("vec_dim", str(DIMENSION)), ("maintenance_epoch", "1")],
+            [
+                ("embedding_model", MODEL),
+                ("embedding_dim", str(DIMENSION)),
+                ("vec_dim", str(DIMENSION)),
+                ("maintenance_epoch", "1"),
+            ],
         )
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
@@ -108,7 +117,12 @@ def test_adapter_preserves_profile_backup_and_before_after_identity(
                 "INSERT INTO thought_nodes "
                 "(id, content, node_type, domain, timestamp, source_file, permanent) "
                 "VALUES (?, ?, 'observation', 'test', '2026-09-12T00:00:00Z', ?, ?)",
-                (node_id, f"memory {node_id}", f"source-{index}", 1 if index == 0 else 0),
+                (
+                    node_id,
+                    f"memory {node_id}",
+                    f"source-{index}",
+                    1 if index == 0 else 0,
+                ),
             )
             blob = vector.tobytes()
             conn.execute(
@@ -158,7 +172,9 @@ def test_adapter_preserves_profile_backup_and_before_after_identity(
     assert hashlib.sha256(backup_path.read_bytes()).hexdigest() == backup_hash
     assert backup_path.parent == db_path.parent / "backups"
     with sqlite3.connect(db_path) as conn:
-        audit_columns = {row[1] for row in conn.execute("PRAGMA table_info(decay_audit)")}
+        audit_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(decay_audit)")
+        }
         assert {"node_id", "decay_reason", "decay_timestamp"} <= audit_columns
 
 
@@ -182,9 +198,12 @@ def test_configured_model_fn_runs_for_real_cross_source_pair(tmp_path: Path) -> 
     assert result["dream_generation"] == "ran"
     assert calls and "SNIPPET A" in calls[0]
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM thought_nodes WHERE node_type = 'dream'"
-        ).fetchone()[0] == 1
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM thought_nodes WHERE node_type = 'dream'"
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_cross_link_cap_reports_truthful_persisted_directed_rows(
@@ -262,13 +281,19 @@ def test_gc_audit_and_permanence_are_preserved_at_upstream_boundary(
 
     assert result["nodes_gc_decayed"] == 50
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute(
-            "SELECT decayed FROM thought_nodes WHERE id = 'stale-0'"
-        ).fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM thought_nodes "
-            "WHERE id LIKE 'stale-%' AND decayed = 1"
-        ).fetchone()[0] == 50
+        assert (
+            conn.execute(
+                "SELECT decayed FROM thought_nodes WHERE id = 'stale-0'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM thought_nodes "
+                "WHERE id LIKE 'stale-%' AND decayed = 1"
+            ).fetchone()[0]
+            == 50
+        )
         assert conn.execute("SELECT COUNT(*) FROM decay_audit").fetchone()[0] == 50
 
 
@@ -338,20 +363,27 @@ def test_real_vec_rows_survive_upstream_cycle_and_malformed_row_is_ignored(
                 "('left', 'right', 'third')"
             )
         } == {"left", "right", "third"}
-        assert conn.execute(
-            "SELECT vector FROM embeddings WHERE node_id = 'malformed'"
-        ).fetchone()[0] == b"bad"
-        assert conn.execute(
-            "SELECT vector FROM embeddings WHERE node_id = 'nan-node'"
-        ).fetchone()[0] == np.full(DIMENSION, np.nan, dtype=np.float32).tobytes()
-        assert conn.execute(
-            "SELECT length(vector) FROM embeddings WHERE node_id = 'wrong-dimension'"
-        ).fetchone()[0] == 8
+        assert (
+            conn.execute(
+                "SELECT vector FROM embeddings WHERE node_id = 'malformed'"
+            ).fetchone()[0]
+            == b"bad"
+        )
+        assert (
+            conn.execute(
+                "SELECT vector FROM embeddings WHERE node_id = 'nan-node'"
+            ).fetchone()[0]
+            == np.full(DIMENSION, np.nan, dtype=np.float32).tobytes()
+        )
+        assert (
+            conn.execute(
+                "SELECT length(vector) FROM embeddings WHERE node_id = 'wrong-dimension'"
+            ).fetchone()[0]
+            == 8
+        )
 
 
-def test_upstream_failure_degrades_silently(
-    monkeypatch: Any, tmp_path: Path
-) -> None:
+def test_upstream_failure_degrades_silently(monkeypatch: Any, tmp_path: Path) -> None:
     db_path = _brain(tmp_path)
 
     def fail(**kwargs: Any) -> dict[str, Any]:
@@ -375,7 +407,9 @@ def test_adapter_skips_when_maintenance_lease_is_held(tmp_path: Path) -> None:
         assert sleep_adapter.run_sleep_cycle(str(db_path), model_fn=None) == {}
 
 
-def test_configured_model_and_profile_are_forwarded(monkeypatch: Any, tmp_path: Path) -> None:
+def test_configured_model_and_profile_are_forwarded(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
     db_path = _brain(tmp_path)
     captured: dict[str, Any] = {}
 
@@ -385,9 +419,11 @@ def test_configured_model_and_profile_are_forwarded(monkeypatch: Any, tmp_path: 
 
     monkeypatch.setattr(sleep_adapter, "_upstream_run_sleep_cycle", fake_upstream)
     client = _EmbeddingClient()
+
     def model_fn(prompt: str) -> str:
         del prompt
         return "{}"
+
     result = sleep_adapter.run_sleep_cycle(
         str(db_path),
         limit=7,

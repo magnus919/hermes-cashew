@@ -71,28 +71,6 @@ if "agent.memory_provider" not in sys.modules:
     sys.modules["agent"] = _agent_pkg
     sys.modules["agent.memory_provider"] = _mp_mod
 
-# Synthesize core.session if cashew-brain is not installed.
-# Provides a minimal end_session stub so tests can monkeypatch core.session.end_session.
-# Use find_spec to detect cashew-brain without importing it — importing core.context
-# would populate sys.modules['core.session'] with the real module, blocking later patches.
-import importlib.util as _igu  # noqa: E402
-
-try:
-    _cashew_spec = _igu.find_spec("core.context")
-except ModuleNotFoundError:
-    _cashew_spec = None
-if "core.session" not in sys.modules and _cashew_spec is None:
-    _core_pkg = types.ModuleType("core")
-    _session_mod = types.ModuleType("core.session")
-
-    def _stub_end_session(**kwargs):
-        return types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[])
-
-    _session_mod.end_session = _stub_end_session
-    _core_pkg.session = _session_mod
-    sys.modules["core"] = _core_pkg
-    sys.modules["core.session"] = _session_mod
-
 # Phase 3: MemoryManager stub injection — must happen after agent.memory_provider
 # is already in sys.modules because the stub imports nothing from there directly
 # but Hermes ABC ordering conventions keep memory_provider ahead of memory_manager.
@@ -124,7 +102,9 @@ def fake_embedder(monkeypatch):
         )
 
     try:
-        import core.embeddings  # noqa: F401
+        from plugins.memory.cashew._vendor.core import (
+            embeddings as _vendor_embeddings,  # noqa: F401
+        )
 
         for attr in (
             "load_embeddings",
@@ -132,11 +112,21 @@ def fake_embedder(monkeypatch):
             "embed_text",
             "embed_nodes",
         ):
-            monkeypatch.setattr(f"core.embeddings.{attr}", _stub, raising=False)
-        import core.session  # noqa: F401
+            monkeypatch.setattr(
+                f"plugins.memory.cashew._vendor.core.embeddings.{attr}",
+                _stub,
+                raising=False,
+            )
+        from plugins.memory.cashew._vendor.core import (
+            session as _vendor_session,  # noqa: F401
+        )
 
         for attr in ("embed_text", "embed_nodes"):
-            monkeypatch.setattr(f"core.session.{attr}", _stub, raising=False)
+            monkeypatch.setattr(
+                f"plugins.memory.cashew._vendor.core.session.{attr}",
+                _stub,
+                raising=False,
+            )
     except ImportError:
         pass
     yield

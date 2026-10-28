@@ -18,6 +18,7 @@ import pytest
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+
 def _create_minimal_schema(conn: sqlite3.Connection) -> None:
     """Create the subset of Cashew schema needed by on_pre_compress tests."""
     conn.executescript("""
@@ -60,7 +61,9 @@ def _make_multimodal_msg(role: str, text_parts: list[str]) -> dict:
     parts = []
     for t in text_parts:
         parts.append({"type": "text", "text": t})
-    parts.append({"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}})
+    parts.append(
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+    )
     return {"role": role, "content": parts}
 
 
@@ -68,17 +71,36 @@ def _sample_messages(count: int = 6) -> list[dict]:
     """Generate a plausible conversation with detectable arc."""
     base = [
         _make_msg("user", "Can you help me set up a new memory provider for Hermes?"),
-        _make_msg("assistant", "Sure. Which provider are you considering? Cashew? Hindsight?"),
-        _make_msg("user", "Cashew looks interesting — I like that it's local and doesn't need a server."),
-        _make_msg("assistant", "Good choice. It uses SQLite with sentence-transformers for local embeddings."),
-        _make_msg("user", "How does the retrieval work? Is it just vector search or something smarter?"),
-        _make_msg("assistant", "It has three tiers: sqlite-vec for semantic search, keyword fallback, and BFS graph traversal."),
+        _make_msg(
+            "assistant", "Sure. Which provider are you considering? Cashew? Hindsight?"
+        ),
+        _make_msg(
+            "user",
+            "Cashew looks interesting — I like that it's local and doesn't need a server.",
+        ),
+        _make_msg(
+            "assistant",
+            "Good choice. It uses SQLite with sentence-transformers for local embeddings.",
+        ),
+        _make_msg(
+            "user",
+            "How does the retrieval work? Is it just vector search or something smarter?",
+        ),
+        _make_msg(
+            "assistant",
+            "It has three tiers: sqlite-vec for semantic search, keyword fallback, and BFS graph traversal.",
+        ),
     ]
     # Extend if more needed
     while len(base) < count:
         idx = len(base) // 2
         base.append(_make_msg("user", f"Can you explain more about tier {idx}?"))
-        base.append(_make_msg("assistant", f"Tier {idx} handles retrieval through a different mechanism..."))
+        base.append(
+            _make_msg(
+                "assistant",
+                f"Tier {idx} handles retrieval through a different mechanism...",
+            )
+        )
     return base[:count]
 
 
@@ -108,9 +130,15 @@ def provider_with_llm(tmp_db, monkeypatch) -> MagicMock:
     fake_set_tags = MagicMock()
     fake_embed_nodes = MagicMock()
 
-    monkeypatch.setattr("core.session._create_node", fake_create_node)
-    monkeypatch.setattr("core.session._set_node_tags", fake_set_tags)
-    monkeypatch.setattr("core.embeddings.embed_nodes", fake_embed_nodes)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.session._create_node", fake_create_node
+    )
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.session._set_node_tags", fake_set_tags
+    )
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.embeddings.embed_nodes", fake_embed_nodes
+    )
 
     # Build a minimal provider-like mock
     from plugins.memory.cashew import CashewMemoryProvider
@@ -130,6 +158,7 @@ def provider_with_llm(tmp_db, monkeypatch) -> MagicMock:
 def provider_without_llm(tmp_db) -> MagicMock:
     """Provider with model_fn=None (no LLM available)."""
     from plugins.memory.cashew import CashewMemoryProvider
+
     provider = CashewMemoryProvider()
     provider._db_path = tmp_db
     provider._model_fn = None
@@ -163,7 +192,7 @@ class TestContract:
 
     def test_returns_string_always(self, provider_with_llm):
         """Even with valid input, returns str type."""
-        provider_with_llm._model_fn = MagicMock(return_value='[]')
+        provider_with_llm._model_fn = MagicMock(return_value="[]")
         result = provider_with_llm.on_pre_compress(_sample_messages())
         assert isinstance(result, str)
 
@@ -176,23 +205,48 @@ class TestLLMPath:
 
     def test_valid_json_creates_nodes(self, provider_with_llm, tmp_db, monkeypatch):
         """Valid LLM response creates insight nodes via upstream API."""
-        valid_response = json.dumps([
-            {"content": "User asks 'why' before accepting solutions — recurring pattern", "type": "insight", "domain": "test_user", "tags": ["communication_style"], "keep": True},
-            {"content": "Discussion shifted from architecture to cost 3 times", "type": "observation", "domain": "test_user", "tags": ["topic_shift"], "keep": True},
-        ])
+        valid_response = json.dumps(
+            [
+                {
+                    "content": "User asks 'why' before accepting solutions — recurring pattern",
+                    "type": "insight",
+                    "domain": "test_user",
+                    "tags": ["communication_style"],
+                    "keep": True,
+                },
+                {
+                    "content": "Discussion shifted from architecture to cost 3 times",
+                    "type": "observation",
+                    "domain": "test_user",
+                    "tags": ["topic_shift"],
+                    "keep": True,
+                },
+            ]
+        )
         provider_with_llm._model_fn = MagicMock(return_value=valid_response)
 
         # Mock upstream node creation to actually write to DB
         real_created: list[str] = []
 
-        def _fake_create(db_path, content, node_type, session_id, domain="user", referent_time=None):
+        def _fake_create(
+            db_path, content, node_type, session_id, domain="user", referent_time=None
+        ):
             import hashlib
+
             node_id = hashlib.sha256(content.encode()).hexdigest()[:12]
             conn = sqlite3.connect(tmp_db)
             try:
                 conn.execute(
                     "INSERT OR IGNORE INTO thought_nodes (id, content, node_type, timestamp, source_file, last_accessed, access_count, domain) VALUES (?,?,?,?,?,?,0,?)",
-                    (node_id, content, node_type, "2026-01-01T00:00:00", "pre_compress", "2026-01-01T00:00:00", domain),
+                    (
+                        node_id,
+                        content,
+                        node_type,
+                        "2026-01-01T00:00:00",
+                        "pre_compress",
+                        "2026-01-01T00:00:00",
+                        domain,
+                    ),
                 )
                 conn.commit()
             finally:
@@ -200,9 +254,15 @@ class TestLLMPath:
             real_created.append(node_id)
             return node_id
 
-        monkeypatch.setattr("core.session._create_node", _fake_create)
-        monkeypatch.setattr("core.session._set_node_tags", MagicMock())
-        monkeypatch.setattr("core.embeddings.embed_nodes", MagicMock())
+        monkeypatch.setattr(
+            "plugins.memory.cashew._vendor.core.session._create_node", _fake_create
+        )
+        monkeypatch.setattr(
+            "plugins.memory.cashew._vendor.core.session._set_node_tags", MagicMock()
+        )
+        monkeypatch.setattr(
+            "plugins.memory.cashew._vendor.core.embeddings.embed_nodes", MagicMock()
+        )
 
         result = provider_with_llm.on_pre_compress(_sample_messages())
 
@@ -211,16 +271,22 @@ class TestLLMPath:
 
     def test_empty_json_array(self, provider_with_llm):
         """LLM returns [] → return ''."""
-        provider_with_llm._model_fn = MagicMock(return_value='[]')
+        provider_with_llm._model_fn = MagicMock(return_value="[]")
         result = provider_with_llm.on_pre_compress(_sample_messages())
         assert result == ""
 
     def test_keep_false_items_filtered(self, provider_with_llm):
         """Items with keep=false are filtered out."""
-        response = json.dumps([
-            {"content": "Keep this insight", "type": "insight", "keep": True},
-            {"content": "Skip this observation", "type": "observation", "keep": False},
-        ])
+        response = json.dumps(
+            [
+                {"content": "Keep this insight", "type": "insight", "keep": True},
+                {
+                    "content": "Skip this observation",
+                    "type": "observation",
+                    "keep": False,
+                },
+            ]
+        )
         provider_with_llm._model_fn = MagicMock(return_value=response)
 
         original_create = provider_with_llm._create_insight_nodes
@@ -243,7 +309,7 @@ class TestLLMPath:
 
     def test_code_fence_parsing(self, provider_with_llm):
         """LLM wraps JSON in ```markdown code fences → still parses."""
-        response = "```json\n[{\"content\": \"Arc insight from code fence\", \"type\": \"insight\", \"keep\": true}]\n```"
+        response = '```json\n[{"content": "Arc insight from code fence", "type": "insight", "keep": true}]\n```'
         provider_with_llm._model_fn = MagicMock(return_value=response)
         provider_with_llm._create_insight_nodes = MagicMock(return_value=1)
 
@@ -255,7 +321,6 @@ class TestLLMPath:
 
 
 class TestEdgeCases:
-
     def test_malformed_json_graceful(self, provider_with_llm):
         """LLM returns non-JSON → log warning, return '', never crash."""
         provider_with_llm._model_fn = MagicMock(return_value="This is not JSON at all")
@@ -265,14 +330,29 @@ class TestEdgeCases:
     def test_multimodal_content(self, provider_with_llm):
         """Array-format messages with text+images → text extracted, images skipped."""
         messages = [
-            _make_multimodal_msg("user", ["What do you think about this architecture?"]),
-            _make_multimodal_msg("assistant", ["It looks good but the storage layer could be optimized."]),
-            _make_multimodal_msg("user", ["Can you elaborate on the storage optimization?"]),
-            _make_multimodal_msg("assistant", ["Yes, we should use WAL mode and batch writes for better performance."]),
+            _make_multimodal_msg(
+                "user", ["What do you think about this architecture?"]
+            ),
+            _make_multimodal_msg(
+                "assistant", ["It looks good but the storage layer could be optimized."]
+            ),
+            _make_multimodal_msg(
+                "user", ["Can you elaborate on the storage optimization?"]
+            ),
+            _make_multimodal_msg(
+                "assistant",
+                [
+                    "Yes, we should use WAL mode and batch writes for better performance."
+                ],
+            ),
             _make_multimodal_msg("user", ["How about indexing strategies?"]),
-            _make_multimodal_msg("assistant", ["Compound indexes on timestamp and domain would help."]),
+            _make_multimodal_msg(
+                "assistant", ["Compound indexes on timestamp and domain would help."]
+            ),
         ]
-        provider_with_llm._model_fn = MagicMock(return_value='[{"content": "test", "type": "insight", "keep": true}]')
+        provider_with_llm._model_fn = MagicMock(
+            return_value='[{"content": "test", "type": "insight", "keep": true}]'
+        )
         provider_with_llm._create_insight_nodes = MagicMock(return_value=1)
         result = provider_with_llm.on_pre_compress(messages)
         assert result != ""  # Should not crash, should process
@@ -300,7 +380,6 @@ class TestEdgeCases:
 
 
 class TestExtractExchanges:
-
     def test_extract_exchanges_basic(self, provider_with_llm):
         """Standard messages produce correct role: content strings."""
         msgs = [

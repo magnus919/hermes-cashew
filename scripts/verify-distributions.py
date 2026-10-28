@@ -67,6 +67,18 @@ def verify_distribution(path: PurePosixPath | str) -> None:
     problems: list[str] = []
     if REQUIRED not in paths:
         problems.append(f"missing {REQUIRED}")
+    vendor = PurePosixPath("plugins/memory/cashew/_vendor")
+    for required in (
+        "LICENSE",
+        "pristine-core.tar.gz",
+        "provenance.json",
+        "verify.py",
+        "core/session.py",
+        "core/integrity.py",
+        "core/sleep.py",
+    ):
+        if vendor / required not in paths:
+            problems.append(f"missing {vendor / required}")
     forbidden = _forbidden(paths)
     if forbidden:
         problems.append(f"forbidden paths: {', '.join(forbidden)}")

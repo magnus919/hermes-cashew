@@ -11,9 +11,10 @@ license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [{ name = "Magnus Hedemark", email = "magnus919@pm.me" }]
 dependencies = [
-    "cashew-brain @ https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz#sha256=23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3",
     "numpy",
-    "sentence-transformers",
+    "sentence-transformers>=2.0",
+    "scikit-learn",
+    "PyYAML",
     "sqlite-vec",
 ]
 
@@ -76,7 +77,7 @@ markers = [
 target-version = "py310"
 # This file is a byte-identical upstream source fixture; formatting it changes
 # the immutable provenance used by the subprocess compatibility proof.
-exclude = ["tests/fixtures/cashew-pr137/core/integrity.py"]
+exclude = ["tests/fixtures/cashew-pr137/core/integrity.py", "tests/fixtures/hermes-pm/plugin_declarations.py", "plugins/memory/cashew/_vendor/core", "plugins/memory/cashew/_vendor/scripts"]
 
 [tool.ruff.lint]
 select = ["E", "F", "N", "W", "I", "TD", "C90"]
@@ -98,7 +99,7 @@ strict = true
 ignore_missing_imports = true
 explicit_package_bases = true
 files = ["plugins/memory/cashew"]
-exclude = ["^__init__\\.py$"]
+exclude = ["^__init__\\.py$", "plugins/memory/cashew/_vendor/core", "plugins/memory/cashew/_vendor/scripts"]
 
 [[tool.mypy.overrides]]
 module = "tests/*"
@@ -126,6 +127,14 @@ known_first_party = ["plugins"]
 package_module_name_map = { "opentelemetry-api" = "opentelemetry" }
 
 [tool.deptry.per_rule_ignores]
-DEP001 = ["cashew-brain", "sqlite-vec", "agent", "cron", "utils", "_hermes_cashew_impl", "opentelemetry-api", "sentry-sdk", "hermes_cli", "hermes_constants"]
+DEP001 = [ "sqlite-vec", "agent", "cron", "utils", "_hermes_cashew_impl", "opentelemetry-api", "sentry-sdk", "hermes_cli", "hermes_constants"]
 DEP002 = ["pytest", "pytest-cov", "pytest-asyncio", "pytest-mock", "PyYAML", "tomli", "build", "ruff", "mypy", "pre-commit", "vulture", "deptry", "jsonschema", "opentelemetry-api", "sentry-sdk"]
 DEP003 = ["httpx", "yaml"]
+
+[[tool.mypy.overrides]]
+module = ["plugins.memory.cashew._vendor.core.*", "plugins.memory.cashew._vendor.scripts.*"]
+ignore_errors = true
+follow_imports = "skip"
+
+[tool.vulture]
+exclude = ["plugins/memory/cashew/_vendor/core", "plugins/memory/cashew/_vendor/scripts"]

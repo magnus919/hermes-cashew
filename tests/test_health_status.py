@@ -99,8 +99,15 @@ def test_init_vector_unavailable_reports_keyword_degradation(tmp_path, monkeypat
         return types.SimpleNamespace(new_nodes=["written"], new_edges=[])
 
     monkeypatch.setattr(CashewMemoryProvider, "_finalize_vec_schema", vec_unavailable)
-    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", record_embedding_route)
-    monkeypatch.setattr("core.session.end_session", persist_extract, raising=False)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs",
+        record_embedding_route,
+    )
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        persist_extract,
+        raising=False,
+    )
     provider = CashewMemoryProvider()
     provider.initialize("vector-health", hermes_home=str(tmp_path))
     try:
@@ -154,7 +161,7 @@ def test_query_outcomes_distinguish_empty_success_from_failure(tmp_path, monkeyp
     provider.initialize("query-health", hermes_home=str(tmp_path))
     monkeypatch.setattr(provider, "_keyword_search", lambda *args, **kwargs: [])
     monkeypatch.setattr(
-        "core.retrieval.retrieve_recursive_bfs",
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs",
         lambda *args, **kwargs: [],
     )
     try:
@@ -177,7 +184,7 @@ def test_vector_failure_reports_keyword_degradation_without_tool_error(
     provider = CashewMemoryProvider()
     provider.initialize("keyword-health", hermes_home=str(tmp_path))
     monkeypatch.setattr(
-        "core.retrieval.retrieve_recursive_bfs",
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("vector detail")),
     )
     monkeypatch.setattr(provider, "_keyword_search", lambda *args, **kwargs: [])
@@ -201,7 +208,7 @@ def test_prefetch_fallback_updates_health_without_changing_return_contract(
     provider = CashewMemoryProvider()
     provider.initialize("prefetch-health", hermes_home=str(tmp_path))
     monkeypatch.setattr(
-        "core.retrieval.retrieve_recursive_bfs",
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("vector detail")),
     )
     monkeypatch.setattr(provider, "_keyword_search", lambda *args, **kwargs: [])
@@ -219,7 +226,7 @@ def test_prefetch_keyword_failure_reports_backend_error(tmp_path, monkeypatch):
     provider = CashewMemoryProvider()
     provider.initialize("prefetch-backend", hermes_home=str(tmp_path))
     monkeypatch.setattr(
-        "core.retrieval.retrieve_recursive_bfs",
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("vector detail")),
     )
     monkeypatch.setattr(
@@ -314,7 +321,7 @@ def test_late_query_failure_cannot_mutate_reinitialized_generation(
     result_holder = {}
 
     monkeypatch.setattr(
-        "core.retrieval.retrieve_recursive_bfs",
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs",
         lambda *args, **kwargs: [],
     )
 
@@ -358,7 +365,7 @@ def test_late_query_completion_cannot_mutate_reinitialized_generation(
     release = threading.Event()
     result_holder = {}
     monkeypatch.setattr(
-        "core.retrieval.retrieve_recursive_bfs",
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs",
         lambda *args, **kwargs: [],
     )
 
@@ -403,7 +410,7 @@ def test_late_query_fallback_success_cannot_reverse_completed_shutdown(
     release = threading.Event()
     result_holder = {}
     monkeypatch.setattr(
-        "core.retrieval.retrieve_recursive_bfs",
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs",
         lambda *args, **kwargs: [],
     )
 
@@ -450,7 +457,9 @@ def test_late_extract_failure_cannot_reverse_completed_shutdown(tmp_path, monkey
         assert release.wait(timeout=2.0)
         raise RuntimeError("late extract backend")
 
-    monkeypatch.setattr("core.session.end_session", blocked_extract)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.session.end_session", blocked_extract
+    )
     extract_thread = threading.Thread(
         target=lambda: result_holder.setdefault(
             "result",

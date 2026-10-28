@@ -239,9 +239,11 @@ def test_initialize_is_keyword_only_when_acquisition_failure_hides_required_migr
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A needed repair lock failure preserves read-only keyword query access."""
-    import core.embedding_service
-
     import plugins.memory.cashew as cashew_module
+    from plugins.memory.cashew._vendor import core
+    from plugins.memory.cashew._vendor.core import (
+        embedding_service as _vendor_embedding_service,  # noqa: F401
+    )
 
     (tmp_path / "cashew.json").write_text("{}")
     real_flock = locking.fcntl.flock

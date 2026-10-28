@@ -55,7 +55,9 @@ def _parse_cron_result(stdout: str) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise AssertionError(f"cron script did not produce JSON: {stdout!r}") from exc
     if not isinstance(payload, dict) or not payload:
-        raise AssertionError(f"cron script produced an empty/non-object result: {payload!r}")
+        raise AssertionError(
+            f"cron script produced an empty/non-object result: {payload!r}"
+        )
     if payload.get("status") not in {"completed", "partial"}:
         raise AssertionError(f"cron script returned an unknown status: {payload!r}")
     if payload.get("nodes_selected", 0) < 1:
@@ -180,8 +182,11 @@ def _installed_wheel_package(repository: Path) -> Path:
 
         installed = distribution("hermes-cashew")
         entry = next(
-            (item for item in entry_points(group="hermes_agent.plugins")
-             if item.name == "cashew"),
+            (
+                item
+                for item in entry_points(group="hermes_agent.plugins")
+                if item.name == "cashew"
+            ),
             None,
         )
         if entry is None or entry.value != "plugins.memory.cashew":
@@ -230,16 +235,23 @@ def _verify_wheel_package(package: Path, candidate: Path, record_text: str) -> N
         if not encoded or "=" not in encoded:
             _error(f"wheel RECORD hash missing or invalid: {relative}")
         algorithm, expected = encoded.split("=", 1)
-        actual = base64.urlsafe_b64encode(
-            hashlib.new(algorithm, candidate_path.read_bytes()).digest()
-        ).rstrip(b"=").decode("ascii")
+        actual = (
+            base64.urlsafe_b64encode(
+                hashlib.new(algorithm, candidate_path.read_bytes()).digest()
+            )
+            .rstrip(b"=")
+            .decode("ascii")
+        )
         if actual != expected:
             _error(f"wheel RECORD hash mismatch: {relative}")
 
 
 def _make_dev_overlay(
-    hermes_source: Path, plugin_source: Path, destination: Path,
-    *, installed_package: Path | None = None,
+    hermes_source: Path,
+    plugin_source: Path,
+    destination: Path,
+    *,
+    installed_package: Path | None = None,
 ) -> None:
     """Expose the plugin as a bundled/dev provider without mutating Hermes source."""
     (destination / "plugins" / "memory").mkdir(parents=True)
@@ -306,7 +318,6 @@ def _require_runtime_dependencies() -> None:
         "agent.memory_manager",
         "agent.auxiliary_client",
         "cron.jobs",
-        "core.context",
         "numpy",
         "yaml",
     )
@@ -505,9 +516,12 @@ def _exercise_real_host(mode: str, hermes_source: Path, plugin_source: Path) -> 
         supervisor.active_timeout = 0.1
         supervisor.backoff_base = 0.0
         with sqlite3.connect(str(provider._db_path)) as connection:
-            assert connection.execute(
-                "SELECT 1 FROM embeddings WHERE node_id = ?", ("integration-node",)
-            ).fetchone() is None
+            assert (
+                connection.execute(
+                    "SELECT 1 FROM embeddings WHERE node_id = ?", ("integration-node",)
+                ).fetchone()
+                is None
+            )
             connection.execute(
                 "INSERT INTO thought_nodes (id, content, node_type, domain, timestamp) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -595,10 +609,13 @@ def _exercise_real_host(mode: str, hermes_source: Path, plugin_source: Path) -> 
         assert metadata.get("embedding_dim") == "384", metadata
         assert metadata.get("vec_dim") == "384", metadata
         with sqlite3.connect(str(provider._db_path)) as connection:
-            assert connection.execute(
-                "SELECT 1 FROM embeddings WHERE node_id = ?",
-                ("integration-node",),
-            ).fetchone() is None, "cron target was embedded before cron execution"
+            assert (
+                connection.execute(
+                    "SELECT 1 FROM embeddings WHERE node_id = ?",
+                    ("integration-node",),
+                ).fetchone()
+                is None
+            ), "cron target was embedded before cron execution"
         result = subprocess.run(
             [str(child_python), str(script_path)],
             cwd=temp_root,

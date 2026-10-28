@@ -29,16 +29,12 @@ EOF
 ```
 
 Create a separate host environment from the pinned checkout before the
-offline run. Hermes' frozen lock supplies its host dependencies; Cashew's
-runtime artifacts are pinned explicitly. The source and the older PyPI release
-both report version `1.2.1`, so reinstall the source and verify its provenance:
+offline run. Hermes' frozen lock supplies its host dependencies; the plugin installs its ordinary runtime dependencies and bundled engine:
 
 ```sh
 HERMES_TEST_ENV=/tmp/hermes-agent-$REV-venv
 UV_PROJECT_ENVIRONMENT="$HERMES_TEST_ENV" uv sync --frozen --no-install-project --project "$DEST"
-CASHEW_PIN='cashew-brain @ https://github.com/magnus919/true/archive/fcb4919ac37144bfbeb822eaafc668a4bdceb791.tar.gz#sha256=23765a473ab550db86856fd4b8f0a011d6046196f2e87ebb263a752e8d114db3'
-uv pip install --python "$HERMES_TEST_ENV/bin/python" \
-  --reinstall "$CASHEW_PIN" 'sqlite-vec==0.1.9'
+uv pip install --python "$HERMES_TEST_ENV/bin/python" .
 "$HERMES_TEST_ENV/bin/python" scripts/verify-cashew-baseline.py
 ```
 

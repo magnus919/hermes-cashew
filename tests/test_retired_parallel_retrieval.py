@@ -67,7 +67,9 @@ def test_legacy_flag_uses_upstream_first_without_executor(legacy_provider, monke
     def forbidden_fallback(*args, **kwargs):
         raise AssertionError("nonempty upstream result must win")
 
-    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", upstream)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs", upstream
+    )
     monkeypatch.setattr(provider, "_keyword_search", forbidden_fallback)
     for _ in range(3):
         assert provider.prefetch(
@@ -111,7 +113,9 @@ def test_legacy_flag_preserves_filtered_keyword_fallback(
             raise RuntimeError("synthetic backend failure")
         return []
 
-    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", upstream)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs", upstream
+    )
     result = provider.prefetch(
         "shared", domain="user", tag="keep", exclude_tags=["private"]
     )
@@ -130,7 +134,9 @@ def test_legacy_flag_total_failure_is_neutral(legacy_provider, monkeypatch):
     def fail(*args, **kwargs):
         raise RuntimeError("synthetic backend failure")
 
-    monkeypatch.setattr("core.retrieval.retrieve_recursive_bfs", fail)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.retrieval.retrieve_recursive_bfs", fail
+    )
     monkeypatch.setattr(legacy_provider, "_keyword_search", fail)
     assert legacy_provider.prefetch("unavailable") == ""
 

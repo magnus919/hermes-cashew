@@ -2,27 +2,17 @@
 
 from __future__ import annotations
 
-import hashlib
-import importlib.machinery
-import importlib.metadata
-import json
 import sqlite3
-import sys
 import time
 from contextlib import closing
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
 
-import pytest
-
-# tests/conftest.py intentionally supplies a tiny synthetic ``core`` package
-# when cashew-brain is absent. Skip that supported environment, while letting
-# imports from a present but broken installation fail normally.
-if importlib.machinery.PathFinder.find_spec("core", sys.path) is None:
-    pytest.skip("cashew-brain is not installed", allow_module_level=True)
-
-from core import integrity  # noqa: E402
-from core.db import NODE_COLUMNS, ensure_schema, schema_version  # noqa: E402, I001
+from plugins.memory.cashew._vendor.core import integrity  # noqa: E402
+from plugins.memory.cashew._vendor.core.db import (  # noqa: E402, I001
+    NODE_COLUMNS,
+    ensure_schema,
+    schema_version,
+)
 
 CASHEW_ARCHIVE_URL = (
     "https://github.com/magnus919/true/archive/"
@@ -45,31 +35,12 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 
 def test_installed_cashew_has_selected_source_provenance() -> None:
-    distribution = importlib.metadata.distribution("cashew-brain")
-    direct_url_text = distribution.read_text("direct_url.json")
-    assert direct_url_text is not None, (
-        "cashew-brain 1.2.1 is version-ambiguous; a direct source URL is required"
-    )
-    direct_url = json.loads(direct_url_text)
-    actual_url = direct_url["url"]
-    assert urlunsplit(urlsplit(actual_url)._replace(fragment="")) == CASHEW_ARCHIVE_URL
-    recorded_hash = urlsplit(actual_url).fragment or direct_url.get(
-        "archive_info", {}
-    ).get("hash", "")
-    assert recorded_hash in ("", f"sha256={CASHEW_ARCHIVE_SHA256}")
+    from plugins.memory.cashew._vendor.verify import verify
 
-    session_path = Path(distribution.locate_file("core/session.py"))
-    assert hashlib.sha256(session_path.read_bytes()).hexdigest() == (
-        CASHEW_SESSION_SHA256
-    )
+    assert verify()["commit"] == "fcb4919ac37144bfbeb822eaafc668a4bdceb791"
 
 
 def test_installed_cashew_exposes_connection_owned_integrity_api() -> None:
-    distribution = importlib.metadata.distribution("cashew-brain")
-    integrity_path = Path(distribution.locate_file("core/integrity.py"))
-    assert hashlib.sha256(integrity_path.read_bytes()).hexdigest() == (
-        CASHEW_INTEGRITY_SHA256
-    )
     assert callable(integrity.inspect_integrity)
     assert callable(integrity.repair_integrity)
 

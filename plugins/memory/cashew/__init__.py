@@ -89,9 +89,9 @@ from .cron_reconcile import (
 )
 
 try:
-    from core.context import ContextRetriever
+    from ._vendor.core.context import ContextRetriever
 except ImportError:
-    # Cashew not installed — plugin still loads (for wheel-smoke + discovery paths).
+    # Runtime dependency unavailable — keep discovery failure-isolated.
     # initialize() will silent-degrade if ContextRetriever is unavailable at runtime.
     ContextRetriever = None
 
@@ -117,7 +117,7 @@ logger = logging.getLogger(__name__)
 
 def _retrieve_with_embedding_wait(**kwargs: Any) -> Any:
     """Give interactive retrieval bounded patience without killing active work."""
-    from core.retrieval import retrieve_recursive_bfs
+    from ._vendor.core.retrieval import retrieve_recursive_bfs
 
     with embedding_caller_wait(1.5):
         return retrieve_recursive_bfs(**kwargs)
@@ -260,7 +260,7 @@ def _ensure_config_file(hermes_home: pathlib.Path) -> None:
 
 def _open_profile_embedding_cache(cache_path: pathlib.Path) -> Any:
     """Serialize upstream cache schema setup behind its independent lease."""
-    from core.embedding_cache import EmbeddingCache
+    from ._vendor.core.embedding_cache import EmbeddingCache
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + 5.0
@@ -288,10 +288,12 @@ def _bind_upstream_embedding(
     cannot alter the active profile's upstream globals.
     """
     try:
-        import core.config
-        import core.embedding_service
+        from ._vendor.core import config as _config
+        from ._vendor.core import embedding_service as _service
     except ImportError:
-        logger.warning("cashew-brain not installed; cannot patch embedding model")
+        logger.warning(
+            "bundled Cashew runtime unavailable; cannot patch embedding model"
+        )
         return None
 
     if cache_path is None:
@@ -339,7 +341,7 @@ def _bind_upstream_embedding(
             supervisor=supervisor,
             generation=getattr(supervisor, "generation", None),
         )
-        raw_service = core.embedding_service.EmbeddingService(
+        raw_service = _service.EmbeddingService(
             model=model_name,
             cache=cache,
             daemon=ProcessEmbeddingBackend(supervisor),
@@ -358,10 +360,10 @@ def _bind_upstream_embedding(
     # Publish the process-global upstream selection only after ownership,
     # dimension discovery, and cache setup all succeed. A rejected second
     # provider must not disturb the active owner's model or service.
-    core.config.config.embedding_model = model_name
+    _config.config.embedding_model = model_name
     if expected_dim == 0:
-        core.embedding_service._KNOWN_DIMS[model_name] = dim
-    core.embedding_service._default_service = service
+        _service._KNOWN_DIMS[model_name] = dim
+    _service._default_service = service
     logger.info(
         "configured upstream embedding: model=%s dim=%d device=%s",
         model_name,
@@ -908,7 +910,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 if ContextRetriever is None:
                     raise RuntimeError(
                         "core.context.ContextRetriever unavailable at import time; "
-                        "cashew-brain dependency missing"
+                        "bundled Cashew engine or runtime dependency missing"
                     )
                 self._db_path.parent.mkdir(parents=True, exist_ok=True)
                 # Keep the wrapper-owned sqlite-vec migration behind the same
@@ -1487,7 +1489,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         extensions (provider metadata).  The sqlite-vec schema is finalized
         only after the backup-backed embedding repair has succeeded.
         """
-        from core.db import ensure_schema
+        from ._vendor.core.db import ensure_schema
 
         with admit_operation(
             graph_path=db_path,
@@ -1955,7 +1957,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         ):
             return True
 
-        from core.backup import create_backup
+        from ._vendor.core.backup import create_backup
 
         backup_dir = db_path.parent / "backups"
         backup = create_backup(str(db_path), str(backup_dir))
@@ -1975,7 +1977,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         expected_ids = self._active_embedding_ids(db_path)
         expected_count = len(expected_ids)
         try:
-            from scripts.migrate_embeddings import migrate_embeddings
+            from ._vendor.scripts.migrate_embeddings import migrate_embeddings
 
             summary = migrate_embeddings(str(db_path), confirm=True, quiet=True)
             embedded_count = summary.get("nodes_embedded")
@@ -2196,7 +2198,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         Lease contention is handled before admission. Once upstream begins, an
         exception is terminal for this turn; replaying it could duplicate the
         stages that Cashew already committed."""
-        from core.session import end_session  # lazy import
+        from ._vendor.core.session import end_session  # lazy import
 
         user, assistant, session_id = turn
 
@@ -2293,7 +2295,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
             or self._db_path is None
         ):
             return
-        from core.session import think_cycle
+        from ._vendor.core.session import think_cycle
 
         claim_epoch: str | None = None
         try:
@@ -2583,8 +2585,8 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
         if not self._embedding_identity_ready:
             return 0
 
-        from core.embeddings import embed_nodes
-        from core.session import _create_node, _set_node_tags
+        from ._vendor.core.embeddings import embed_nodes
+        from ._vendor.core.session import _create_node, _set_node_tags
 
         db_path = str(self._db_path)
         count = 0
@@ -3630,7 +3632,7 @@ class CashewMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 user = args["user_content"]  # KeyError caught below — tool-call failure
                 assistant = args["assistant_content"]
                 # Lazy import — keeps is_available free of core.session side effects.
-                from core.session import end_session
+                from ._vendor.core.session import end_session
 
                 with self._operation_admission() as admission:
                     self._validate_runtime_identity(admission)

@@ -25,9 +25,9 @@ from collections.abc import Callable, Iterator
 from typing import Any
 
 import numpy as np
-from core import sleep as upstream_sleep
 
 from . import sleep_adapter
+from ._vendor.core import sleep as upstream_sleep
 from .locking import try_shared_lock
 
 EMBEDDING_MODEL = "thenlper/gte-large"
@@ -282,15 +282,11 @@ def _measure_sleep_cycle(
                     {
                         "observed": True,
                         "admitted": lease is not None,
-                        "elapsed_ms": round(
-                            (time.perf_counter() - started) * 1000, 3
-                        ),
+                        "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
                     }
                 )
         except OSError as exc:
-            writer_result.update(
-                {"observed": True, "error": type(exc).__name__}
-            )
+            writer_result.update({"observed": True, "error": type(exc).__name__})
         finally:
             lock_probe_complete.set()
 
@@ -339,12 +335,14 @@ def _measure_sleep_cycle(
 
     conn = sqlite3.connect(db_path)
     try:
-        edge_rows = int(conn.execute("SELECT COUNT(*) FROM derivation_edges").fetchone()[0])
+        edge_rows = int(
+            conn.execute("SELECT COUNT(*) FROM derivation_edges").fetchone()[0]
+        )
         cross_link_rows = int(
             conn.execute(
                 "SELECT COUNT(*) FROM derivation_edges "
-                "WHERE reasoning LIKE 'cross_link%'")
-            .fetchone()[0]
+                "WHERE reasoning LIKE 'cross_link%'"
+            ).fetchone()[0]
         )
         orphan_rows = int(
             conn.execute(
@@ -353,7 +351,9 @@ def _measure_sleep_cycle(
                 "WHERE tn.id LIKE 'orphan-%' AND e.node_id IS NOT NULL"
             ).fetchone()[0]
         )
-        total_nodes = int(conn.execute("SELECT COUNT(*) FROM thought_nodes").fetchone()[0])
+        total_nodes = int(
+            conn.execute("SELECT COUNT(*) FROM thought_nodes").fetchone()[0]
+        )
     finally:
         conn.close()
 

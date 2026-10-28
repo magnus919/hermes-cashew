@@ -99,7 +99,9 @@ def test_extract_happy_path_returns_success_envelope(tmp_path, monkeypatch):
         new_nodes=["n1", "n2", "n3"], new_edges=["e1"], updated_nodes=[]
     )
     monkeypatch.setattr(
-        "core.session.end_session", lambda **k: fake_result, raising=False
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        lambda **k: fake_result,
+        raising=False,
     )
     p = make_initialized_provider(tmp_path)
     try:
@@ -126,7 +128,9 @@ def test_extract_calls_end_session_with_canonical_kwargs(tmp_path, monkeypatch):
         recorded.append(kwargs)
         return types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[])
 
-    monkeypatch.setattr("core.session.end_session", _fake, raising=False)
+    monkeypatch.setattr(
+        "plugins.memory.cashew._vendor.core.session.end_session", _fake, raising=False
+    )
     p = make_initialized_provider(tmp_path)
     try:
         p.handle_tool_call(
@@ -145,10 +149,8 @@ def test_extract_calls_end_session_with_canonical_kwargs(tmp_path, monkeypatch):
 
 def test_extract_bypasses_sync_queue(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        "core.session.end_session",
-        lambda **k: types.SimpleNamespace(
-            new_nodes=[], new_edges=[], updated_nodes=[]
-        ),
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        lambda **k: types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[]),
         raising=False,
     )
     p = make_initialized_provider(tmp_path)
@@ -186,10 +188,8 @@ def test_extract_missing_arg_returns_error_envelope_and_logs_once(
     tmp_path, monkeypatch, caplog
 ):
     monkeypatch.setattr(
-        "core.session.end_session",
-        lambda **k: types.SimpleNamespace(
-            new_nodes=[], new_edges=[], updated_nodes=[]
-        ),
+        "plugins.memory.cashew._vendor.core.session.end_session",
+        lambda **k: types.SimpleNamespace(new_nodes=[], new_edges=[], updated_nodes=[]),
         raising=False,
     )
     p = make_initialized_provider(tmp_path)
@@ -213,7 +213,7 @@ def test_extract_cashew_failure_returns_error_envelope_and_logs_once(
     tmp_path, monkeypatch, caplog
 ):
     monkeypatch.setattr(
-        "core.session.end_session",
+        "plugins.memory.cashew._vendor.core.session.end_session",
         lambda **k: (_ for _ in ()).throw(
             sqlite3.OperationalError("database is locked")
         ),
@@ -241,7 +241,7 @@ def test_extract_error_envelope_has_no_stack_trace_substrings(
 ):
     SECRET = "/some/secret/path/brain.db"
     monkeypatch.setattr(
-        "core.session.end_session",
+        "plugins.memory.cashew._vendor.core.session.end_session",
         lambda **k: (_ for _ in ()).throw(
             sqlite3.OperationalError(f"database is locked {SECRET}")
         ),

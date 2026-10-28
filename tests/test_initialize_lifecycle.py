@@ -438,7 +438,7 @@ def test_initialize_does_not_import_cashew_runtime(tmp_path):
         post = set(sys.modules.keys())
         new = post - pre
         forbidden = {
-            "core.embeddings"
+            "plugins.memory.cashew._vendor.core.embeddings"
         }  # Phase 3: core.context is now legitimately loaded at initialize; embedding still lazy.
         assert not (new & forbidden), (
             f"initialize() loaded forbidden Cashew runtime modules: {new & forbidden}"

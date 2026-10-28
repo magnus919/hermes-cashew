@@ -405,7 +405,7 @@ def test_process_wide_gate_caps_hung_calls_across_new_closures(
 def test_empty_response_uses_upstream_heuristic_while_json_array_does_not(
     fake_host, tmp_path, monkeypatch
 ):
-    import core.session as session
+    from plugins.memory.cashew._vendor.core import session as session
 
     monkeypatch.setattr(session, "embed_nodes", lambda _: None)
     monkeypatch.setattr(session, "_find_similar_nodes", lambda *_: [])

@@ -14,8 +14,7 @@ import pathlib
 import sqlite3
 from typing import Any, Iterator, cast
 
-from core.sleep import run_sleep_cycle as _upstream_run_sleep_cycle
-
+from ._vendor.core.sleep import run_sleep_cycle as _upstream_run_sleep_cycle
 from .admission import OperationAdmissionError, current_admission
 from .locking import (
     MaintenanceLockAcquisitionError,
@@ -92,7 +91,9 @@ def run_sleep_cycle(
             admission = current_admission()
             if admission is not None and embedding_client is not None:
                 if admission.model not in (None, embedding_model):
-                    raise OperationAdmissionError("sleep admission model identity mismatch")
+                    raise OperationAdmissionError(
+                        "sleep admission model identity mismatch"
+                    )
                 if admission.embedding_dim not in (None, expected_dimension):
                     raise OperationAdmissionError(
                         "sleep admission dimension identity mismatch"
@@ -103,20 +104,23 @@ def run_sleep_cycle(
             effective_embedding_model = (
                 embedding_model if embedding_client is not None else None
             )
-            return cast(dict[str, Any], _upstream_run_sleep_cycle(
-                db_path=db_path,
-                limit=limit,
-                model_fn=model_fn,
-                background_dream=background_dream,
-                max_edges=max_edges,
-                cross_source_only=cross_source_only,
-                embedding_client=embedding_client,
-                embedding_model=effective_embedding_model,
-                expected_dimension=expected_dimension,
-                journal_policy="preserve",
-                orphan_limit=orphan_limit,
-                orphan_batch_size=orphan_batch_size,
-            ))
+            return cast(
+                dict[str, Any],
+                _upstream_run_sleep_cycle(
+                    db_path=db_path,
+                    limit=limit,
+                    model_fn=model_fn,
+                    background_dream=background_dream,
+                    max_edges=max_edges,
+                    cross_source_only=cross_source_only,
+                    embedding_client=embedding_client,
+                    embedding_model=effective_embedding_model,
+                    expected_dimension=expected_dimension,
+                    journal_policy="preserve",
+                    orphan_limit=orphan_limit,
+                    orphan_batch_size=orphan_batch_size,
+                ),
+            )
     except MaintenanceLockAcquisitionError:
         logger.info("sleep: maintenance lease is busy; skipping")
         return {}

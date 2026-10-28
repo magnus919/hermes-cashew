@@ -142,7 +142,7 @@ def test_audit_privacy_canary_is_absent_from_report_and_logs(
 
 
 def test_permanent_core_memory_is_informational(tmp_path: Path) -> None:
-    path = tmp_path / "core.db"
+    path = tmp_path / "plugins.memory.cashew._vendor.core.db"
     _create_profile(path)
     conn = sqlite3.connect(path)
     _add_node(conn, "core", permanent=1)

@@ -187,7 +187,7 @@ jobs:
           assert '$GITHUB_WORKSPACE' not in str(loaded), loaded
           print(f'wheel import: {loaded}')
           "
-              "$WHEEL_SMOKE_VENV/bin/python" "$GITHUB_WORKSPACE/scripts/verify-cashew-baseline.py"
+              "$WHEEL_SMOKE_VENV/bin/python" "$GITHUB_WORKSPACE/scripts/verify-cashew-baseline.py" --installed
             )
             "$WHEEL_SMOKE_VENV/bin/python" -c "
           import importlib.metadata as im
@@ -216,7 +216,7 @@ jobs:
           assert '$GITHUB_WORKSPACE' not in str(loaded), loaded
           print(f'sdist import: {loaded}')
           "
-              "$SDIST_SMOKE_VENV/bin/python" "$GITHUB_WORKSPACE/scripts/verify-cashew-baseline.py"
+              "$SDIST_SMOKE_VENV/bin/python" "$GITHUB_WORKSPACE/scripts/verify-cashew-baseline.py" --installed
             )
             mkdir -p "$FLAT_UNPACKED" "$FLAT_SMOKE_HOME/plugins"
             tar -xzf dist/*.tar.gz -C "$FLAT_UNPACKED" --strip-components=1
@@ -246,7 +246,7 @@ jobs:
           assert provider.ContextRetriever is not core.context.ContextRetriever
           print('bundled engine remains authoritative with old Cashew imported')
           "
-              "$FLAT_SMOKE_VENV/bin/python" "$GITHUB_WORKSPACE/scripts/verify-cashew-baseline.py"
+              "$FLAT_SMOKE_VENV/bin/python" "$GITHUB_WORKSPACE/scripts/verify-cashew-baseline.py" --installed
             )
           } 2>&1 | tee flat-smoke.log
 

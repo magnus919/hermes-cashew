@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.metadata
 import importlib.util
 import sqlite3
@@ -13,14 +14,19 @@ MINIMUM_SQLITE = (3, 35, 0)
 
 
 def main() -> None:
-    distribution = importlib.metadata.distribution("hermes-cashew")
-    vendor = Path(distribution.locate_file("plugins/memory/cashew/_vendor"))
-    # Editable installs need the source package directory; use the selected
-    # provider package only when metadata does not locate regular wheel files.
-    if not vendor.is_dir():
-        import plugins.memory.cashew
-
-        vendor = Path(plugins.memory.cashew.__file__).resolve().parent / "_vendor"
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--installed",
+        action="store_true",
+        help="audit the installed wheel/sdist rather than the adjacent flat source",
+    )
+    args = parser.parse_args()
+    if args.installed:
+        distribution = importlib.metadata.distribution("hermes-cashew")
+        vendor = Path(distribution.locate_file("plugins/memory/cashew/_vendor"))
+    else:
+        vendor = Path(__file__).resolve().parents[1] / "plugins/memory/cashew/_vendor"
+    print(f"auditing bundled source: {vendor}")
 
     spec = importlib.util.spec_from_file_location(
         "_cashew_provenance", vendor / "verify.py"

@@ -556,7 +556,7 @@ missing. Preserve `cashew.json` and the graph database. Do not install an unrela
 
 Check the active profile, declared dependency installation, and startup logs.
 Run `scripts/verify-cashew-baseline.py` with Hermes' selected plugin interpreter to
-verify the bundled source. A damaged or incomplete bundle requires reinstalling
+verify the adjacent flat source (or add `--installed` to audit a wheel/sdist). A damaged or incomplete bundle requires reinstalling
 the same reviewed plugin revision. Model availability and initialization health
 are separate from dependency importability; see the health guidance above.
 

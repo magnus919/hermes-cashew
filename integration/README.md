@@ -35,7 +35,7 @@ offline run. Hermes' frozen lock supplies its host dependencies; the plugin inst
 HERMES_TEST_ENV=/tmp/hermes-agent-$REV-venv
 UV_PROJECT_ENVIRONMENT="$HERMES_TEST_ENV" uv sync --frozen --no-install-project --project "$DEST"
 uv pip install --python "$HERMES_TEST_ENV/bin/python" .
-"$HERMES_TEST_ENV/bin/python" scripts/verify-cashew-baseline.py
+"$HERMES_TEST_ENV/bin/python" scripts/verify-cashew-baseline.py --installed
 ```
 
 Run the lane with the interpreter that has Hermes and Cashew installed:

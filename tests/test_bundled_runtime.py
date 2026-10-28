@@ -106,3 +106,15 @@ def test_bundled_engine_ignores_preimported_ambient_core(tmp_path):
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_flat_source_audit_needs_no_installed_package_metadata():
+    import subprocess
+    import sys
+
+    script = Path(__file__).resolve().parents[1] / "scripts/verify-cashew-baseline.py"
+    result = subprocess.run(
+        [sys.executable, "-S", str(script)], capture_output=True, text=True, timeout=10
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "bundled Cashew source verified" in result.stdout

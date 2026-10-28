@@ -138,3 +138,9 @@ follow_imports = "skip"
 
 [tool.vulture]
 exclude = ["plugins/memory/cashew/_vendor/core", "plugins/memory/cashew/_vendor/scripts"]
+
+# The engine is an unchanged external dependency apart from import relocation.
+# Keep adapter coverage comparable to the separately installed dependency; its
+# source and behavior have dedicated provenance and integration checks.
+[tool.coverage.run]
+omit = ["plugins/memory/cashew/_vendor/core/*", "plugins/memory/cashew/_vendor/scripts/*"]
